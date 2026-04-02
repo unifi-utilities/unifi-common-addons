@@ -1,0 +1,28 @@
+name: 'Close Stale Issues / PRs'
+on:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  close-issues:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@v10.2.0
+        with:
+          days-before-issue-stale: 7
+          days-before-pr-stale: 7
+          days-before-issue-close: 7
+          days-before-pr-close: 7
+          stale-issue-label: "stale"
+          stale-pr-label: "stale"
+          exempt-pr-labels: 'keep-open'
+          exempt-issue-labels: 'keep-open'
+          stale-issue-message: "This issue has been marked as stale and will be closed if no further activity occurs."
+          stale-pr-message: "This pull request has been marked as stale and will be closed if no further activity occurs."
+          close-issue-message: "This issue has been closed after being marked as stale because no further activity occurred."
+          close-pr-message: "This pull request has been closed after being marked as stale because no further activity occurred."
