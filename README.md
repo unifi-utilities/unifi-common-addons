@@ -28,6 +28,10 @@ Enables Containers - replacing Podman.
 
 Persist changes to your device's configurations and prevent them from being overwritten by UniFi.
 
+### tailscale-unifi
+
+Miscellaneous scripts to help with Tailscale and UniFi integration from [tailscale-unifi by @SierraSoftworks](https://github.com/SierraSoftworks/tailscale-unifi)
+
 ## Missing something?
 
 We have moved the old addons to a new repository to make it easier to maintain and add new addons. If you have an addon that you would like to see added, please open an issue or submit a pull request.

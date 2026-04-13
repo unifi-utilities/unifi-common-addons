@@ -1,0 +1,13 @@
+[Unit]
+Description=Apply dnsmasq config for tailscale0 at boot
+After=tailscaled.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/data/on_boot.d/20-tailscale-dnsmasq.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
