@@ -34,9 +34,9 @@ I tore through how IP Passthrough and Cascaded Routers work in ATT Gateways, and
    valid_lft forever preferred_lft forever
    ```
 
-   Our subnet mask is `/22` — `255.255.252.0`.
+   Our subnet mask is `/22` - `255.255.252.0`.
 
-5. Set up your internet with a static IP. Use your dynamic IP, which you usually get, and the gateway/subnet mask we found above. Also, add each one of your static IPs by hand — if you try to add them by range, the UI CIDR knows that some of those should be broadcast/router, etc.
+5. Set up your internet with a static IP. Use your dynamic IP, which you usually get, and the gateway/subnet mask we found above. Also, add each one of your static IPs by hand - if you try to add them by range, the UI CIDR knows that some of those should be broadcast/router, etc.
 
 Example:
 
@@ -44,15 +44,15 @@ Example:
 
 Save, and it should work.
 
-However, if it does not — or later you randomly lose your internet — there is a reason for this.
+However, if it does not - or later you randomly lose your internet - there is a reason for this.
 
 Your route out to the internet is your DHCPv4 lease. You may need to renew it. To do this, switch back to DHCPv4 and save, then switch back to static IP, **or** do this from the command line:
 
-   ```sh
-   # busybox-legacy udhcpc -i eth8
-   udhcpc: started, v1.34.1
-   udhcpc: broadcasting discover
-   sh: /usr/share/udhcpc/decline.script: not found
-   udhcpc: broadcasting select for 108.2.2.2, server 108.1.1.1
-   udhcpc: lease of 108.2.2.2 obtained from 108.1.1.1., lease time 3600
-   ```
+```sh
+# busybox-legacy udhcpc -i eth8
+udhcpc: started, v1.34.1
+udhcpc: broadcasting discover
+sh: /usr/share/udhcpc/decline.script: not found
+udhcpc: broadcasting select for 108.2.2.2, server 108.1.1.1
+udhcpc: lease of 108.2.2.2 obtained from 108.1.1.1., lease time 3600
+```
