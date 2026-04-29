@@ -34,7 +34,7 @@ Persist changes to your device's configurations and prevent them from being over
 
 ### tailscale-unifi
 
-Miscellaneous scripts to help with Tailscale and UniFi integration from [tailscale-unifi by @SierraSoftworks](https://github.com/SierraSoftworks/tailscale-unifi)
+Miscellaneous scripts to help with Tailscale and UniFi integration from [tailscale-unifi](https://github.com/SierraSoftworks/tailscale-unifi) by [@notheotherben](https://github.com/notheotherben)
 
 ## Missing something?
 
