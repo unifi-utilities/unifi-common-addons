@@ -6,16 +6,16 @@ To install AdGuard Home, we run the automated install as instructed in the [AdGu
 
 1. Spawn a shell to your container.
 
-    ```sh
-    machinectl shell debian-custom
-    ```
+   ```sh
+   machinectl shell debian-custom
+   ```
 
 2. Run the automated install command from the AdGuard documentation and follow the prompts. Refer to the PiHole documentation for more details.
 
-    ```sh
-    apt -y install curl
-    curl -s -S -L https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh | sh -s -- -v
-    ```
+   ```sh
+   apt -y install curl
+   curl -s -S -L https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh | sh -s -- -v
+   ```
 
 3. Go to <http://10.0.5.3:3000> to configure AdGuard Home (or whatever IP you configured for your container).
 4. After configuration, you can access AdGuard Home web GUI at <http://10.0.5.3>.

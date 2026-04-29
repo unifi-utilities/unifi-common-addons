@@ -20,6 +20,10 @@ Enables receiving up to 8 Prefix Delegations on AT&T connections.
 
 Enables emulation of a Cascaded Router setup and allows full use of your CIDR on AT&T connections.
 
+### centurylink-ipv6
+
+Enables 6RD on CenturyLink connections. This allows you to use IPv6 on your LAN and have it routed over the 6RD tunnel to the internet.
+
 ### nspawn-container
 
 Enables Containers - replacing Podman.
