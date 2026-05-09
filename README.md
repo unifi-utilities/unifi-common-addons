@@ -32,6 +32,10 @@ Enables Containers - replacing Podman.
 
 Persist changes to your device's configurations and prevent them from being overwritten by UniFi.
 
+### soundcork
+
+Runs SoundCork on a UniFi OS gateway for local Bose SoundTouch cloud endpoint emulation.
+
 ### tailscale-unifi
 
 Miscellaneous scripts to help with Tailscale and UniFi integration from [tailscale-unifi](https://github.com/SierraSoftworks/tailscale-unifi) by [@notheotherben](https://github.com/notheotherben)
