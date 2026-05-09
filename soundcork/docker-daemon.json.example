@@ -1,0 +1,11 @@
+{
+  "data-root": "/data/docker",
+  "bridge": "none",
+  "iptables": false,
+  "ip-forward": false,
+  "log-driver": "local",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}

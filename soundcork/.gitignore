@@ -1,0 +1,5 @@
+soundcork-data/
+soundcork-logs/
+backups/
+runtime/
+*.log
