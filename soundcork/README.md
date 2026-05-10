@@ -15,9 +15,10 @@ enough on firmware that validates TLS certificates.
 - A stable speaker-facing DNS name or address for the UniFi host. The default
   is `http://unifi:8001`, which works when `unifi` resolves from the speaker
   LAN.
-- Docker or Podman on the UniFi OS host. If no runtime is available, the
-  runtime hook can try `apt-get install docker.io` when `apt-get` is present
-  and `SOUNDCORK_RUNTIME_AUTO_INSTALL=1`.
+- Docker or Podman on the UniFi OS host, or a prepared rootfs for the direct
+  `systemd-nspawn` launcher. If no container runtime is available, the runtime
+  hook can try `apt-get install docker.io` when `apt-get` is present and
+  `SOUNDCORK_RUNTIME_AUTO_INSTALL=1`.
 - Existing private SoundCork account data, if you are migrating an existing
   SoundCork installation.
 
@@ -27,6 +28,8 @@ enough on firmware that validates TLS certificates.
   an optional Docker daemon config from `/data`.
 - `20-soundcork.sh` starts the host-networked SoundCork container and waits for
   the local registry endpoint.
+- `soundcork-nspawn.sh` starts SoundCork from a prepared rootfs through
+  rootful `systemd-nspawn`, for gateways where Docker or Podman is not usable.
 - `soundcork.env.example` is the controller-side environment template.
 - `soundcork-healthcheck.sh` checks SoundCork, optional Spotify account
   support.
@@ -43,11 +46,18 @@ cp soundcork.env.example /data/soundcork/soundcork.env
 cp docker-daemon.json.example /data/soundcork/docker-daemon.json
 cp 05-soundcork-runtime.sh /data/on_boot.d/05-soundcork-runtime.sh
 cp 20-soundcork.sh /data/on_boot.d/20-soundcork.sh
+cp soundcork-nspawn.sh /data/soundcork/soundcork-nspawn.sh
 cp soundcork-healthcheck.sh /data/soundcork/soundcork-healthcheck.sh
 chmod +x /data/on_boot.d/05-soundcork-runtime.sh
 chmod +x /data/on_boot.d/20-soundcork.sh
+chmod +x /data/soundcork/soundcork-nspawn.sh
 chmod +x /data/soundcork/soundcork-healthcheck.sh
 ```
+
+To disable an on-boot hook, move it out of `/data/on_boot.d`, or rename it to
+a suffix other than `.sh` and remove its execute bit. Some `unifi-common`
+dispatchers run every executable file in that directory regardless of suffix,
+and source non-executable `*.sh` files.
 
 Edit `/data/soundcork/soundcork.env` and set `SOUNDCORK_HOST` or `BASE_URL` to
 the LAN name or address reachable by SoundTouch speakers. The default derives:
@@ -77,6 +87,89 @@ http://127.0.0.1:${SOUNDCORK_PORT}/bmx/registry/v1/services
 
 If the endpoint does not become ready within `SOUNDCORK_READY_TIMEOUT`, the
 script exits nonzero and prints a redacted tail of the container logs.
+
+## Direct nspawn Fallback
+
+Use `soundcork-nspawn.sh` on UniFi gateways where Docker or Podman cannot
+start containers, or where you prefer a rootfs under `/data` over a host
+container runtime. This launcher does not build the rootfs. Prepare one first
+with Python `>=3.12`, SoundCork source, and a virtualenv containing Gunicorn
+and SoundCork's runtime dependencies.
+
+Expected defaults inside the rootfs:
+
+```text
+/opt/soundcork/soundcork
+/opt/soundcork-venv/bin/gunicorn
+```
+
+The launcher bind-mounts the controller's persistent data and logs into the
+rootfs:
+
+```text
+/data/soundcork/data -> /soundcork/data
+/data/soundcork/logs -> /soundcork/logs
+```
+
+Set nspawn-specific variables in `/data/soundcork/soundcork.env` or in a small
+wrapper under `/data/on_boot.d`:
+
+```sh
+SOUNDCORK_ROOTFS=/data/soundcork/nspawn-rootfs
+SOUNDCORK_NSPAWN=/usr/bin/systemd-nspawn
+SOUNDCORK_APP_DIR=/opt/soundcork/soundcork
+SOUNDCORK_PYTHONPATH=/opt/soundcork
+SOUNDCORK_GUNICORN=/opt/soundcork-venv/bin/gunicorn
+DATA_DIR=/data/soundcork/data
+LOG_DIR=/data/soundcork/logs
+```
+
+Example boot wrapper:
+
+```sh
+mkdir -p /data/soundcork/disabled-hooks
+for hook in 05-soundcork-runtime.sh 20-soundcork.sh; do
+    if [ -e "/data/on_boot.d/${hook}" ]; then
+        mv "/data/on_boot.d/${hook}" "/data/soundcork/disabled-hooks/${hook}"
+    fi
+done
+
+cat >/data/on_boot.d/20-soundcork-nspawn.sh <<'EOF'
+#!/bin/sh
+set -eu
+exec env \
+  SOUNDCORK_ROOTFS=/data/soundcork/nspawn-rootfs \
+  SOUNDCORK_NSPAWN=/usr/bin/systemd-nspawn \
+  /data/soundcork/soundcork-nspawn.sh
+EOF
+chmod +x /data/on_boot.d/20-soundcork-nspawn.sh
+```
+
+Do not enable both `/data/on_boot.d/20-soundcork.sh` and the nspawn wrapper on
+the same port. Keep the Docker/Podman hooks moved out of `/data/on_boot.d`, or
+renamed to a non-`.sh` suffix with no execute bit, until the new runtime has
+passed readiness checks and a controller reboot test.
+
+## Log Retention
+
+The Docker path applies per-container log limits by default:
+
+```sh
+SOUNDCORK_CONTAINER_LOG_DRIVER=local
+SOUNDCORK_CONTAINER_LOG_MAX_SIZE=10m
+SOUNDCORK_CONTAINER_LOG_MAX_FILE=3
+```
+
+The included `docker-daemon.json.example` uses the same host-wide defaults.
+
+The direct nspawn launcher writes Gunicorn output through a rotating file
+logger. By default it keeps `/data/soundcork/logs/soundcork-nspawn.log` plus
+three 10 MiB rotated files:
+
+```sh
+SOUNDCORK_LOG_MAX_BYTES=10485760
+SOUNDCORK_LOG_ROTATIONS=3
+```
 
 ## Optional Docker Daemon Config
 
