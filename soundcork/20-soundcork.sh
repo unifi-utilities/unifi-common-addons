@@ -30,6 +30,9 @@ SOUNDCORK_READY_URL="${SOUNDCORK_READY_URL:-http://127.0.0.1:${SOUNDCORK_PORT}/b
 SOUNDCORK_READY_TIMEOUT="${SOUNDCORK_READY_TIMEOUT:-90}"
 SOUNDCORK_READY_INTERVAL="${SOUNDCORK_READY_INTERVAL:-2}"
 SOUNDCORK_READY_LOG_LINES="${SOUNDCORK_READY_LOG_LINES:-80}"
+SOUNDCORK_CONTAINER_LOG_DRIVER="${SOUNDCORK_CONTAINER_LOG_DRIVER:-local}"
+SOUNDCORK_CONTAINER_LOG_MAX_SIZE="${SOUNDCORK_CONTAINER_LOG_MAX_SIZE:-10m}"
+SOUNDCORK_CONTAINER_LOG_MAX_FILE="${SOUNDCORK_CONTAINER_LOG_MAX_FILE:-3}"
 
 log() {
     logger -t soundcork-onboot "$*" 2>/dev/null || true
@@ -119,7 +122,7 @@ elif command -v podman >/dev/null 2>&1; then
     RUNTIME=podman
 else
     log "no docker or podman runtime found; SoundCork not started"
-    log "run 05-soundcork-runtime.sh first, or use the unifi-common-addons nspawn-container path instead"
+    log "run 05-soundcork-runtime.sh first, or use the direct nspawn launcher with a prepared rootfs"
     exit 1
 fi
 
@@ -131,10 +134,16 @@ fi
 
 log "starting ${CONTAINER_NAME} from ${IMAGE} with base_url=${BASE_URL} bind=${GUNICORN_BIND}"
 
+CONTAINER_LOG_ARGS=""
+if [ "$RUNTIME" = docker ]; then
+    CONTAINER_LOG_ARGS="--log-driver ${SOUNDCORK_CONTAINER_LOG_DRIVER} --log-opt max-size=${SOUNDCORK_CONTAINER_LOG_MAX_SIZE} --log-opt max-file=${SOUNDCORK_CONTAINER_LOG_MAX_FILE}"
+fi
+
 CONTAINER_ID=$("$RUNTIME" run -d \
     --name "$CONTAINER_NAME" \
     --network host \
     --restart unless-stopped \
+    $CONTAINER_LOG_ARGS \
     -e "base_url=${BASE_URL}" \
     -e "data_dir=/soundcork/data" \
     -e "spotify_client_id=${SPOTIFY_CLIENT_ID}" \
