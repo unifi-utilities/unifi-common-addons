@@ -28,6 +28,8 @@ enough on firmware that validates TLS certificates.
   an optional Docker daemon config from `/data`.
 - `20-soundcork.sh` starts the host-networked SoundCork container and waits for
   the local registry endpoint.
+- `soundcork-provision-rootfs.sh` optionally builds a Debian rootfs for the
+  direct nspawn launcher from package repositories and SoundCork source.
 - `soundcork-nspawn.sh` starts SoundCork from a prepared rootfs through
   rootful `systemd-nspawn`, for gateways where Docker or Podman is not usable.
 - `soundcork.env.example` is the controller-side environment template.
@@ -46,10 +48,12 @@ cp soundcork.env.example /data/soundcork/soundcork.env
 cp docker-daemon.json.example /data/soundcork/docker-daemon.json
 cp 05-soundcork-runtime.sh /data/on_boot.d/05-soundcork-runtime.sh
 cp 20-soundcork.sh /data/on_boot.d/20-soundcork.sh
+cp soundcork-provision-rootfs.sh /data/soundcork/soundcork-provision-rootfs.sh
 cp soundcork-nspawn.sh /data/soundcork/soundcork-nspawn.sh
 cp soundcork-healthcheck.sh /data/soundcork/soundcork-healthcheck.sh
 chmod +x /data/on_boot.d/05-soundcork-runtime.sh
 chmod +x /data/on_boot.d/20-soundcork.sh
+chmod +x /data/soundcork/soundcork-provision-rootfs.sh
 chmod +x /data/soundcork/soundcork-nspawn.sh
 chmod +x /data/soundcork/soundcork-healthcheck.sh
 ```
@@ -92,9 +96,39 @@ script exits nonzero and prints a redacted tail of the container logs.
 
 Use `soundcork-nspawn.sh` on UniFi gateways where Docker or Podman cannot
 start containers, or where you prefer a rootfs under `/data` over a host
-container runtime. This launcher does not build the rootfs. Prepare one first
-with Python `>=3.12`, SoundCork source, and a virtualenv containing Gunicorn
-and SoundCork's runtime dependencies.
+container runtime. The launcher expects a prepared rootfs with Python,
+SoundCork source, and a virtualenv containing Gunicorn and SoundCork's runtime
+dependencies.
+
+The optional provisioner builds that rootfs manually; do not place it in
+`/data/on_boot.d`:
+
+```sh
+/data/soundcork/soundcork-provision-rootfs.sh
+```
+
+By default it creates `/data/soundcork/nspawn-rootfs` with Debian `trixie`,
+clones `https://github.com/deborahgu/soundcork.git`, checks out `main`, creates
+`/opt/soundcork-venv`, installs SoundCork dependencies when standard Python
+metadata is present, and installs Gunicorn. It refuses rootfs targets outside
+`/data` unless `SOUNDCORK_ROOTFS_ALLOW_OUTSIDE_DATA=1` is set.
+
+If `debootstrap` is missing on the UniFi host, install it yourself or run the
+provisioner with explicit host package installation enabled. This installs only
+the provisioning tool; provide `systemd-nspawn` separately for the launcher, or
+set `SOUNDCORK_NSPAWN` to an extracted binary under `/data`:
+
+```sh
+SOUNDCORK_ROOTFS_INSTALL_HOST_TOOLS=1 \
+SOUNDCORK_ROOTFS_APT_UPDATE=1 \
+/data/soundcork/soundcork-provision-rootfs.sh
+```
+
+Set `SOUNDCORK_ROOTFS_SUITE`, `SOUNDCORK_ROOTFS_MIRROR`, `SOUNDCORK_REPO_URL`,
+and `SOUNDCORK_REPO_REF` before running the provisioner if you need a pinned
+Debian suite, mirror, fork, tag, or commit. The default Python compatibility
+check requires Python `>=3.12`; adjust `SOUNDCORK_ROOTFS_MIN_PYTHON` only when
+you have selected a SoundCork ref that supports an older Python version.
 
 Expected defaults inside the rootfs:
 
@@ -119,6 +153,7 @@ SOUNDCORK_ROOTFS=/data/soundcork/nspawn-rootfs
 SOUNDCORK_NSPAWN=/usr/bin/systemd-nspawn
 SOUNDCORK_APP_DIR=/opt/soundcork/soundcork
 SOUNDCORK_PYTHONPATH=/opt/soundcork
+SOUNDCORK_VENV=/opt/soundcork-venv
 SOUNDCORK_GUNICORN=/opt/soundcork-venv/bin/gunicorn
 DATA_DIR=/data/soundcork/data
 LOG_DIR=/data/soundcork/logs
