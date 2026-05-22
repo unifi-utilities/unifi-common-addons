@@ -32,6 +32,10 @@ enough on firmware that validates TLS certificates.
   direct nspawn launcher from package repositories and SoundCork source.
 - `soundcork-nspawn.sh` starts SoundCork from a prepared rootfs through
   rootful `systemd-nspawn`, for gateways where Docker or Podman is not usable.
+- `30-soundtouch-remux.sh` optionally starts a helper that remuxes selected
+  Ogg-FLAC radio streams to native FLAC for SoundTouch internet radio playback.
+- `remux_stream_endpoint.py` is the small HTTP remux helper used by
+  `30-soundtouch-remux.sh`.
 - `soundcork.env.example` is the controller-side environment template.
 - `soundcork-healthcheck.sh` checks SoundCork, optional Spotify account
   support.
@@ -48,11 +52,14 @@ cp soundcork.env.example /data/soundcork/soundcork.env
 cp docker-daemon.json.example /data/soundcork/docker-daemon.json
 cp 05-soundcork-runtime.sh /data/on_boot.d/05-soundcork-runtime.sh
 cp 20-soundcork.sh /data/on_boot.d/20-soundcork.sh
+cp 30-soundtouch-remux.sh /data/on_boot.d/30-soundtouch-remux.sh
+cp remux_stream_endpoint.py /data/soundcork/remux_stream_endpoint.py
 cp soundcork-provision-rootfs.sh /data/soundcork/soundcork-provision-rootfs.sh
 cp soundcork-nspawn.sh /data/soundcork/soundcork-nspawn.sh
 cp soundcork-healthcheck.sh /data/soundcork/soundcork-healthcheck.sh
 chmod +x /data/on_boot.d/05-soundcork-runtime.sh
 chmod +x /data/on_boot.d/20-soundcork.sh
+chmod +x /data/on_boot.d/30-soundtouch-remux.sh
 chmod +x /data/soundcork/soundcork-provision-rootfs.sh
 chmod +x /data/soundcork/soundcork-nspawn.sh
 chmod +x /data/soundcork/soundcork-healthcheck.sh
@@ -204,6 +211,86 @@ three 10 MiB rotated files:
 ```sh
 SOUNDCORK_LOG_MAX_BYTES=10485760
 SOUNDCORK_LOG_ROTATIONS=3
+```
+
+## Optional FLAC Remux Helper
+
+Some radio stations publish FLAC audio inside an Ogg container. Tested
+SoundTouch firmware can fetch those streams but rejects the Ogg-FLAC framing in
+the internet-radio path, while the same audio remuxed to native FLAC plays.
+
+The optional `30-soundtouch-remux.sh` hook starts a small host-networked HTTP
+helper on port `8768`. It serves:
+
+```text
+GET  /healthz
+GET  /metrics
+HEAD /flac
+GET  /flac
+GET  /remux/flac
+```
+
+`/flac` runs ffmpeg in remux-only mode:
+
+```text
+Ogg-FLAC input -> native FLAC output
+```
+
+It does not transcode audio, so quality is preserved. Each playback client owns
+one ffmpeg process; the helper terminates that process when the client
+disconnects. Upstream hosts are allowlisted by the Python helper.
+
+In `auto` mode, the hook first tries to reuse the direct SoundCork rootfs with
+`chroot` when that rootfs contains Python and a usable `ffmpeg` executable. If
+that rootfs is not available, it falls back to the original Docker/Podman
+sidecar path. A separate `nspawn` mode is available only for a separate rootfs;
+a second `systemd-nspawn` process cannot reuse a busy rootfs already used by
+SoundCork.
+
+Enable it explicitly in `/data/soundcork/soundcork.env`:
+
+```sh
+SOUNDTOUCH_REMUX_ENABLED=1
+SOUNDTOUCH_REMUX_PORT=8768
+SOUNDTOUCH_REMUX_RUNTIME=auto
+SOUNDTOUCH_REMUX_UPSTREAM=https://amp.cesnet.cz:8443/cro3.flac
+# Optional command name or absolute path inside the selected runtime.
+# Prefer a command name available in SOUNDTOUCH_REMUX_RUNTIME_PATH for rootfs mode.
+# SOUNDTOUCH_REMUX_FFMPEG=ffmpeg-btbn
+# SOUNDTOUCH_REMUX_RUNTIME_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Optional comma- or whitespace-separated upstream host allowlist.
+SOUNDTOUCH_REMUX_ALLOW_HOSTS="amp.cesnet.cz radio.cesnet.cz"
+# Optional ffmpeg concurrency cap. 0 or unset means unlimited.
+SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES=4
+# Optional rootfs paths; defaults match the direct SoundCork nspawn launcher.
+# SOUNDTOUCH_REMUX_ROOTFS=/data/soundcork/nspawn-rootfs
+# Only used with SOUNDTOUCH_REMUX_RUNTIME=nspawn and a separate, non-busy rootfs.
+# SOUNDTOUCH_REMUX_NSPAWN=/data/soundcork/nspawn-tools/usr/bin/systemd-nspawn
+# Set to 1 only when remux should be a hard udm-boot dependency.
+SOUNDTOUCH_REMUX_REQUIRED=0
+```
+
+Start or restart it without rebooting:
+
+```sh
+/data/on_boot.d/30-soundtouch-remux.sh
+```
+
+Then verify from the UniFi host and from the speaker LAN:
+
+```sh
+command curl -fsS http://127.0.0.1:8768/healthz
+command curl -fsS http://unifi:8768/healthz
+command curl -I http://unifi:8768/flac
+/data/soundcork/soundcork-healthcheck.sh --remux
+```
+
+Point a SoundCork `LOCAL_INTERNET_RADIO` stream URL at
+`http://unifi:8768/flac`, or pass a percent-encoded upstream URL for individual
+stations:
+
+```text
+http://unifi:8768/flac?url=https%3A%2F%2Famp.cesnet.cz%3A8443%2Fcro3.flac
 ```
 
 ## Optional Docker Daemon Config
