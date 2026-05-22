@@ -4,13 +4,14 @@ set -eu
 ENV_FILE="${ENV_FILE:-/data/soundcork/soundcork.env}"
 QUIET=0
 FORCE_SPOTIFY=""
+FORCE_REMUX=""
 
 usage() {
     cat <<'EOF'
-Usage: soundcork-healthcheck.sh [--spotify|--no-spotify] [--quiet]
+Usage: soundcork-healthcheck.sh [--spotify|--no-spotify] [--remux|--no-remux] [--quiet]
 
 Checks SoundCork's local registry endpoint and, when requested or configured,
-the Spotify accounts endpoint. Response bodies and
+the Spotify accounts endpoint and FLAC remux sidecar. Response bodies and
 OAuth secrets are not printed.
 EOF
 }
@@ -22,6 +23,12 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-spotify)
             FORCE_SPOTIFY=0
+            ;;
+        --remux)
+            FORCE_REMUX=1
+            ;;
+        --no-remux)
+            FORCE_REMUX=0
             ;;
         --quiet)
             QUIET=1
@@ -52,6 +59,9 @@ SPOTIFY_CLIENT_SECRET="${SPOTIFY_CLIENT_SECRET:-${spotify_client_secret:-}}"
 SOUNDCORK_HEALTHCHECK_TIMEOUT="${SOUNDCORK_HEALTHCHECK_TIMEOUT:-5}"
 SOUNDCORK_HEALTHCHECK_SPOTIFY="${SOUNDCORK_HEALTHCHECK_SPOTIFY:-auto}"
 SOUNDCORK_HEALTHCHECK_SPOTIFY_ACCOUNT="${SOUNDCORK_HEALTHCHECK_SPOTIFY_ACCOUNT:-}"
+SOUNDCORK_HEALTHCHECK_REMUX="${SOUNDCORK_HEALTHCHECK_REMUX:-auto}"
+SOUNDTOUCH_REMUX_ENABLED="${SOUNDTOUCH_REMUX_ENABLED:-0}"
+SOUNDTOUCH_REMUX_PORT="${SOUNDTOUCH_REMUX_PORT:-8768}"
 REGISTRY_URL="${SOUNDCORK_HEALTHCHECK_REGISTRY_URL:-http://127.0.0.1:${SOUNDCORK_PORT}/bmx/registry/v1/services}"
 SPOTIFY_ACCOUNTS_URL="${SOUNDCORK_HEALTHCHECK_SPOTIFY_URL:-http://127.0.0.1:${SOUNDCORK_PORT}/mgmt/spotify/accounts}"
 TMP_BODY=""
@@ -164,6 +174,45 @@ should_check_spotify() {
     esac
 }
 
+is_remux_enabled() {
+    case "$SOUNDTOUCH_REMUX_ENABLED" in
+        1|true|TRUE|yes|YES|on|ON)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+should_check_remux() {
+    if [ "$FORCE_REMUX" = "1" ]; then
+        return 0
+    fi
+
+    if [ "$FORCE_REMUX" = "0" ]; then
+        return 1
+    fi
+
+    case "$SOUNDCORK_HEALTHCHECK_REMUX" in
+        1|true|TRUE|yes|YES|required|REQUIRED|on|ON)
+            return 0
+            ;;
+        0|false|FALSE|no|NO|off|OFF)
+            return 1
+            ;;
+        auto|AUTO)
+            is_remux_enabled
+            return $?
+            ;;
+        *)
+            log "unknown SOUNDCORK_HEALTHCHECK_REMUX=${SOUNDCORK_HEALTHCHECK_REMUX}; treating it as auto"
+            is_remux_enabled
+            return $?
+            ;;
+    esac
+}
+
 check_spotify_accounts() {
     check_endpoint "spotify accounts" "$SPOTIFY_ACCOUNTS_URL"
 
@@ -186,6 +235,12 @@ check_spotify_accounts() {
     log "spotify accounts check OK"
 }
 
+check_remux() {
+    check_endpoint "remux healthz" "http://127.0.0.1:${SOUNDTOUCH_REMUX_PORT}/healthz"
+    check_endpoint "remux metrics" "http://127.0.0.1:${SOUNDTOUCH_REMUX_PORT}/metrics"
+    log "remux check OK"
+}
+
 make_tmp_body
 
 check_endpoint "registry" "$REGISTRY_URL"
@@ -196,5 +251,10 @@ else
     log "spotify accounts check skipped"
 fi
 
+if should_check_remux; then
+    check_remux
+else
+    log "remux check skipped"
+fi
 
 log "SoundCork healthcheck OK"
