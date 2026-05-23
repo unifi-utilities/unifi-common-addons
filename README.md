@@ -24,6 +24,10 @@ Enables emulation of a Cascaded Router setup and allows full use of your CIDR on
 
 Enables 6RD on CenturyLink connections. This allows you to use IPv6 on your LAN and have it routed over the 6RD tunnel to the internet.
 
+### he-ipv6
+
+Enables a [Hurricane Electric Tunnel Broker](https://tunnelbroker.net/) [6in4](https://www.rfc-editor.org/rfc/rfc4213.html) tunnel on UniFi OS gateways where the ISP only provides IPv4.
+
 ### nspawn-container
 
 Enables Containers - replacing Podman.
