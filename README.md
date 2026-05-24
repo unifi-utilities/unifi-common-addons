@@ -34,7 +34,7 @@ Persist changes to your device's configurations and prevent them from being over
 
 ### soundcork
 
-Runs SoundCork on a UniFi OS gateway for local Bose SoundTouch cloud endpoint emulation.
+Runs [SoundCork](https://github.com/deborahgu/soundcork) on a UniFi OS gateway for local Bose SoundTouch cloud endpoint emulation.
 
 ### tailscale-unifi
 
