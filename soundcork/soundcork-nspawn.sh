@@ -227,6 +227,8 @@ stop_previous() {
 if [ -z "$NSPAWN_BIN" ]; then
     if command -v systemd-nspawn >/dev/null 2>&1; then
         NSPAWN_BIN="$(command -v systemd-nspawn)"
+    elif [ -x /data/soundcork/nspawn-tools/usr/bin/systemd-nspawn ]; then
+        NSPAWN_BIN=/data/soundcork/nspawn-tools/usr/bin/systemd-nspawn
     elif [ -x /data/soundcork/systemd-nspawn/usr/bin/systemd-nspawn ]; then
         NSPAWN_BIN=/data/soundcork/systemd-nspawn/usr/bin/systemd-nspawn
     else

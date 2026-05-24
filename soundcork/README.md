@@ -1,7 +1,8 @@
 # SoundCork
 
 Run [SoundCork](https://github.com/deborahgu/soundcork) on a UniFi OS
-gateway using `unifi-common`'s `/data/on_boot.d` hook.
+gateway using [`unifi-common`](https://github.com/unifi-utilities/unifi-common)'s
+`/data/on_boot.d` hook.
 
 SoundCork emulates the discontinued Bose SoundTouch cloud endpoints used for
 account data, internet radio, and some speaker-managed music-provider flows.
@@ -11,13 +12,16 @@ enough on firmware that validates TLS certificates.
 
 ## Requirements
 
-- `unifi-common` installed and `udm-boot.service` enabled.
+- [`unifi-common`](https://github.com/unifi-utilities/unifi-common) installed
+  and `udm-boot.service` enabled.
 - A stable speaker-facing DNS name or address for the UniFi host. The default
   is `http://unifi:8001`, which works when `unifi` resolves from the speaker
   LAN.
-- Docker or Podman on the UniFi OS host, or a prepared rootfs for the direct
-  `systemd-nspawn` launcher. If no container runtime is available, the runtime
-  hook can try `apt-get install docker.io` when `apt-get` is present and
+- [Docker](https://docs.docker.com/engine/) or
+  [Podman](https://podman.io/) on the UniFi OS host, or a prepared rootfs for
+  the direct [`systemd-nspawn`](https://www.freedesktop.org/software/systemd/man/latest/systemd-nspawn.html)
+  launcher. If no container runtime is available, the runtime hook can try
+  `apt-get install docker.io` when `apt-get` is present and
   `SOUNDCORK_RUNTIME_AUTO_INSTALL=1`.
 - Existing private SoundCork account data, if you are migrating an existing
   SoundCork installation.
@@ -107,6 +111,11 @@ container runtime. The launcher expects a prepared rootfs with Python,
 SoundCork source, and a virtualenv containing Gunicorn and SoundCork's runtime
 dependencies.
 
+This direct launcher is separate from the more general
+[`nspawn-container`](../nspawn-container) addon. Use that addon when you want a
+generic managed container. Use `soundcork-nspawn.sh` when you want the smallest
+SoundCork-specific runtime surface under `/data/soundcork`.
+
 The optional provisioner builds that rootfs manually; do not place it in
 `/data/on_boot.d`:
 
@@ -114,16 +123,18 @@ The optional provisioner builds that rootfs manually; do not place it in
 /data/soundcork/soundcork-provision-rootfs.sh
 ```
 
-By default it creates `/data/soundcork/nspawn-rootfs` with Debian `trixie`,
-clones `https://github.com/deborahgu/soundcork.git`, checks out `main`, creates
-`/opt/soundcork-venv`, installs SoundCork dependencies when standard Python
-metadata is present, and installs Gunicorn. It refuses rootfs targets outside
-`/data` unless `SOUNDCORK_ROOTFS_ALLOW_OUTSIDE_DATA=1` is set.
+By default it creates `/data/soundcork/nspawn-rootfs` with
+[Debian trixie](https://www.debian.org/releases/trixie/), clones
+[`deborahgu/soundcork`](https://github.com/deborahgu/soundcork), checks out
+`main`, creates `/opt/soundcork-venv`, installs SoundCork dependencies when
+standard Python metadata is present, and installs Gunicorn. It refuses rootfs
+targets outside `/data` unless `SOUNDCORK_ROOTFS_ALLOW_OUTSIDE_DATA=1` is set.
 
-If `debootstrap` is missing on the UniFi host, install it yourself or run the
-provisioner with explicit host package installation enabled. This installs only
-the provisioning tool; provide `systemd-nspawn` separately for the launcher, or
-set `SOUNDCORK_NSPAWN` to an extracted binary under `/data`:
+If [`debootstrap`](https://wiki.debian.org/Debootstrap) is missing on the
+UniFi host, install it yourself or run the provisioner with explicit host
+package installation enabled. This installs only the provisioning tool; provide
+`systemd-nspawn` separately for the launcher, or set `SOUNDCORK_NSPAWN` to an
+extracted binary under `/data`:
 
 ```sh
 SOUNDCORK_ROOTFS_INSTALL_HOST_TOOLS=1 \
@@ -157,7 +168,9 @@ wrapper under `/data/on_boot.d`:
 
 ```sh
 SOUNDCORK_ROOTFS=/data/soundcork/nspawn-rootfs
-SOUNDCORK_NSPAWN=/usr/bin/systemd-nspawn
+# Use /usr/bin/systemd-nspawn when the host provides it, or the extracted
+# systemd-container payload under /data/soundcork/nspawn-tools.
+SOUNDCORK_NSPAWN=/data/soundcork/nspawn-tools/usr/bin/systemd-nspawn
 SOUNDCORK_APP_DIR=/opt/soundcork/soundcork
 SOUNDCORK_PYTHONPATH=/opt/soundcork
 SOUNDCORK_VENV=/opt/soundcork-venv
@@ -181,7 +194,7 @@ cat >/data/on_boot.d/20-soundcork-nspawn.sh <<'EOF'
 set -eu
 exec env \
   SOUNDCORK_ROOTFS=/data/soundcork/nspawn-rootfs \
-  SOUNDCORK_NSPAWN=/usr/bin/systemd-nspawn \
+  SOUNDCORK_NSPAWN=/data/soundcork/nspawn-tools/usr/bin/systemd-nspawn \
   /data/soundcork/soundcork-nspawn.sh
 EOF
 chmod +x /data/on_boot.d/20-soundcork-nspawn.sh
@@ -254,7 +267,9 @@ SOUNDTOUCH_REMUX_ENABLED=1
 SOUNDTOUCH_REMUX_PORT=8768
 SOUNDTOUCH_REMUX_RUNTIME=auto
 SOUNDTOUCH_REMUX_UPSTREAM=https://amp.cesnet.cz:8443/cro3.flac
-# Optional command name or absolute path inside the selected runtime.
+# Optional command name or absolute path inside the selected runtime. A
+# portable build such as BtbN's FFmpeg builds can be installed into the rootfs
+# as ffmpeg-btbn; this addon does not download or verify it.
 # Prefer a command name available in SOUNDTOUCH_REMUX_RUNTIME_PATH for rootfs mode.
 # SOUNDTOUCH_REMUX_FFMPEG=ffmpeg-btbn
 # SOUNDTOUCH_REMUX_RUNTIME_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -269,6 +284,14 @@ SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES=4
 # Set to 1 only when remux should be a hard udm-boot dependency.
 SOUNDTOUCH_REMUX_REQUIRED=0
 ```
+
+For rootfs/chroot remux, either install `ffmpeg` from the rootfs package
+repositories or place a portable build such as
+[BtbN's FFmpeg builds](https://github.com/BtbN/FFmpeg-Builds) under
+`/usr/local/bin/ffmpeg-btbn` inside the rootfs and set
+`SOUNDTOUCH_REMUX_FFMPEG=ffmpeg-btbn`. Keep binary downloads and checksum
+verification outside this addon for now; a future release workflow can publish
+or pin a prepared rootfs artifact.
 
 Start or restart it without rebooting:
 
