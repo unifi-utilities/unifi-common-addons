@@ -1,0 +1,68 @@
+# Copy this file to /data/on_boot.d/he-ipv6.conf and fill in the values from
+# the Hurricane Electric tunnel details page.
+
+# Interface name created on the UniFi gateway.
+HE_TUNNEL_IF="he-ipv6"
+
+# HE "Server IPv4 Address".
+HE_SERVER_IPV4="CHANGE_ME_SERVER_IPV4"
+
+# HE "Client IPv4 Address". Leave empty to auto-detect the source address used
+# to reach HE_SERVER_IPV4. Set this explicitly if your WAN source selection is
+# unusual or policy-routed.
+HE_CLIENT_IPV4=""
+
+# HE "Client IPv6 Address" with prefix length, usually the ::2 address from the
+# tunnel /64.
+HE_CLIENT_IPV6="CHANGE_ME_CLIENT_IPV6/64"
+
+# HE "Server IPv6 Address", usually the ::1 address from the tunnel /64. Used
+# only by --check connectivity validation.
+HE_SERVER_IPV6="CHANGE_ME_SERVER_IPV6"
+
+# Typical 6in4 MTU is 1480: Ethernet 1500 minus the outer IPv4 header.
+HE_TUNNEL_MTU="1480"
+HE_TUNNEL_TTL="255"
+
+# Install an IPv6 default route through the tunnel.
+HE_DEFAULT_ROUTE="1"
+HE_DEFAULT_ROUTE_METRIC="512"
+
+# Enable IPv6 forwarding sysctls.
+HE_ENABLE_FORWARDING="1"
+
+# Add runtime UniFi ip6tables jumps that classify he-ipv6 ingress/egress as
+# WAN traffic so Internet v6 In/Local/Out rules apply to the tunnel.
+HE_WAN_CLASSIFICATION="1"
+
+# Watchdog interval in seconds. Set to 0 to disable. This is useful because
+# UniFi Network/UDAPI reprovision events can remove runtime firewall jumps.
+HE_WATCHDOG_INTERVAL="60"
+HE_WATCHDOG_PIDFILE="/run/he-ipv6-watchdog.pid"
+
+# Optional LAN address checks/management.
+#
+# Recommended: configure LAN IPv6 prefixes in UniFi Network UI/API when
+# possible and keep HE_MANAGE_LAN_ADDRESSES=0. List the expected addresses here
+# if you still want --check to validate them.
+#
+# HE may provide both a routed /64 and an optional routed /48. Do not assign the
+# /48 itself to a LAN interface. Pick one /64 per LAN from those routed
+# allocations and list the gateway address for each LAN here.
+#
+# Format is whitespace-separated interface=address/prefix pairs.
+# Example:
+# HE_LAN_ADDRESSES="br0=2001:db8:100::1/64 br2=2001:db8:101::1/64"
+HE_LAN_ADDRESSES=""
+
+# If set to 1, --apply adds missing addresses from HE_LAN_ADDRESSES.
+HE_MANAGE_LAN_ADDRESSES="0"
+
+# If set to 1 together with HE_MANAGE_LAN_ADDRESSES=1, --apply first removes
+# existing global IPv6 addresses from listed LAN interfaces. Leave this at 0
+# unless you intentionally want runtime state to override UniFi-managed LAN
+# IPv6 addresses.
+HE_FLUSH_LAN_GLOBAL="0"
+
+# Ping HE_SERVER_IPV6 during --check.
+HE_CHECK_CONNECTIVITY="1"
