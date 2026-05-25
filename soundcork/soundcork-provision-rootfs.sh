@@ -281,6 +281,7 @@ warn_runtime_tools() {
     fi
 
     if command -v systemd-nspawn >/dev/null 2>&1 ||
+        [ -x "${SOUNDCORK_STATE_DIR}/nspawn-tools/usr/bin/systemd-nspawn" ] ||
         [ -x "${SOUNDCORK_STATE_DIR}/systemd-nspawn/usr/bin/systemd-nspawn" ]; then
         return 0
     fi
