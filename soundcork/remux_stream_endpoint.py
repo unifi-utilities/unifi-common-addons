@@ -168,7 +168,13 @@ class RemuxHandler(BaseHTTPRequestHandler):
             self.server.record_request_rejected()
             self.send_error(403, "upstream host is not allowed")
             return None
-        return upstream
+
+        # Reconstruct the URL strictly from its validated parsed components.
+        # This guarantees the string always begins with "http://" or "https://",
+        # so it can never be misinterpreted as an ffmpeg flag or inject extra
+        # arguments into the subprocess command list (CWE-78 / CWE-88).
+        safe_upstream = urllib.parse.urlunsplit(parsed_upstream)
+        return safe_upstream
 
     def _send_text(self, status_code: int, body: str) -> None:
         payload = body.encode("utf-8")
