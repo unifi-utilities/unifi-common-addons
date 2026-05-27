@@ -35,6 +35,12 @@ HE_ENABLE_FORWARDING="1"
 # WAN traffic so Internet v6 In/Local/Out rules apply to the tunnel.
 HE_WAN_CLASSIFICATION="1"
 
+# Clamp forwarded TCP MSS on the tunnel so LAN clients do not need to rely on
+# ICMPv6 Packet Too Big handling for the 6in4 MTU. Leave HE_TCP_MSS empty to
+# use HE_TUNNEL_MTU minus 60 bytes: 1420 for the default MTU 1480.
+HE_TCP_MSS_CLAMP="1"
+HE_TCP_MSS=""
+
 # Watchdog interval in seconds. Set to 0 to disable. This is useful because
 # UniFi Network/UDAPI reprovision events can remove runtime firewall jumps.
 HE_WATCHDOG_INTERVAL="60"
