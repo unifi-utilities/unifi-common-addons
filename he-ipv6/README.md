@@ -68,6 +68,15 @@ HE_FLUSH_LAN_GLOBAL="0"
 
 Keep `HE_FLUSH_LAN_GLOBAL=0` unless you intentionally want the script to remove existing global IPv6 addresses from listed LAN interfaces before adding its own.
 
+The HE tunnel MTU is usually 1480, while LAN clients often use Ethernet MTU 1500. Keep TCP MSS clamping enabled unless you intentionally handle path MTU elsewhere:
+
+```sh
+HE_TCP_MSS_CLAMP="1"
+HE_TCP_MSS=""
+```
+
+With `HE_TCP_MSS` empty, the script uses `HE_TUNNEL_MTU - 60`, which is `1420` for the default tunnel MTU. This avoids relying on every LAN client or container runtime to handle ICMPv6 Packet Too Big messages correctly during large downloads.
+
 ## Firewall Classification
 
 UniFi's generated firewall rules classify traffic by known interfaces. A custom SIT tunnel interface may not be part of the generated WAN interface list, so traffic can otherwise bypass the expected `Internet v6` rule family.
@@ -82,6 +91,12 @@ ip6tables -I UBIOS_FORWARD_OUT_USER 1 -o he-ipv6 -j UBIOS_WAN_OUT_USER
 
 This keeps unsolicited inbound traffic on the normal Internet/WAN IPv6 policy path. Create allow rules in UniFi Network only for services you intentionally want reachable over IPv6.
 
+The script also adds a runtime mangle rule in `UBIOS_FORWARD_TCPMSS` when that UniFi chain exists, falling back to the standard `FORWARD` chain otherwise:
+
+```sh
+ip6tables -t mangle -I UBIOS_FORWARD_TCPMSS 1 -o he-ipv6 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1420
+```
+
 UniFi Network/UDAPI reprovision events can remove runtime firewall rules, so the script starts a lightweight watchdog by default. Set `HE_WATCHDOG_INTERVAL=0` to disable it.
 
 ## Validation
@@ -94,6 +109,7 @@ ip tunnel show he-ipv6
 ip -6 addr show he-ipv6
 ip -6 route show default
 ip6tables -S UBIOS_FORWARD_IN_USER | grep he-ipv6
+ip6tables -t mangle -S UBIOS_FORWARD_TCPMSS | grep he-ipv6
 ```
 
 Expected `--check` output ends with:
