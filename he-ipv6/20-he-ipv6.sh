@@ -68,6 +68,8 @@ HE_DEFAULT_ROUTE=${HE_DEFAULT_ROUTE:-1}
 HE_DEFAULT_ROUTE_METRIC=${HE_DEFAULT_ROUTE_METRIC:-512}
 HE_ENABLE_FORWARDING=${HE_ENABLE_FORWARDING:-1}
 HE_WAN_CLASSIFICATION=${HE_WAN_CLASSIFICATION:-1}
+HE_TCP_MSS_CLAMP=${HE_TCP_MSS_CLAMP:-1}
+HE_TCP_MSS=${HE_TCP_MSS:-}
 HE_WATCHDOG_INTERVAL=${HE_WATCHDOG_INTERVAL:-60}
 HE_WATCHDOG_PIDFILE=${HE_WATCHDOG_PIDFILE:-/run/he-ipv6-watchdog.pid}
 HE_MANAGE_LAN_ADDRESSES=${HE_MANAGE_LAN_ADDRESSES:-0}
@@ -115,6 +117,28 @@ get_client_ipv4() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+tcp_mss_value() {
+    if [ -n "$HE_TCP_MSS" ] && ! is_placeholder "$HE_TCP_MSS"; then
+        case "$HE_TCP_MSS" in
+            *[!0-9]*)
+                return 1
+                ;;
+        esac
+        printf '%s\n' "$HE_TCP_MSS"
+        return 0
+    fi
+
+    case "$HE_TUNNEL_MTU" in
+        ""|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    mss=$((HE_TUNNEL_MTU - 60))
+    [ "$mss" -gt 0 ] || return 1
+    printf '%s\n' "$mss"
 }
 
 run() {
@@ -191,6 +215,25 @@ ensure_wan_classification() {
     ensure_ip6tables_rule UBIOS_FORWARD_OUT_USER -o UBIOS_WAN_OUT_USER
 }
 
+ensure_tcp_mss_clamp() {
+    [ "$HE_TCP_MSS_CLAMP" = "1" ] || return 0
+    command_exists ip6tables || return 0
+
+    mss=$(tcp_mss_value) || {
+        echo "Could not determine a valid TCP MSS from HE_TCP_MSS or HE_TUNNEL_MTU" >&2
+        exit 1
+    }
+
+    chain=UBIOS_FORWARD_TCPMSS
+    if ! ip6tables -t mangle -nL "$chain" >/dev/null 2>&1; then
+        chain=FORWARD
+    fi
+
+    if ! ip6tables -t mangle -C "$chain" -o "$HE_TUNNEL_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss" 2>/dev/null; then
+        run ip6tables -t mangle -I "$chain" 1 -o "$HE_TUNNEL_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss"
+    fi
+}
+
 apply_config() {
     require_config
     client_ipv4=$(get_client_ipv4)
@@ -204,6 +247,7 @@ apply_config() {
     ensure_default_route
     ensure_lan_addresses
     ensure_wan_classification
+    ensure_tcp_mss_clamp
 }
 
 CHECK_FAILS=0
@@ -251,6 +295,31 @@ check_ip6tables_rule() {
         check_ok "runtime glue: $label classification present"
     else
         check_fail "runtime glue: $label classification missing"
+    fi
+}
+
+check_tcp_mss_clamp() {
+    [ "$HE_TCP_MSS_CLAMP" = "1" ] || return 0
+
+    if ! command_exists ip6tables; then
+        check_warn "runtime glue: ip6tables missing, cannot check TCP MSS clamp"
+        return
+    fi
+
+    mss=$(tcp_mss_value) || {
+        check_fail "runtime glue: invalid TCP MSS from HE_TCP_MSS or HE_TUNNEL_MTU"
+        return
+    }
+
+    chain=UBIOS_FORWARD_TCPMSS
+    if ! ip6tables -t mangle -nL "$chain" >/dev/null 2>&1; then
+        chain=FORWARD
+    fi
+
+    if ip6tables -t mangle -C "$chain" -o "$HE_TUNNEL_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss" 2>/dev/null; then
+        check_ok "runtime glue: TCP MSS clamp present on $chain for $HE_TUNNEL_IF at $mss"
+    else
+        check_fail "runtime glue: TCP MSS clamp missing on $chain for $HE_TUNNEL_IF at $mss"
     fi
 }
 
@@ -322,6 +391,8 @@ check_state() {
         check_ip6tables_rule UBIOS_FORWARD_IN_USER -i UBIOS_WAN_IN_USER "wan in"
         check_ip6tables_rule UBIOS_FORWARD_OUT_USER -o UBIOS_WAN_OUT_USER "wan out"
     fi
+
+    check_tcp_mss_clamp
 
     if [ "$HE_CHECK_CONNECTIVITY" = "1" ] && [ -n "$HE_SERVER_IPV6" ] && ! is_placeholder "$HE_SERVER_IPV6"; then
         if ping -6 -c 1 -W 3 "$HE_SERVER_IPV6" >/dev/null 2>&1; then
