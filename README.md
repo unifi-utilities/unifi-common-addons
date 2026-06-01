@@ -16,6 +16,10 @@ Do this first. Enables init.d style scripts to run on every boot. This is requir
 
 Enables receiving up to 8 Prefix Delegations on AT&T connections.
 
+### att-pon-ipv6-patch
+
+Enables local ONT management access and fixes console-level IPv6 routing in bypassed AT&T environments.
+
 ### att-static-ips
 
 Enables emulation of a Cascaded Router setup and allows full use of your CIDR on AT&T connections.
