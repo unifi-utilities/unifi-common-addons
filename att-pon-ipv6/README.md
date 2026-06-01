@@ -1,10 +1,10 @@
-# att-pon-ipv6-patch
+# att-pon-ipv6
 
 On AT&T fiber networks, when bypassing the residential gateway entirely using an SFP+ ONT or custom media converter, the UniFi Console directly requests network credentials. While LAN clients successfully receive fully routable IPv6 allocations from the continuous `/64` subnets routed by AT&T, the UniFi Console's WAN interface itself receives a non-routable internal AT&T IPv6 address. This breaks console-level outbound IPv6 traffic, causing native features like internal speed tests to fail.
 
-This script patches the WAN interface on boot to bind a legitimate global IPv6 address from your allotment to the console itself, restoring full IPv6 functionality. Concurrently, it maintains a persistent localized IPv4 allocation on the WAN interface to preserve management access to your external ONT hardware.
+This script changes the WAN interface on boot to bind a legitimate global IPv6 address from your allotment to the console itself, restoring full IPv6 functionality. Concurrently, it maintains a persistent localized IPv4 allocation on the WAN interface to preserve management access to your external ONT hardware.
 
-Unlike alternative solutions, this patch operates non-destructively: all native UniFi Network UI features, firewall rules, and DHCP/DHCPv6 controls remain fully functional.
+Unlike alternative solutions, this change operates non-destructively: all native UniFi Network UI features, firewall rules, and DHCP/DHCPv6 controls remain fully functional.
 
 ## Requirements
 
@@ -14,7 +14,7 @@ Unlike alternative solutions, this patch operates non-destructively: all native 
 
 ## Customization
 
-The script reads its settings from a standalone configuration file located at `/data/att-pon-ipv6-patch/att-ipv6-patch.conf`. If it does not exist, you must create it.
+The script reads its settings from a standalone configuration file located at `/data/att-pon-ipv6/att-pon-ipv6.conf`. If it does not exist, you must create it.
 
 ```sh
 # The WAN physical interface (e.g., eth9 for UDM Pro/SE Port 10 SFP+)
@@ -38,18 +38,18 @@ The core script handles boot-stage race conditions automatically. Because `on_bo
 
 ```sh
 # 1. Create the persistent configuration container
-mkdir -p /data/att-pon-ipv6-patch
+mkdir -p /data/att-pon-ipv6
 
 # 2. Populate your configuration values into the file
-vi /data/att-pon-ipv6-patch/att-ipv6-patch.conf
+vi /data/att-pon-ipv6/att-pon-ipv6.conf
 
 # 3. Pull down the boot execution script
 cd /data/on_boot.d
-curl -LO https://raw.githubusercontent.com/unifi-utilities/unifi-common-addons/HEAD/att-pon-ipv6-patch/att-pon-ipv6-patch.sh
-chmod +x att-pon-ipv6-patch.sh
+curl -LO https://raw.githubusercontent.com/unifi-utilities/unifi-common-addons/HEAD/att-pon-ipv6/att-pon-ipv6.sh
+chmod +x att-pon-ipv6.sh
 
-# 4. Run immediately to patch without a reboot
-./att-pon-ipv6-patch.sh
+# 4. Run immediately to change without a reboot
+./att-pon-ipv6.sh
 
 ```
 
@@ -65,9 +65,9 @@ $ ip addr show dev eth9
     inet xx.xx.xx.xx/22 brd xx.xx.xx.xx scope global dynamic eth9
     inet 192.168.11.2/24 scope global eth9
        valid_lft forever preferred_lft forever
-    inet6 2001:db8:xxxx:xx00::2/128 scope global 
+    inet6 2001:db8:xxxx:xx00::2/128 scope global
        valid_lft forever preferred_lft forever
-    inet6 fe80::xxxx:xxxx:xxxx:xxxx/64 scope link 
+    inet6 fe80::xxxx:xxxx:xxxx:xxxx/64 scope link
        valid_lft forever preferred_lft forever
 
 ```
@@ -75,18 +75,18 @@ $ ip addr show dev eth9
 Inspect the system log to ensure both diagnostic checks pass and that no duplicate bindings occurred:
 
 ```sh
-$ journalctl -t att-pon-ipv6-patch --no-pager
+$ journalctl -t att-pon-ipv6 --no-pager
 [...]
-att-pon-ipv6-patch[1024]: Initial network diagnostic checks:
-att-pon-ipv6-patch[1025]: IPv4 connectivity to 192.168.11.1 successful.
-att-pon-ipv6-patch[1026]: WARNING: IPv4 connectivity to ifconfig.co failed.
-att-pon-ipv6-patch[1027]: Assigning IPv4 address '192.168.11.2/24' to 'eth9'...
-att-pon-ipv6-patch[1028]: IPv4 address '192.168.11.2/24' added successfully.
-att-pon-ipv6-patch[1029]: Assigning IPv6 address '2001:db8:xxxx:xx00::2/128' to 'eth9'...
-att-pon-ipv6-patch[1030]: IPv6 address '2001:db8:xxxx:xx00::2/128' added successfully.
-att-pon-ipv6-patch[1031]: Post-patch diagnostic checks:
-att-pon-ipv6-patch[1032]: IPv4 connectivity to 192.168.11.1 successful.
-att-pon-ipv6-patch[1033]: IPv6 connectivity to ifconfig.co successful.
+att-pon-ipv6[1024]: Initial network diagnostic checks:
+att-pon-ipv6[1025]: IPv4 connectivity to 192.168.11.1 successful.
+att-pon-ipv6[1026]: WARNING: IPv4 connectivity to ifconfig.co failed.
+att-pon-ipv6[1027]: Assigning IPv4 address '192.168.11.2/24' to 'eth9'...
+att-pon-ipv6[1028]: IPv4 address '192.168.11.2/24' added successfully.
+att-pon-ipv6[1029]: Assigning IPv6 address '2001:db8:xxxx:xx00::2/128' to 'eth9'...
+att-pon-ipv6[1030]: IPv6 address '2001:db8:xxxx:xx00::2/128' added successfully.
+att-pon-ipv6[1031]: Post diagnostic checks:
+att-pon-ipv6[1032]: IPv4 connectivity to 192.168.11.1 successful.
+att-pon-ipv6[1033]: IPv6 connectivity to ifconfig.co successful.
 
 ```
 
@@ -94,14 +94,13 @@ att-pon-ipv6-patch[1033]: IPv6 connectivity to ifconfig.co successful.
 
 ```sh
 # Read the complete execution logs for debugging link timelines
-journalctl -t att-pon-ipv6-patch -n 50 --no-pager
+journalctl -t att-pon-ipv6 -n 50 --no-pager
 
 # Force-run the utility manually if you change parameters in your conf file
-/data/on_boot.d/att-pon-ipv6-patch.sh
+/data/on_boot.d/att-pon-ipv6.sh
 
 ```
 
 ## Credits & Resources
 
-* **Deep Dive Blog Post:** For a detailed exploration of the routing architecture, root causes, and user discussions behind this implementation, read [UniFi OS – AT&T XGS-PON Gateway Bypass](https://www.stevenz.blog/att-xgs-pon-gateway-bypass-for-unifi-console/).
-"""
+- **Deep Dive Blog Post:** For a detailed exploration of the routing architecture, root causes, and user discussions behind this implementation, read [UniFi OS – AT&T XGS-PON Gateway Bypass](https://www.stevenz.blog/att-xgs-pon-gateway-bypass-for-unifi-console/).

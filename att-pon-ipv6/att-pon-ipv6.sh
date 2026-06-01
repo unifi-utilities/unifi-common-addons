@@ -1,28 +1,17 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-# Determine persistent data directory location across UniFi generations
-case "$(ubnt-device-info firmware || true)" in
-1*)
-    DATA_DIR="/mnt/data"
-    ;;
-2* | 3* | 4* | 5*)
-    DATA_DIR="/data"
-    ;;
-*)
-    echo "ERROR: No persistent storage found." >&2
-    exit 1
-    ;;
-esac
+# UniFi Data Directory
+DATA_DIR="/data"
 
 # Define paths matching your custom structure
-CONFIG_DIR="${DATA_DIR}/att-pon-ipv6-patch"
-CONFIG_FILE="${CONFIG_DIR}/att-ipv6-patch.conf"
+CONFIG_DIR="${DATA_DIR}/att-pon-ipv6"
+CONFIG_FILE="${CONFIG_DIR}/att-pon-ipv6.conf"
 
 # Logging function for system visibility
 log() {
-    echo "[att-pon-ipv6-patch] $1"
-    logger -t att-pon-ipv6-patch "$1"
+    echo "[att-pon-ipv6] $1"
+    logger -t att-pon-ipv6 "$1"
 }
 
 # Source Configuration File
@@ -100,7 +89,7 @@ else
     fi
 fi
 
-log "Post-patch diagnostic checks:"
+log "Post diagnostic checks:"
 test_ipv4_connectivity
 test_ipv6_connectivity
 

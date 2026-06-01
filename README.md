@@ -16,7 +16,7 @@ Do this first. Enables init.d style scripts to run on every boot. This is requir
 
 Enables receiving up to 8 Prefix Delegations on AT&T connections.
 
-### att-pon-ipv6-patch
+### att-pon-ipv6
 
 Enables local ONT management access and fixes console-level IPv6 routing in bypassed AT&T environments.
 
