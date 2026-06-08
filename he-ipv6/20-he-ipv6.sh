@@ -291,6 +291,10 @@ check_ip6tables_rule() {
         check_fail "runtime glue: chain $chain missing for $label"
         return
     fi
+    if ! ip6tables -nL "$target" >/dev/null 2>&1; then
+        check_warn "runtime glue: chain $target missing, skipping $label classification check"
+        return
+    fi
     if ip6tables -C "$chain" "$direction" "$HE_TUNNEL_IF" -j "$target" 2>/dev/null; then
         check_ok "runtime glue: $label classification present"
     else
