@@ -8,6 +8,9 @@ DATA_DIR="/data"
 CONFIG_DIR="${DATA_DIR}/att-pon-ipv6"
 CONFIG_FILE="${CONFIG_DIR}/att-pon-ipv6.conf"
 
+# Retry settings
+MAX_RETRIES=15
+
 # Logging function for system visibility
 log() {
     echo "[att-pon-ipv6] $1"
@@ -24,26 +27,55 @@ else
 fi
 
 # Connectivity validation helper functions
-test_ipv4_connectivity() {
-    if curl -4 -m 10 -s -o /dev/null "$IPV4_TEST_TARGET"; then
-        log "IPv4 connectivity to $IPV4_TEST_TARGET successful."
-    else
-        log "WARNING: IPv4 connectivity to $IPV4_TEST_TARGET failed."
+test_ip_connectivity() {
+    local ip_version="$1"
+    local mode="${2:-warn}"
+    local target
+
+    # Default mode logs final diagnostics without failing the script; retry mode
+    # returns failures so post diagnostics can retry before logging a final result.
+    case "$ip_version" in
+        4) target="$IPV4_TEST_TARGET" ;;
+        6) target="$IPV6_TEST_TARGET" ;;
+        *)
+            log "ERROR: Unsupported IP version '$ip_version'."
+            return 1
+            ;;
+    esac
+
+    if curl "-$ip_version" -m 10 -s -o /dev/null "$target"; then
+        log "IPv${ip_version} connectivity to $target successful."
+        return 0
     fi
+
+    if [[ "$mode" == "retry" ]]; then
+        log "WARNING: IPv${ip_version} connectivity to $target failed; retrying..."
+        return 1
+    fi
+
+    log "WARNING: IPv${ip_version} connectivity to $target failed."
+    return 0
 }
 
-test_ipv6_connectivity() {
-    if curl -6 -m 10 -s -o /dev/null "$IPV6_TEST_TARGET"; then
-        log "IPv6 connectivity to $IPV6_TEST_TARGET successful."
-    else
-        log "WARNING: IPv6 connectivity to $IPV6_TEST_TARGET failed."
-    fi
+perform_post_diagnostic_check() {
+    local ip_version="$1"
+    local retry_count=0
+
+    while (( retry_count < MAX_RETRIES )); do
+        if test_ip_connectivity "$ip_version" retry; then
+            return 0
+        fi
+
+        sleep 2
+        ((retry_count+=1))
+    done
+
+    test_ip_connectivity "$ip_version"
 }
 
 # --- Main Execution ---
 
 # 1. Wait for the interface to initialize (Handles boot-stage race conditions)
-MAX_RETRIES=15
 RETRY_COUNT=0
 while ! ip link show "$WAN_IFACE" >/dev/null 2>&1; do
     if (( RETRY_COUNT >= MAX_RETRIES )); then
@@ -52,12 +84,12 @@ while ! ip link show "$WAN_IFACE" >/dev/null 2>&1; do
     fi
     log "Waiting for interface $WAN_IFACE to initialize..."
     sleep 2
-    ((RETRY_COUNT++))
+    ((RETRY_COUNT+=1))
 done
 
 log "Initial network diagnostic checks:"
-test_ipv4_connectivity
-test_ipv6_connectivity
+test_ip_connectivity 4
+test_ip_connectivity 6
 
 # 2. Idempotent IPv4 Allocation
 CLEAN_IP4="${WAN_LOCAL_IP4%%/*}"
@@ -90,7 +122,7 @@ else
 fi
 
 log "Post diagnostic checks:"
-test_ipv4_connectivity
-test_ipv6_connectivity
+perform_post_diagnostic_check 4
+perform_post_diagnostic_check 6
 
 exit 0
