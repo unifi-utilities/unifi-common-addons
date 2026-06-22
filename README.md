@@ -6,7 +6,8 @@ A collection of addons to enhance the capabilities of your UniFi products.
 
 ### on_boot.d
 
-Do this first. Enables init.d style scripts to run on every boot. This is required for all addons below.
+> [!IMPORTANT]
+> Do this first. Enables init.d style scripts to run on every boot. This is required for all addons below.
 
 <https://github.com/unifi-utilities/unifi-common>
 
@@ -46,10 +47,11 @@ Runs [SoundCork](https://github.com/deborahgu/soundcork) on a UniFi OS gateway f
 
 ### tailscale-unifi
 
-Miscellaneous scripts to help with Tailscale and UniFi integration from [tailscale-unifi](https://github.com/SierraSoftworks/tailscale-unifi) by [@notheotherben](https://github.com/notheotherben)
+Miscellaneous scripts to help with Tailscale and UniFi integration from [tailscale-unifi](https://github.com/SierraSoftworks/tailscale-unifi)
 
 ## Missing something?
 
-We have moved the old addons to a new repository to make it easier to maintain and add new addons. If you have an addon that you would like to see added, please open an issue or submit a pull request.
+> [!TIP]
+> We have moved the old addons to a new repository to make it easier to maintain and add new addons. If you have an addon that you would like to see added, please open an issue or submit a pull request.
 
 <https://github.com/unifi-utilities/unifios-utilities-archived>
