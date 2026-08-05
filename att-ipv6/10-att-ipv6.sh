@@ -31,6 +31,7 @@ noup
 ipv6only
 nooption domain_name_servers
 nooption domain_name
+nohook resolv.conf
 duid
 persistent
 option rapid_commit
