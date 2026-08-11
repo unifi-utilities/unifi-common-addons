@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for delegated IPv6 acquisition changes
+
+[Path]
+PathChanged=/run/att-ipv6/acquisition.json
+Unit=att-ipv6-reconcile.service
+
+[Install]
+WantedBy=multi-user.target

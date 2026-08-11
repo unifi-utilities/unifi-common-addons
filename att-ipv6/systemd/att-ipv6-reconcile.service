@@ -1,0 +1,24 @@
+[Unit]
+Description=Reconcile delegated IPv6 prefixes into native UniFi networks
+After=network-online.target att-ipv6-acquire.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/data/att-ipv6/att-ipv6 apply
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/run/att-ipv6
+ReadOnlyPaths=/data/att-ipv6
+ReadOnlyPaths=/etc/resolv.conf
+ReadOnlyPaths=-/run/resolv.conf.d
+ReadOnlyPaths=-/run/dnsmasq.conf.d
+ReadOnlyPaths=-/run/dnsmasq.dhcp.conf.d
+ReadOnlyPaths=-/etc/dnsmasq.conf
+ReadOnlyPaths=-/etc/dnsmasq.d
+ReadOnlyPaths=-/data/unifi
+ReadOnlyPaths=-/data/unifi-core
+ReadOnlyPaths=-/var/lib/unifi
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

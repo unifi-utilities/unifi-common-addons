@@ -1,0 +1,21 @@
+{
+  "active": false,
+  "wan_interface": "eth9",
+  "duid": "00030001000000000000",
+  "api_key_path": "/data/att-ipv6/integration-api.key",
+  "acquisition_path": "/run/att-ipv6/acquisition.json",
+  "site": "default",
+  "delegations": [
+    {
+      "id": "primary",
+      "iaid": 17,
+      "network": "Primary LAN",
+      "vlan_id": 1,
+      "bridge": "br0"
+    }
+  ],
+  "ra_priority": "HIGH",
+  "dhcpv6_suffix_range": {"start": "::2", "stop": "::7d1"},
+  "dhcpv6_lease_seconds": 86400,
+  "minimum_valid_lifetime": 600
+}

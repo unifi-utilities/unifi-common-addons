@@ -1,0 +1,879 @@
+#!/usr/bin/env python3
+"""Validate odhcp6c PD state and reconcile static UniFi IPv6 networks."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Callable, Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+
+DEFAULT_CONFIG_PATH = Path("/data/att-ipv6/config.json")
+DEFAULT_API_KEY_PATH = Path("/data/att-ipv6/integration-api.key")
+DEFAULT_API_ENDPOINT = "https://127.0.0.1/proxy/network/integration/v1"
+ODHCP6C = "/usr/sbin/odhcp6c"
+HOOK_PATH = "/data/att-ipv6/att-ipv6-hook"
+CONFIG_DIGEST_ENV = "ATT_IPV6_CONFIG_DIGEST"
+READ_ONLY_NETWORK_FIELDS = {"default", "id", "metadata"}
+
+
+class ReconcileError(RuntimeError):
+    """Raised when state cannot be used without ambiguity."""
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ReconcileError(message)
+
+
+def _duid(value: str) -> str:
+    normalized = value.replace(":", "").lower()
+    _require(re.fullmatch(r"[0-9a-f]+", normalized) is not None, "DUID is malformed")
+    _require(len(normalized) >= 8 and len(normalized) % 2 == 0, "DUID is malformed")
+    return normalized
+
+
+def _ipv6_network(value: str, field: str) -> ipaddress.IPv6Network:
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError as exc:
+        raise ReconcileError(f"{field} is not a valid IPv6 prefix") from exc
+    _require(isinstance(network, ipaddress.IPv6Network), f"{field} must be IPv6")
+    _require(network.prefixlen == 64, f"{field} must be /64")
+    return network
+
+
+def _ipv6_address(value: str, field: str) -> str:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ReconcileError(f"{field} is not a valid address") from exc
+    _require(isinstance(address, ipaddress.IPv6Address), f"{field} must be IPv6")
+    return str(address)
+
+
+def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
+    _require(isinstance(raw, dict), "configuration must be an object")
+    config = copy.deepcopy(raw)
+    for field in ("wan_interface", "duid", "api_key_path"):
+        _require(config.get(field) not in (None, "", []), f"missing configuration field {field}")
+    _require("delegations" in config, "missing configuration field delegations")
+    config["duid"] = _duid(str(config["duid"]))
+    config.setdefault("active", False)
+    _require(isinstance(config["active"], bool), "active must be boolean")
+    config.setdefault("site", "default")
+    config.setdefault("acquisition_path", "/run/att-ipv6/acquisition.json")
+    config.setdefault("lock_path", "/run/att-ipv6/reconciler.lock")
+    config.setdefault("ra_priority", "HIGH")
+    config.setdefault("dhcpv6_suffix_range", {"start": "::2", "stop": "::7d1"})
+    config.setdefault("dhcpv6_lease_seconds", 86400)
+    config.setdefault("minimum_valid_lifetime", 600)
+    _require(config["ra_priority"] in {"LOW", "MEDIUM", "HIGH"}, "invalid RA priority")
+    for field in ("dhcpv6_lease_seconds", "minimum_valid_lifetime"):
+        config[field] = int(config[field])
+        _require(config[field] > 0, f"{field} must be positive")
+    suffixes = config["dhcpv6_suffix_range"]
+    _require(isinstance(suffixes, dict), "dhcpv6_suffix_range must be an object")
+    start = _ipv6_address(str(suffixes.get("start", "")), "DHCPv6 range start")
+    stop = _ipv6_address(str(suffixes.get("stop", "")), "DHCPv6 range stop")
+    _require(int(ipaddress.ip_address(start)) <= int(ipaddress.ip_address(stop)), "DHCPv6 range is reversed")
+    config["dhcpv6_suffix_range"] = {"start": start, "stop": stop}
+
+    delegations = config["delegations"]
+    _require(isinstance(delegations, list), "delegations must be a list")
+    _require(bool(delegations), "delegations must not be empty")
+    normalized = []
+    seen_ids: set[str] = set()
+    seen_iaids: set[int] = set()
+    seen_names: set[str] = set()
+    seen_bridges: set[str] = set()
+    for index, raw_item in enumerate(delegations):
+        _require(isinstance(raw_item, dict), f"delegation {index} must be an object")
+        item = copy.deepcopy(raw_item)
+        for field in ("id", "iaid", "network", "vlan_id", "bridge"):
+            _require(item.get(field) not in (None, ""), f"delegation {index} is missing {field}")
+        item["id"] = str(item["id"])
+        try:
+            item["iaid"] = int(item["iaid"])
+        except (TypeError, ValueError) as exc:
+            raise ReconcileError(f"delegation {index} IAID must be an integer") from exc
+        item["network"] = str(item["network"])
+        item["vlan_id"] = int(item["vlan_id"])
+        item["bridge"] = str(item["bridge"])
+        _require(item["id"] not in seen_ids, f"duplicate delegation id {item['id']}")
+        _require(0 <= item["iaid"] <= 0xFFFFFFFF, f"delegation {index} IAID must be an unsigned 32-bit integer")
+        _require(item["iaid"] not in seen_iaids, f"duplicate IAID {item['iaid']}")
+        _require(item["network"] not in seen_names, f"duplicate network {item['network']}")
+        _require(item["bridge"] not in seen_bridges, f"duplicate bridge {item['bridge']}")
+        seen_ids.add(item["id"])
+        seen_iaids.add(item["iaid"])
+        seen_names.add(item["network"])
+        seen_bridges.add(item["bridge"])
+        normalized.append(item)
+    config["delegations"] = sorted(normalized, key=lambda item: item["iaid"])
+    return config
+
+
+def config_digest(config: dict[str, Any]) -> str:
+    """Return the stable digest shared by the launcher, hook, and health."""
+    if isinstance(config.get("_source_digest"), str):
+        return config["_source_digest"]
+    digest_value = {key: value for key, value in config.items() if key != "_source_digest"}
+    return hashlib.sha256(
+        json.dumps(digest_value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def expected_state(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "duid": config["duid"],
+        "iaids": [item["iaid"] for item in config["delegations"]],
+        "delegation_count": len(config["delegations"]),
+        "networks": {
+            item["id"]: {
+                "iaid": item["iaid"],
+                "network": item["network"],
+                "vlan_id": item["vlan_id"],
+                "bridge": item["bridge"],
+            }
+            for item in config["delegations"]
+        },
+    }
+
+
+def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    try:
+        payload = Path(path).read_bytes()
+        raw = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReconcileError(f"unable to read configuration: {exc}") from exc
+    config = validate_config(raw)
+    config["_source_digest"] = hashlib.sha256(payload).hexdigest()
+    return config
+
+
+def load_acquisition(path: Path | str) -> dict[str, Any]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReconcileError(f"unable to read acquisition state: {exc}") from exc
+    _require(isinstance(value, dict), "acquisition state must be an object")
+    return value
+
+
+def validate_acquisition(
+    config: dict[str, Any], state: dict[str, Any], *, now: int
+) -> dict[str, dict[str, Any]]:
+    _require(state.get("schema") == 1, "unsupported acquisition state schema")
+    _require(
+        state.get("config_digest") == config_digest(config),
+        "acquisition configuration changed; restart the client in a controlled window",
+    )
+    _require(_duid(str(state.get("duid", ""))) == config["duid"], "acquisition DUID differs")
+    observed = int(state.get("observed_at", 0))
+    raw_assignments = state.get("assignments")
+    _require(isinstance(raw_assignments, dict), "acquisition assignments must be an object")
+    present = {int(value) for value in raw_assignments}
+    expected_iaids = {item["iaid"] for item in config["delegations"]}
+    _require(present == expected_iaids, "acquisition state is incomplete")
+    prefixes: set[str] = set()
+    by_iaid: dict[int, dict[str, Any]] = {}
+    for iaid in sorted(expected_iaids):
+        item = raw_assignments.get(str(iaid))
+        _require(not isinstance(item, list), f"IAID {iaid} is ambiguous")
+        _require(isinstance(item, dict), f"IAID {iaid} is missing")
+        _require(int(item.get("iaid", -1)) == iaid, f"IAID {iaid} is inconsistent")
+        prefix = str(_ipv6_network(str(item.get("prefix", "")), f"IAID {iaid} prefix"))
+        _require(prefix not in prefixes, f"duplicate delegated prefix {prefix}")
+        prefixes.add(prefix)
+        preferred = int(item.get("preferred_lifetime", -1))
+        valid = int(item.get("valid_lifetime", -1))
+        expires = int(item.get("expires_at", 0))
+        _require(preferred >= 0 and valid > 0, f"IAID {iaid} lifetimes are invalid")
+        _require(int(item.get("observed_at", 0)) == observed, f"IAID {iaid} observation is stale")
+        _require(expires > now, f"IAID {iaid} is expired")
+        _require(expires == observed + valid, f"IAID {iaid} expiry is stale")
+        _require(expires - now >= config["minimum_valid_lifetime"], f"IAID {iaid} has insufficient valid lifetime")
+        by_iaid[iaid] = {**item, "prefix": prefix}
+    return {
+        delegation["id"]: by_iaid[delegation["iaid"]]
+        for delegation in config["delegations"]
+    }
+
+
+def atomic_write(path: Path | str, data: bytes, mode: int = 0o600) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        os.chmod(target, mode)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def atomic_create(path: Path | str, data: bytes, mode: int = 0o600) -> None:
+    """Atomically create a file while refusing to replace an existing config."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError as exc:
+            raise ReconcileError(f"configuration already exists: {target}") from exc
+        os.chmod(target, mode)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def private_mode_ok(path: Path | str, *, optional: bool = False) -> bool:
+    target = Path(path)
+    if optional and not target.exists():
+        return True
+    try:
+        return stat.S_IMODE(target.stat().st_mode) == 0o600
+    except OSError:
+        return False
+
+
+def _command_json(
+    run: Callable[..., subprocess.CompletedProcess[str]], args: list[str]
+) -> Any:
+    result = run(args, check=False, capture_output=True, text=True)
+    _require(result.returncode == 0, f"command failed ({args[0]}): {result.stderr.strip()}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ReconcileError(f"command returned invalid JSON ({args[0]})") from exc
+
+
+class ApiClient:
+    """Minimal Integration API client with a narrow loopback TLS exception."""
+
+    def __init__(
+        self,
+        api_key: str,
+        endpoint: str | None = None,
+        *,
+        timeout: int = 15,
+        opener: Callable[..., Any] = urlopen,
+    ) -> None:
+        self.endpoint = (endpoint or DEFAULT_API_ENDPOINT).rstrip("/")
+        self.verify_tls = endpoint is not None or self.endpoint != DEFAULT_API_ENDPOINT
+        self.api_key = api_key.strip()
+        _require(bool(self.api_key), "Integration API key is empty")
+        self.timeout = int(timeout)
+        self._opener = opener
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> Any:
+        url = f"{self.endpoint}/{path.lstrip('/')}"
+        if query:
+            url += "?" + urlencode(query)
+        data = None if body is None else json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        request = Request(
+            url,
+            data=data,
+            method=method.upper(),
+            headers={"Accept": "application/json", "Content-Type": "application/json", "X-API-Key": self.api_key},
+        )
+        context = None if self.verify_tls else ssl._create_unverified_context()  # noqa: SLF001
+        try:
+            response = self._opener(request, timeout=self.timeout, context=context)
+            payload = response.read()
+        except HTTPError as exc:
+            raise ReconcileError(f"UniFi API {method} {path} returned HTTP {exc.code}") from exc
+        except (URLError, OSError) as exc:
+            raise ReconcileError(f"UniFi API {method} {path} failed: {exc}") from exc
+        if not payload:
+            return None
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ReconcileError("UniFi API returned invalid JSON") from exc
+
+    def paged(self, path: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = self.request("GET", path, query={"offset": offset, "limit": 200})
+            _require(isinstance(page, dict), "UniFi API page is not an object")
+            data = page.get("data", [])
+            _require(isinstance(data, list), "UniFi API page data is not a list")
+            items.extend(data)
+            offset += len(data)
+            if not data or offset >= int(page.get("totalCount", len(items))):
+                return items
+
+
+def select_site(sites: Iterable[dict[str, Any]], wanted: str) -> dict[str, Any]:
+    matches = [site for site in sites if site.get("name") == wanted or site.get("internalReference") == wanted]
+    _require(len(matches) == 1, f"site {wanted!r} did not resolve uniquely")
+    return matches[0]
+
+
+def collect_networks(client: ApiClient, site: str) -> tuple[str, list[dict[str, Any]]]:
+    selected = select_site(client.paged("sites"), site)
+    site_id = selected.get("id")
+    _require(bool(site_id), "selected site has no id")
+    details = []
+    for overview in client.paged(f"sites/{site_id}/networks"):
+        network_id = overview.get("id")
+        _require(bool(network_id), "network overview has no id")
+        detail = client.request("GET", f"sites/{site_id}/networks/{network_id}")
+        _require(isinstance(detail, dict), "network detail is not an object")
+        details.append({**overview, **detail})
+    return str(site_id), details
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    _require(bool(slug), f"network name {value!r} cannot form a delegation id")
+    return slug
+
+
+def discover_config(
+    api_key_path: Path | str,
+    *,
+    activate: bool = False,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    api_factory: Callable[..., ApiClient] = ApiClient,
+) -> tuple[dict[str, Any], list[str]]:
+    """Discover a conservative common UniFi gateway configuration."""
+    try:
+        api_key = Path(api_key_path).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ReconcileError(f"unable to read Integration API key: {exc}") from exc
+    api = api_factory(api_key)
+    sites = api.paged("sites")
+    _require(len(sites) == 1, "automatic configuration requires exactly one UniFi site")
+    site = sites[0]
+    site_id = site.get("id")
+    _require(bool(site_id), "discovered site has no id")
+
+    routes = _command_json(run, ["ip", "-j", "route", "get", "1.1.1.1"])
+    _require(isinstance(routes, list) and len(routes) == 1, "default-route WAN did not resolve uniquely")
+    wan = routes[0].get("dev")
+    _require(isinstance(wan, str) and bool(wan), "default-route WAN has no interface")
+    links = _command_json(run, ["ip", "-j", "link", "show", "dev", wan])
+    _require(isinstance(links, list) and len(links) == 1, "WAN interface did not resolve uniquely")
+    link = links[0]
+    _require(link.get("link_type") == "ether", "discovered WAN is not Ethernet")
+    mac = str(link.get("address", "")).lower()
+    _require(re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", mac) is not None, "WAN MAC is malformed")
+
+    bridge_links = _command_json(run, ["ip", "-j", "link", "show", "type", "bridge"])
+    _require(isinstance(bridge_links, list), "bridge discovery did not return a list")
+    bridges = {item.get("ifname") for item in bridge_links if isinstance(item, dict)}
+
+    overviews = api.paged(f"sites/{site_id}/networks")
+    candidates: list[tuple[dict[str, Any], str]] = []
+    excluded: list[str] = []
+    for overview in overviews:
+        network_id = overview.get("id")
+        _require(bool(network_id), "network overview has no id")
+        detail = api.request("GET", f"sites/{site_id}/networks/{network_id}")
+        _require(isinstance(detail, dict), "network detail is not an object")
+        network = {**overview, **detail}
+        name = str(network.get("name", ""))
+        vlan_id = int(network.get("vlanId", 1))
+        bridge = "br0" if network.get("default") is True else f"br{vlan_id}"
+        ipv4 = network.get("ipv4Configuration")
+        eligible = all(
+            (
+                network.get("enabled") is True,
+                network.get("management") == "GATEWAY",
+                isinstance(ipv4, dict) and isinstance(ipv4.get("dhcpConfiguration"), dict),
+                bridge in bridges,
+            )
+        )
+        if eligible:
+            candidates.append((network, bridge))
+        else:
+            excluded.append(name or str(network_id))
+
+    _require(bool(candidates), "automatic configuration found no eligible client LANs")
+    defaults = [item for item in candidates if item[0].get("default") is True]
+    _require(len(defaults) == 1, "eligible default LAN did not resolve uniquely")
+    candidates.sort(key=lambda item: (not bool(item[0].get("default")), int(item[0].get("vlanId", 1)), str(item[0].get("name", ""))))
+
+    delegations = []
+    ids: set[str] = set()
+    names: set[str] = set()
+    vlans: set[int] = set()
+    for iaid, (network, bridge) in enumerate(candidates):
+        name = str(network.get("name", ""))
+        vlan_id = int(network.get("vlanId", 1))
+        delegation_id = _slug(name)
+        _require(delegation_id not in ids, f"duplicate discovered delegation id {delegation_id}")
+        _require(name not in names, f"duplicate discovered network name {name!r}")
+        _require(vlan_id not in vlans, f"duplicate discovered VLAN {vlan_id}")
+        ids.add(delegation_id)
+        names.add(name)
+        vlans.add(vlan_id)
+        delegations.append(
+            {
+                "id": delegation_id,
+                "iaid": iaid,
+                "network": name,
+                "vlan_id": vlan_id,
+                "bridge": bridge,
+            }
+        )
+
+    config = validate_config(
+        {
+            "active": bool(activate),
+            "wan_interface": wan,
+            "duid": "00030001" + mac.replace(":", ""),
+            "api_key_path": str(DEFAULT_API_KEY_PATH),
+            "site": str(site.get("internalReference") or site.get("name") or "default"),
+            "delegations": delegations,
+        }
+    )
+    return config, excluded
+
+
+def bootstrap(
+    config_path: Path | str,
+    api_key_path: Path | str,
+    *,
+    activate: bool = False,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    api_factory: Callable[..., ApiClient] = ApiClient,
+) -> dict[str, Any]:
+    config, excluded = discover_config(
+        api_key_path,
+        activate=activate,
+        run=run,
+        api_factory=api_factory,
+    )
+    payload = json.dumps(config, indent=2, sort_keys=True).encode() + b"\n"
+    atomic_create(config_path, payload)
+    return {"config": str(config_path), "active": config["active"], "excluded_networks": excluded}
+
+
+def resolve_networks(
+    config: dict[str, Any], networks: list[dict[str, Any]], bridge_vlans: dict[str, int]
+) -> dict[str, dict[str, Any]]:
+    resolved = {}
+    for delegation in config["delegations"]:
+        matches = [network for network in networks if network.get("name") == delegation["network"]]
+        _require(len(matches) == 1, f"network {delegation['network']!r} did not resolve uniquely")
+        network = matches[0]
+        _require(int(network.get("vlanId", 1)) == delegation["vlan_id"], f"VLAN conflict for {delegation['network']!r}")
+        _require(bridge_vlans.get(delegation["bridge"]) == delegation["vlan_id"], f"bridge conflict for {delegation['network']!r}")
+        resolved[delegation["id"]] = network
+    return resolved
+
+
+def _semantic_network(value: dict[str, Any]) -> dict[str, Any]:
+    result = {key: copy.deepcopy(item) for key, item in value.items() if key not in READ_ONLY_NETWORK_FIELDS}
+    guarding = result.get("dhcpGuarding")
+    if isinstance(guarding, dict) and isinstance(guarding.get("trustedDhcpServerIpAddresses"), list):
+        guarding["trustedDhcpServerIpAddresses"] = [value for value in guarding["trustedDhcpServerIpAddresses"] if value]
+    return result
+
+
+def build_network_payload(network: dict[str, Any], prefix: str, config: dict[str, Any]) -> dict[str, Any]:
+    delegated = _ipv6_network(prefix, "assigned prefix")
+    payload = _semantic_network(network)
+    ipv6 = copy.deepcopy(network.get("ipv6Configuration") or {})
+    assignment = copy.deepcopy(ipv6.get("clientAddressAssignment") or {})
+    dhcp = copy.deepcopy(assignment.get("dhcpConfiguration") or {})
+    router = copy.deepcopy(ipv6.get("routerAdvertisement") or {})
+    dhcp.update({"ipAddressSuffixRange": copy.deepcopy(config["dhcpv6_suffix_range"]), "leaseTimeSeconds": config["dhcpv6_lease_seconds"]})
+    assignment.update({"slaacEnabled": True, "dhcpConfiguration": dhcp})
+    router["priority"] = config["ra_priority"]
+    ipv6.update(
+        {
+            "interfaceType": "STATIC",
+            "hostIpAddress": str(delegated.network_address + 1),
+            "prefixLength": 64,
+            "clientAddressAssignment": assignment,
+            "routerAdvertisement": router,
+        }
+    )
+    payload["ipv6Configuration"] = ipv6
+    return payload
+
+
+def static_network_status(
+    addresses: list[dict[str, Any]],
+    routes: list[dict[str, Any]],
+    assignments: dict[str, dict[str, Any]],
+    bridges: dict[str, str],
+) -> dict[str, Any]:
+    missing_addresses: list[str] = []
+    missing_routes: list[str] = []
+    conflicts: list[str] = []
+    local = []
+    for interface in addresses:
+        for address in interface.get("addr_info", []):
+            if address.get("family") == "inet6":
+                local.append((interface.get("ifname"), address.get("local"), address.get("prefixlen")))
+    for key, assignment in assignments.items():
+        prefix = _ipv6_network(assignment["prefix"], f"assignment {key}")
+        bridge = bridges[key]
+        gateway = str(prefix.network_address + 1)
+        matching_addresses = [item for item in local if item[1] and ipaddress.ip_address(item[1]) in prefix]
+        if (bridge, gateway, 64) not in matching_addresses:
+            missing_addresses.append(key)
+        desired_routes = [
+            route
+            for route in routes
+            if route.get("dst") == str(prefix)
+            and route.get("dev") == bridge
+            and route.get("protocol") == "kernel"
+            and route.get("type", "unicast") == "unicast"
+        ]
+        if len(desired_routes) != 1:
+            missing_routes.append(key)
+        bad_address = any(item != (bridge, gateway, 64) for item in matching_addresses)
+        bad_route = any(
+            route.get("dst") == str(prefix)
+            and (
+                route.get("type", "unicast") != "unicast"
+                or route.get("protocol") == "dhcp"
+                or (route.get("dev") and route.get("dev") != bridge)
+            )
+            for route in routes
+        )
+        if bad_address or bad_route:
+            conflicts.append(key)
+    return {
+        "ok": not (missing_addresses or missing_routes or conflicts),
+        "missing_addresses": sorted(missing_addresses),
+        "missing_routes": sorted(missing_routes),
+        "conflicts": sorted(conflicts),
+    }
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+class Reconciler:
+    def __init__(
+        self,
+        config_path: Path | str = DEFAULT_CONFIG_PATH,
+        *,
+        run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        now: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+        api_factory: Callable[..., ApiClient] = ApiClient,
+    ) -> None:
+        self.config_path = Path(config_path)
+        self.run = run
+        self.now = now
+        self.sleep = sleep
+        self.api_factory = api_factory
+
+    def _command(self, args: list[str], *, check: bool = True) -> str:
+        result = self.run(args, check=False, capture_output=True, text=True)
+        if check and result.returncode != 0:
+            raise ReconcileError(f"command failed ({args[0]}): {result.stderr.strip()}")
+        return result.stdout
+
+    def _api(self, config: dict[str, Any]) -> ApiClient:
+        try:
+            key = Path(config["api_key_path"]).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ReconcileError(f"unable to read Integration API key: {exc}") from exc
+        return self.api_factory(key, config["api_url"]) if config.get("api_url") else self.api_factory(key)
+
+    def _bridge_vlans(self, config: dict[str, Any]) -> dict[str, int]:
+        values = {}
+        for delegation in config["delegations"]:
+            self._command(["ip", "-j", "link", "show", "dev", delegation["bridge"]])
+            values[delegation["bridge"]] = delegation["vlan_id"]
+        return values
+
+    def _network_state(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        try:
+            addresses = json.loads(self._command(["ip", "-j", "-6", "address", "show"]))
+            routes = json.loads(self._command(["ip", "-j", "-6", "route", "show", "table", "all"]))
+        except json.JSONDecodeError as exc:
+            raise ReconcileError("ip returned invalid JSON") from exc
+        _require(isinstance(addresses, list) and isinstance(routes, list), "network state is not a list")
+        return addresses, routes
+
+    def _client_active(self) -> bool:
+        return self.run(
+            ["systemctl", "is-active", "--quiet", "att-ipv6-acquire.service"],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode == 0
+
+    @staticmethod
+    def _write_networks(
+        api: ApiClient,
+        site_id: str,
+        config: dict[str, Any],
+        resolved: dict[str, dict[str, Any]],
+        assignments: dict[str, dict[str, Any]],
+    ) -> list[str]:
+        changed = []
+        for delegation in config["delegations"]:
+            key = delegation["id"]
+            current = resolved[key]
+            desired = build_network_payload(current, assignments[key]["prefix"], config)
+            if _semantic_network(current) == desired:
+                continue
+            path = f"sites/{site_id}/networks/{current['id']}"
+            api.request("PUT", path, body=desired)
+            observed = api.request("GET", path)
+            _require(isinstance(observed, dict) and _semantic_network(observed) == desired, f"network {delegation['network']!r} failed API readback")
+            changed.append(key)
+        return changed
+
+    def status(self) -> dict[str, Any]:
+        config = load_config(self.config_path)
+        result: dict[str, Any] = {
+            "active": config["active"],
+            "expected": expected_state(config),
+            "client": {"active": self._client_active()},
+            "acquisition": {"ok": False, "status": "missing", "error": None, "assignments": {}},
+            "api": {"ok": False, "site": config["site"], "networks": {}},
+            "network": {"ok": False, "missing_addresses": [], "missing_routes": [], "conflicts": []},
+            "permissions": {
+                "config": private_mode_ok(self.config_path),
+                "api_key": private_mode_ok(config["api_key_path"]),
+                "acquisition": private_mode_ok(config["acquisition_path"], optional=True),
+            },
+        }
+        try:
+            state = load_acquisition(config["acquisition_path"])
+            result["acquisition"]["status"] = state.get("status", "unknown")
+            assignments = validate_acquisition(config, state, now=int(self.now()))
+            result["acquisition"].update({"ok": True, "assignments": assignments})
+        except ReconcileError as exc:
+            result["acquisition"]["error"] = str(exc)
+            return result
+        try:
+            api = self._api(config)
+            site_id, networks = collect_networks(api, config["site"])
+            resolved = resolve_networks(config, networks, self._bridge_vlans(config))
+            result["api"] = {
+                "ok": True,
+                "site": site_id,
+                "networks": {
+                    key: {
+                        "name": network["name"],
+                        "desired": _semantic_network(network) == build_network_payload(network, assignments[key]["prefix"], config),
+                    }
+                    for key, network in resolved.items()
+                },
+            }
+            addresses, routes = self._network_state()
+            result["network"] = static_network_status(
+                addresses,
+                routes,
+                assignments,
+                {item["id"]: item["bridge"] for item in config["delegations"]},
+            )
+        except ReconcileError as exc:
+            result["api"]["error"] = str(exc)
+        return result
+
+    def apply(self) -> dict[str, Any]:
+        config = load_config(self.config_path)
+        _require(config["active"], "reconciliation is not active")
+        _require(self._client_active(), "acquisition client is not active")
+        Path(config["lock_path"]).parent.mkdir(parents=True, exist_ok=True)
+        with Path(config["lock_path"]).open("w", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = load_acquisition(config["acquisition_path"])
+            assignments = validate_acquisition(config, state, now=int(self.now()))
+            state_digest = _digest(state)
+            api = self._api(config)
+            site_id, networks = collect_networks(api, config["site"])
+            bridge_vlans = self._bridge_vlans(config)
+            resolved = resolve_networks(config, networks, bridge_vlans)
+            _require(_digest(load_acquisition(config["acquisition_path"])) == state_digest, "acquisition changed during preflight")
+            changed = self._write_networks(api, site_id, config, resolved, assignments)
+            deadline = self.now() + 30
+            network_status = None
+            while self.now() <= deadline:
+                addresses, routes = self._network_state()
+                network_status = static_network_status(
+                    addresses,
+                    routes,
+                    assignments,
+                    {item["id"]: item["bridge"] for item in config["delegations"]},
+                )
+                if network_status["ok"]:
+                    break
+                self.sleep(2)
+            _require(bool(network_status and network_status["ok"]), "static bridge address or route verification failed")
+            _site, observed = collect_networks(api, config["site"])
+            observed_resolved = resolve_networks(config, observed, bridge_vlans)
+            for key, network in observed_resolved.items():
+                _require(_semantic_network(network) == build_network_payload(network, assignments[key]["prefix"], config), f"network {network['name']!r} lost API readback")
+            return {"changed": bool(changed), "networks": changed}
+
+
+def _socket_546_inodes() -> set[str]:
+    inodes: set[str] = set()
+    for table in (Path("/proc/net/udp"), Path("/proc/net/udp6")):
+        try:
+            lines = table.read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 9 and fields[1].rsplit(":", 1)[-1].upper() == "0222":
+                inodes.add(fields[9])
+    return inodes
+
+
+def acquire(
+    config_path: Path | str = DEFAULT_CONFIG_PATH,
+    *,
+    execve: Callable[[str, list[str], dict[str, str]], Any] = os.execve,
+) -> None:
+    """Replace this process with odhcp6c using only config-derived arguments."""
+    config = load_config(config_path)
+    command = [
+        ODHCP6C,
+        "-e",
+        "-v",
+        "-N",
+        "none",
+        "-k",
+        "-R",
+        "-c",
+        config["duid"],
+        "-s",
+        HOOK_PATH,
+    ]
+    for delegation in config["delegations"]:
+        command.extend(("-P", f"64:{delegation['iaid']}"))
+    command.append(config["wan_interface"])
+    environment = os.environ.copy()
+    environment[CONFIG_DIGEST_ENV] = config_digest(config)
+    execve(ODHCP6C, command, environment)
+
+
+def client_guard(config_path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    config = load_config(config_path)
+    hook = Path(HOOK_PATH)
+    _require(hook.is_file() and os.access(hook, os.X_OK), "managed state hook is absent")
+    current = os.getpid()
+    for directory in Path("/proc").iterdir():
+        if not directory.name.isdigit() or int(directory.name) == current:
+            continue
+        try:
+            command = (directory / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        _require("/usr/sbin/odhcp6c" not in command, "another acquisition client is running")
+    _require(not _socket_546_inodes(), "UDP/546 is already owned")
+    return {
+        "ok": True,
+        "duid": config["duid"],
+        "iaids": [item["iaid"] for item in config["delegations"]],
+    }
+
+
+def _healthy(result: dict[str, Any]) -> bool:
+    expected_networks = set(result.get("expected", {}).get("networks", {}))
+    return all(
+        (
+            result.get("active") is True,
+            result.get("client", {}).get("active") is True,
+            result.get("acquisition", {}).get("ok") is True,
+            set(result.get("acquisition", {}).get("assignments", {})) == expected_networks,
+            result.get("api", {}).get("ok") is True,
+            set(result.get("api", {}).get("networks", {})) == expected_networks,
+            all(item.get("desired") for item in result.get("api", {}).get("networks", {}).values()),
+            result.get("network", {}).get("ok") is True,
+            all(result.get("permissions", {}).values()),
+        )
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("acquire")
+    subparsers.add_parser("apply")
+    bootstrap_parser = subparsers.add_parser("bootstrap")
+    bootstrap_parser.add_argument("--api-key-file", default=str(DEFAULT_API_KEY_PATH))
+    bootstrap_parser.add_argument("--activate", action="store_true")
+    status = subparsers.add_parser("status")
+    status.add_argument("--json", action="store_true")
+    subparsers.add_parser("client-guard")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "acquire":
+            acquire(args.config)
+            return 0
+        if args.command == "bootstrap":
+            result = bootstrap(args.config, args.api_key_file, activate=args.activate)
+        elif args.command == "client-guard":
+            result = client_guard(args.config)
+        else:
+            reconciler = Reconciler(args.config)
+            result = reconciler.apply() if args.command == "apply" else reconciler.status()
+    except ReconcileError as exc:
+        print(f"att_ipv6 error={exc}", file=sys.stderr)
+        return 1
+    if args.command == "status" and not args.json:
+        print(
+            "att_ipv6 "
+            f"active={'yes' if result['active'] else 'no'} "
+            f"client={'ok' if result['client']['active'] else 'failed'} "
+            f"acquisition={result['acquisition']['status']} "
+            f"api={'ok' if result['api']['ok'] else 'failed'} "
+            f"network={'ok' if result['network']['ok'] else 'failed'}"
+        )
+    else:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if args.command != "status" or _healthy(result) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
