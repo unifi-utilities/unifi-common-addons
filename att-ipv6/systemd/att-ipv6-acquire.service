@@ -1,0 +1,35 @@
+[Unit]
+Description=Acquire AT&T IPv6 delegated prefixes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/data/att-ipv6/att-ipv6 client-guard
+ExecStart=/data/att-ipv6/att-ipv6 acquire
+Restart=on-failure
+RestartSec=15min
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/run/att-ipv6
+ReadOnlyPaths=/data/att-ipv6/config.json /data/att-ipv6/integration-api.key /data/att-ipv6/att-ipv6 /data/att-ipv6/att-ipv6-hook /data/att-ipv6/systemd
+ReadOnlyPaths=/etc/resolv.conf
+ReadOnlyPaths=-/run/resolv.conf.d
+ReadOnlyPaths=-/run/dnsmasq.conf.d
+ReadOnlyPaths=-/run/dnsmasq.dhcp.conf.d
+ReadOnlyPaths=-/etc/dnsmasq.conf
+ReadOnlyPaths=-/etc/dnsmasq.d
+ReadOnlyPaths=-/data/unifi
+ReadOnlyPaths=-/data/unifi-core
+ReadOnlyPaths=-/var/lib/unifi
+InaccessiblePaths=-/lib/netifd/dhcpv6.script -/etc/odhcp6c.user -/etc/odhcp6c.user.d -/usr/sbin/odhcp6c-update
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_UNIX AF_INET6 AF_NETLINK
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

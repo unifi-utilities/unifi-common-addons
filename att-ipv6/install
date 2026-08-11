@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Install the standalone ATT IPv6 addon on a UniFi gateway."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Callable
+
+
+ROOT = Path("/data/att-ipv6")
+DEFAULT_CONFIG = ROOT / "config.json"
+DEFAULT_API_KEY = ROOT / "integration-api.key"
+
+
+class InstallError(RuntimeError):
+    """Raised when installation cannot proceed safely."""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument(
+        "--api-key-file",
+        help="Integration API key source; discovered safely when omitted",
+    )
+    parser.add_argument(
+        "--activate",
+        action="store_true",
+        help="activate the installed configuration",
+    )
+    return parser
+
+
+def _copy(source: Path, target: Path, mode: int) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink():
+        raise InstallError(f"refusing to replace symlink: {target}")
+    try:
+        same = source.samefile(target)
+    except FileNotFoundError:
+        same = False
+    if not same:
+        shutil.copyfile(source, target)
+    target.chmod(mode)
+
+
+def _atomic_write_config(target: Path, config: dict) -> None:
+    if target.is_symlink():
+        raise InstallError(f"refusing to replace symlink: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(config, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, target)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+class Installer:
+    def __init__(
+        self,
+        source_dir: Path,
+        *,
+        run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        geteuid: Callable[[], int] = os.geteuid,
+        which: Callable[[str], str | None] = shutil.which,
+        root: Path = ROOT,
+        systemd_dir: Path = Path("/etc/systemd/system"),
+        tmpfiles_dir: Path = Path("/etc/tmpfiles.d"),
+        on_boot_dir: Path = Path("/data/on_boot.d"),
+    ) -> None:
+        self.source_dir = source_dir
+        self.run = run
+        self.geteuid = geteuid
+        self.which = which
+        self.root = root
+        self.systemd_dir = systemd_dir
+        self.tmpfiles_dir = tmpfiles_dir
+        self.on_boot_dir = on_boot_dir
+
+    def _run(self, command: list[str]) -> None:
+        result = self.run(command, check=False)
+        if result.returncode != 0:
+            raise InstallError(f"command failed: {command[0]}")
+
+    def resolve_api_key(
+        self,
+        config_path: Path,
+        requested: Path | None,
+        *,
+        cwd: Path,
+    ) -> Path:
+        if requested is not None:
+            return requested
+        if config_path.is_file():
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                configured = Path(config["api_key_path"])
+                if configured.is_file():
+                    return configured
+            except (OSError, KeyError, TypeError, json.JSONDecodeError):
+                pass
+        installed = self.root / DEFAULT_API_KEY.name
+        if installed.is_file():
+            return installed
+        local = cwd / DEFAULT_API_KEY.name
+        if local.is_file():
+            return local
+        raise InstallError(
+            "Integration API key is unreadable; pass --api-key-file or place "
+            f"{DEFAULT_API_KEY.name} in the current directory"
+        )
+
+    def _validate_config(self, config: dict) -> None:
+        runtime = runpy.run_path(str(self.source_dir / "att-ipv6"))
+        try:
+            runtime["validate_config"](config)
+        except (runtime["ReconcileError"], KeyError, TypeError, ValueError) as exc:
+            raise InstallError(f"configuration is invalid: {exc}") from exc
+
+    def install(
+        self,
+        config_path: Path,
+        api_key_path: Path | None,
+        *,
+        activate: bool,
+        cwd: Path | None = None,
+    ) -> str:
+        if self.geteuid() != 0:
+            raise InstallError("installer must run as root")
+        for command in ("python3", "odhcp6c", "systemctl", "systemd-tmpfiles"):
+            if self.which(command) is None:
+                raise InstallError(f"required command is absent: {command}")
+        api_key_path = self.resolve_api_key(
+            config_path, api_key_path, cwd=cwd or Path.cwd()
+        )
+        if not api_key_path.is_file():
+            raise InstallError(f"Integration API key is unreadable: {api_key_path}")
+
+        discovered = not config_path.exists()
+        if discovered:
+            command = [
+                str(self.source_dir / "att-ipv6"),
+                "--config",
+                str(config_path),
+                "bootstrap",
+                "--api-key-file",
+                str(api_key_path),
+            ]
+            if activate:
+                command.append("--activate")
+            self._run(command)
+        if not config_path.is_file():
+            raise InstallError(f"configuration is unreadable: {config_path}")
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            installed_api_key = Path(config["api_key_path"]).resolve()
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise InstallError(f"configuration is invalid: {exc}") from exc
+        self._validate_config(config)
+        installed_config = copy.deepcopy(config)
+        if activate:
+            installed_config["active"] = True
+        active = installed_config.get("active") is True
+        try:
+            installed_api_key.relative_to(self.root.resolve())
+        except ValueError as exc:
+            raise InstallError("api_key_path must remain under /data/att-ipv6") from exc
+
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.root.chmod(0o700)
+        for directory in (
+            self.root / "systemd",
+            self.root / "tmpfiles.d",
+            self.on_boot_dir,
+            self.tmpfiles_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o755)
+
+        _copy(self.source_dir / "att-ipv6", self.root / "att-ipv6", 0o755)
+        _copy(self.source_dir / "att-ipv6-hook", self.root / "att-ipv6-hook", 0o755)
+        installed_config_path = self.root / "config.json"
+        if activate:
+            _atomic_write_config(installed_config_path, installed_config)
+        else:
+            _copy(config_path, installed_config_path, 0o600)
+        _copy(api_key_path, installed_api_key, 0o600)
+        _copy(
+            self.source_dir / "tmpfiles.d/att-ipv6.conf",
+            self.root / "tmpfiles.d/att-ipv6.conf",
+            0o644,
+        )
+        _copy(
+            self.source_dir / "tmpfiles.d/att-ipv6.conf",
+            self.tmpfiles_dir / "att-ipv6.conf",
+            0o644,
+        )
+        for name in (
+            "att-ipv6-acquire.service",
+            "att-ipv6-reconcile.service",
+            "att-ipv6-reconcile.path",
+            "att-ipv6-reconcile.timer",
+        ):
+            source = self.source_dir / "systemd" / name
+            _copy(source, self.root / "systemd" / name, 0o644)
+            _copy(source, self.systemd_dir / name, 0o644)
+        _copy(
+            self.source_dir / "on_boot.sh",
+            self.on_boot_dir / "11-att-ipv6-native.sh",
+            0o755,
+        )
+
+        self._run(["systemd-tmpfiles", "--create", str(self.tmpfiles_dir / "att-ipv6.conf")])
+        self._run(["systemctl", "daemon-reload"])
+        marker = self.root / "native-enabled"
+        if active:
+            marker.touch(mode=0o644, exist_ok=True)
+            self._run([str(self.on_boot_dir / "11-att-ipv6-native.sh")])
+            return "installed and started"
+        marker.unlink(missing_ok=True)
+        return "installed but inactive"
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = Installer(Path(__file__).resolve().parent).install(
+            Path(args.config),
+            Path(args.api_key_file) if args.api_key_file else None,
+            activate=args.activate,
+            cwd=Path.cwd(),
+        )
+    except InstallError as exc:
+        print(f"install error: {exc}", file=sys.stderr)
+        return 1
+    print(f"{result}; run: {ROOT}/att-ipv6 status")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

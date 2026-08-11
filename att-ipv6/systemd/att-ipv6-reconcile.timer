@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic delegated IPv6 reconciliation
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Persistent=true
+Unit=att-ipv6-reconcile.service
+
+[Install]
+WantedBy=timers.target
