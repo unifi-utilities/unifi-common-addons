@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Persist odhcp6c acquisition observations without changing the network."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any, Mapping
+
+
+STATE_PATH = Path("/run/att-ipv6/acquisition.json")
+CONFIG_PATH = Path("/data/att-ipv6/config.json")
+CONFIG_DIGEST_ENV = "ATT_IPV6_CONFIG_DIGEST"
+PRESERVE_EMPTY_EVENTS = {"ra-updated"}
+
+
+def _iaid(parts: list[str]) -> int:
+    for value in parts:
+        if value.startswith("class="):
+            return int(value.removeprefix("class="), 16)
+    # odhcp6c omits class for its default identity association, IAID 1.
+    return 1
+
+
+def parse_prefixes(value: str, *, now: int) -> dict[str, Any]:
+    assignments: dict[str, Any] = {}
+    for token in value.split():
+        parts = token.split(",")
+        if len(parts) < 3:
+            continue
+        try:
+            prefix = ipaddress.ip_network(parts[0], strict=True)
+            preferred = int(parts[1])
+            valid = int(parts[2])
+            iaid = _iaid(parts[3:])
+        except (ValueError, TypeError):
+            continue
+        item = {
+            "iaid": iaid,
+            "prefix": str(prefix),
+            "preferred_lifetime": preferred,
+            "valid_lifetime": valid,
+            "observed_at": now,
+            "preferred_until": now + preferred,
+            "expires_at": now + valid,
+        }
+        key = str(iaid)
+        if key not in assignments:
+            assignments[key] = item
+        elif isinstance(assignments[key], list):
+            assignments[key].append(item)
+        else:
+            assignments[key] = [assignments[key], item]
+    return assignments
+
+
+def build_state(
+    interface: str,
+    event: str,
+    environment: Mapping[str, str],
+    *,
+    now: int | None = None,
+    expected_iaids: set[int],
+    config_digest: str,
+    previous: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    observed = int(time.time() if now is None else now)
+    assignments = parse_prefixes(environment.get("PREFIXES", ""), now=observed)
+    server = environment.get("SERVER", "")
+    if (
+        not assignments
+        and event in PRESERVE_EMPTY_EVENTS
+        and isinstance(previous, Mapping)
+        and previous.get("schema") == 1
+        and previous.get("interface") == interface
+        and isinstance(previous.get("assignments"), dict)
+    ):
+        assignments = copy.deepcopy(previous["assignments"])
+        observed = int(previous.get("observed_at", observed))
+        server = server or str(previous.get("server", ""))
+    present = {int(value) for value in assignments}
+    complete = present == expected_iaids and all(
+        not isinstance(value, list) for value in assignments.values()
+    )
+    return {
+        "schema": 1,
+        "status": (
+            f"complete={len(present)}/{len(expected_iaids)}"
+            if complete
+            else f"acquiring={len(present)}/{len(expected_iaids)}"
+        ),
+        "event": event,
+        "interface": interface,
+        "duid": environment.get("OPTION_1", "").replace(":", "").lower(),
+        "config_digest": config_digest,
+        "server": server,
+        "observed_at": observed,
+        "assignments": assignments,
+        "missing_iaids": sorted(expected_iaids - present),
+    }
+
+
+def load_expectations(
+    path: Path | None = None,
+) -> tuple[set[int], str, str]:
+    target = CONFIG_PATH if path is None else path
+    try:
+        payload = target.read_bytes()
+        config = json.loads(payload)
+        delegations = config["delegations"]
+        expected = {int(item["iaid"]) for item in delegations}
+        duid = str(config["duid"]).replace(":", "").lower()
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to load acquisition expectations: {exc}") from exc
+    if not isinstance(delegations, list) or not delegations or len(expected) != len(delegations):
+        raise ValueError("configured IAIDs must be a non-empty unique set")
+    return expected, duid, hashlib.sha256(payload).hexdigest()
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if len(args) != 2:
+        return 2
+    interface, event = args
+    try:
+        expected_iaids, expected_duid, digest = load_expectations()
+    except ValueError:
+        return 1
+    if os.environ.get(CONFIG_DIGEST_ENV) != digest:
+        return 1
+    observed_duid = os.environ.get("OPTION_1", "").replace(":", "").lower()
+    if observed_duid != expected_duid:
+        return 1
+    previous = None
+    try:
+        previous = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    atomic_write_json(
+        STATE_PATH,
+        build_state(
+            interface,
+            event,
+            os.environ,
+            expected_iaids=expected_iaids,
+            config_digest=digest,
+            previous=previous,
+        ),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
