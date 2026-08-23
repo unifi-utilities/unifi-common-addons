@@ -310,10 +310,15 @@ env PATH="$BIN_DIR:$PATH" FAKE_RELEASE_DIR="$RELEASE_FIXTURES" \
 
 [ -f "$UNIT_DIR/aftertouch-player.service" ] || fail "boot hook did not restore the unit"
 [ -x "$RELEASE_ON_BOOT/26-aftertouch-player.sh" ] || fail "activation did not install the boot hook"
-grep -Fx 'daemon-reload' "$SYSTEMCTL_LOG" >/dev/null || fail "boot hook skipped daemon-reload"
-grep -Fx 'enable aftertouch-player.service' "$SYSTEMCTL_LOG" >/dev/null || fail "boot hook skipped enable"
-grep -Fx 'restart aftertouch-player.service' "$SYSTEMCTL_LOG" >/dev/null || fail "boot hook skipped restart"
-grep -Fx 'is-active --quiet aftertouch-player.service' "$SYSTEMCTL_LOG" >/dev/null || fail "boot hook skipped active-state check"
+expected_systemctl_log=$(
+	cat <<'EOF'
+daemon-reload
+disable aftertouch-player.service
+restart aftertouch-player.service
+is-active --quiet aftertouch-player.service
+EOF
+)
+assert_eq "$(cat "$SYSTEMCTL_LOG")" "$expected_systemctl_log"
 [ -f "$HEALTH_LOG" ] || fail "boot hook skipped healthcheck"
 assert_eq "$(readlink "$RELEASE_HOME/verified")" "$(readlink "$RELEASE_HOME/current")"
 

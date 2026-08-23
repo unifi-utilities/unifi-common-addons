@@ -92,7 +92,7 @@ done
 case "$MODE" in
 release)
 	printf '%s\n' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$' ||
-		die "release tag must look like v0.128.0"
+		die "release tag must look like v0.129.0"
 	case "$RELEASE_BASE_URL" in
 	https://*) ;;
 	*) die "release base URL must use HTTPS" ;;

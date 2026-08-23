@@ -93,7 +93,8 @@ fi
 mkdir -p "$UNIT_DIR"
 install -m 0644 "$APP_HOME/aftertouch-player.service" "$UNIT_DIR/$SERVICE_NAME"
 "$SYSTEMCTL" daemon-reload
-"$SYSTEMCTL" enable "$SERVICE_NAME" >/dev/null
+# udm-boot owns boot ordering; remove legacy enablement to avoid a parallel start.
+"$SYSTEMCTL" disable "$SERVICE_NAME" >/dev/null
 "$SYSTEMCTL" restart "$SERVICE_NAME"
 AFTERTOUCH_PLAYER_HOME=$APP_HOME "$HEALTHCHECK"
 "$SYSTEMCTL" is-active --quiet "$SERVICE_NAME"

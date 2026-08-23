@@ -55,6 +55,12 @@ development builds use the same runtime and rollback path. The installer and
 boot hook serialize state changes with `.operation.lock`; a concurrent command
 fails without changing the selected artifact and can be retried afterward.
 
+The `udm-boot` hook is the sole owner of boot-time startup. Each activation
+reinstalls the unit, removes any direct `multi-user.target` enablement left by
+an earlier addon revision, and then restarts the service. The unit is therefore
+expected to be active but disabled; do not enable it separately, because that
+would race the validated hook path during boot.
+
 ## First Installation And Configuration
 
 Copy the addon to persistent storage and create `config.env` directly from the
@@ -74,7 +80,7 @@ Replace the example addresses and review the complete file. Then download,
 verify, install, and activate an explicit release:
 
 ```sh
-./install.sh --release v0.128.0 --activate
+./install.sh --release v0.129.0 --activate
 ```
 
 The installer also creates `config.env` from the example when it is missing,
@@ -98,13 +104,21 @@ activate the verified artifact in the same operation:
 
 ```sh
 cd /data/aftertouch-player
-./install.sh --release v0.128.0 --activate
+./install.sh --release v0.129.0 --activate
 ```
 
 The release tag is always explicit. The installer never resolves `latest`, and
 the boot hook never downloads or updates anything. A non-default
 `AFTERTOUCH_RELEASE_BASE_URL` is recorded as `release-mirror`, not as an
 official release source.
+
+> [!NOTE]
+> Releases `v0.128.0` and `v0.129.0` predate the upstream
+> [configured-device retry fix](https://github.com/gesellix/Bose-SoundTouch/pull/644).
+> They do not retry an explicitly configured speaker that was offline during
+> player startup. After such a speaker comes online, restart
+> `aftertouch-player.service`, or use the first later release that contains the
+> fix once it is available.
 
 Omitting `--activate` selects the artifact without restarting the service. On a
 first installation it also leaves the boot hook uninstalled. On an existing
@@ -162,12 +176,13 @@ gateway or mutate speakers.
 ## Verification
 
 The boot hook verifies the active binary against its manifest before every
-start, restores the unit, starts the service, and waits for the healthcheck.
-Run the same checks manually with:
+start, restores the intentionally disabled unit, starts the service, and waits
+for the healthcheck. Run the same checks manually with:
 
 ```sh
 /data/aftertouch-player/aftertouch-player-healthcheck.sh
 systemctl status --no-pager aftertouch-player.service
+systemctl is-enabled aftertouch-player.service || true
 readlink /data/aftertouch-player/current
 cat /data/aftertouch-player/current/manifest
 ```
