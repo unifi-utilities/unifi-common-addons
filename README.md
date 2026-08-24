@@ -13,6 +13,12 @@ A collection of addons to enhance the capabilities of your UniFi products.
 
 ## Addons
 
+### [aftertouch-player](aftertouch-player)
+
+Runs the standalone
+[`soundtouch-player`](https://github.com/gesellix/Bose-SoundTouch) web player
+for Bose SoundTouch speakers as a persistent, systemd-managed UniFi OS addon.
+
 ### att-ipv6
 
 Enables receiving up to 8 Prefix Delegations on AT&T connections.
