@@ -1,0 +1,15 @@
+[Unit]
+Description=SoundCork systemd-nspawn service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/data/soundcork/soundcork-nspawn.pid
+ExecStart=/data/soundcork/soundcork-nspawn.sh --keep-unit
+Restart=always
+RestartSec=5s
+TimeoutStartSec=180s
+TimeoutStopSec=30s
+KillMode=control-group
+Delegate=yes
