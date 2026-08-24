@@ -36,6 +36,10 @@ enough on firmware that validates TLS certificates.
   direct nspawn launcher from package repositories and SoundCork source.
 - `soundcork-nspawn.sh` starts SoundCork from a prepared rootfs through
   rootful `systemd-nspawn`, for gateways where Docker or Podman is not usable.
+- `soundcork-nspawn.service` owns the nspawn process cgroup so a later failing
+  `/data/on_boot.d` hook cannot terminate an already started SoundCork process.
+- `20-soundcork-nspawn.sh` installs that unit and starts it from the normal
+  `udm-boot` hook sequence.
 - `30-soundtouch-remux.sh` optionally starts a helper that remuxes selected
   Ogg-FLAC radio streams to native FLAC for SoundTouch internet radio playback.
 - `remux_stream_endpoint.py` is the small HTTP remux helper used by
@@ -60,6 +64,7 @@ cp 30-soundtouch-remux.sh /data/on_boot.d/30-soundtouch-remux.sh
 cp remux_stream_endpoint.py /data/soundcork/remux_stream_endpoint.py
 cp soundcork-provision-rootfs.sh /data/soundcork/soundcork-provision-rootfs.sh
 cp soundcork-nspawn.sh /data/soundcork/soundcork-nspawn.sh
+cp soundcork-nspawn.service /data/soundcork/soundcork-nspawn.service
 cp soundcork-healthcheck.sh /data/soundcork/soundcork-healthcheck.sh
 chmod +x /data/on_boot.d/05-soundcork-runtime.sh
 chmod +x /data/on_boot.d/20-soundcork.sh
@@ -163,8 +168,7 @@ rootfs:
 /data/soundcork/logs -> /soundcork/logs
 ```
 
-Set nspawn-specific variables in `/data/soundcork/soundcork.env` or in a small
-wrapper under `/data/on_boot.d`:
+Set nspawn-specific variables in `/data/soundcork/soundcork.env`:
 
 ```sh
 SOUNDCORK_ROOTFS=/data/soundcork/nspawn-rootfs
@@ -179,7 +183,7 @@ DATA_DIR=/data/soundcork/data
 LOG_DIR=/data/soundcork/logs
 ```
 
-Example boot wrapper:
+Install the supplied boot hook after moving the Docker/Podman hooks aside:
 
 ```sh
 mkdir -p /data/soundcork/disabled-hooks
@@ -189,16 +193,42 @@ for hook in 05-soundcork-runtime.sh 20-soundcork.sh; do
     fi
 done
 
-cat >/data/on_boot.d/20-soundcork-nspawn.sh <<'EOF'
-#!/bin/sh
-set -eu
-exec env \
-  SOUNDCORK_ROOTFS=/data/soundcork/nspawn-rootfs \
-  SOUNDCORK_NSPAWN=/data/soundcork/nspawn-tools/usr/bin/systemd-nspawn \
-  /data/soundcork/soundcork-nspawn.sh
-EOF
+cp 20-soundcork-nspawn.sh /data/on_boot.d/20-soundcork-nspawn.sh
 chmod +x /data/on_boot.d/20-soundcork-nspawn.sh
+/data/on_boot.d/20-soundcork-nspawn.sh
 ```
+
+`soundcork-nspawn.service` is static and is not pulled in by a boot target. The
+normal boot path starts it through the hook, leaving boot ordering with
+`udm-boot.service`, while systemd owns the running nspawn process in a separate
+service cgroup. A failure in a later boot hook can therefore fail the dispatcher
+without killing SoundCork. Use the boot hook, not `soundcork-nspawn.sh`
+directly, for later deployments and manual restarts.
+
+To return to the Docker or Podman path, first move the nspawn hook out of the
+dispatcher and stop its active service. Only then restore the Docker/Podman
+hooks:
+
+```sh
+mkdir -p /data/soundcork/disabled-hooks
+mv /data/on_boot.d/20-soundcork-nspawn.sh \
+  /data/soundcork/disabled-hooks/20-soundcork-nspawn.sh
+systemctl stop soundcork-nspawn.service
+rm -f /etc/systemd/system/soundcork-nspawn.service
+systemctl daemon-reload
+for hook in 05-soundcork-runtime.sh 20-soundcork.sh; do
+    mv "/data/soundcork/disabled-hooks/${hook}" "/data/on_boot.d/${hook}"
+    chmod +x "/data/on_boot.d/${hook}"
+done
+/data/on_boot.d/05-soundcork-runtime.sh
+/data/on_boot.d/20-soundcork.sh
+/data/soundcork/soundcork-healthcheck.sh --no-spotify --no-remux
+```
+
+The unit is static and cannot be enabled through `systemctl enable`. Stopping
+it is still required during rollback because `disabled` or `static` does not
+mean that an already running service has stopped. The restored `20` hook waits
+for the registry endpoint before the final healthcheck runs.
 
 Do not enable both `/data/on_boot.d/20-soundcork.sh` and the nspawn wrapper on
 the same port. Keep the Docker/Podman hooks moved out of `/data/on_boot.d`, or

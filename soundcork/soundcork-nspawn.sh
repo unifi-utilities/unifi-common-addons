@@ -1,6 +1,18 @@
 #!/bin/sh
 set -eu
 
+FORCE_KEEP_UNIT=0
+case "${1:-}" in
+    --keep-unit)
+        FORCE_KEEP_UNIT=1
+        shift
+        ;;
+esac
+[ "$#" -eq 0 ] || {
+    echo "soundcork-nspawn: unexpected argument: $1" >&2
+    exit 2
+}
+
 ENV_FILE="${ENV_FILE:-/data/soundcork/soundcork.env}"
 
 if [ -f "$ENV_FILE" ]; then
@@ -30,6 +42,7 @@ SOUNDCORK_READY_URL="${SOUNDCORK_READY_URL:-http://127.0.0.1:${SOUNDCORK_PORT}/b
 SOUNDCORK_READY_TIMEOUT="${SOUNDCORK_READY_TIMEOUT:-90}"
 SOUNDCORK_READY_INTERVAL="${SOUNDCORK_READY_INTERVAL:-2}"
 SOUNDCORK_READY_LOG_LINES="${SOUNDCORK_READY_LOG_LINES:-80}"
+SOUNDCORK_NSPAWN_KEEP_UNIT="${SOUNDCORK_NSPAWN_KEEP_UNIT:-0}"
 SPOTIFY_CLIENT_ID="${SPOTIFY_CLIENT_ID:-${spotify_client_id:-}}"
 SPOTIFY_CLIENT_SECRET="${SPOTIFY_CLIENT_SECRET:-${spotify_client_secret:-}}"
 SPOTIFY_REDIRECT_URI="${SPOTIFY_REDIRECT_URI:-${spotify_redirect_uri:-${BASE_URL}/mgmt/spotify/callback}}"
@@ -192,9 +205,38 @@ stop_log_writer() {
 
     old_log_pid="$(cat "$LOG_PID_FILE" 2>/dev/null || true)"
     if [ "$should_kill" = "1" ] && [ -n "${old_log_pid:-}" ] && kill -0 "$old_log_pid" 2>/dev/null; then
-        kill "$old_log_pid" 2>/dev/null || true
+        old_log_fd="$(readlink "/proc/${old_log_pid}/fd/0" 2>/dev/null || true)"
+        case "$old_log_fd" in
+            "$LOG_PIPE"|"$LOG_PIPE (deleted)")
+                kill "$old_log_pid" 2>/dev/null || true
+                ;;
+            *)
+                log "ignoring stale log PID $old_log_pid owned by another process"
+                ;;
+        esac
     fi
     rm -f "$LOG_PID_FILE"
+}
+
+process_start_time() {
+    sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '
+        NF >= 20 { print $20; found = 1 }
+        END { if (!found) exit 1 }
+    '
+}
+
+process_has_arg() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\000' '\n' <"/proc/$1/cmdline" | grep -Fqx -e "$2"
+}
+
+nspawn_pid_matches() {
+    identity_exe="$(readlink -f "/proc/$1/exe" 2>/dev/null || true)"
+    configured_exe="$(readlink -f "$NSPAWN_BIN" 2>/dev/null || true)"
+    [ -n "$identity_exe" ] && [ "$identity_exe" = "$configured_exe" ] || return 1
+    process_has_arg "$1" "--directory=$ROOTFS" || return 1
+    process_has_arg "$1" "--bind=${DATA_DIR}:/soundcork/data" || return 1
+    process_has_arg "$1" "--bind=${LOG_DIR}:/soundcork/logs"
 }
 
 stop_previous() {
@@ -212,13 +254,29 @@ stop_previous() {
         return 0
     fi
 
+    old_start_time="$(process_start_time "$old_pid" || true)"
+    if [ -z "$old_start_time" ] || ! nspawn_pid_matches "$old_pid"; then
+        log "ignoring stale nspawn PID $old_pid owned by another process"
+        rm -f "$PID_FILE"
+        stop_log_writer
+        rm -f "$LOG_PIPE"
+        return 0
+    fi
+
     log "stopping previous nspawn process $old_pid"
     kill "$old_pid" 2>/dev/null || true
     for _ in $(seq 1 10); do
         kill -0 "$old_pid" 2>/dev/null || break
         sleep 1
     done
-    kill -9 "$old_pid" 2>/dev/null || true
+    if kill -0 "$old_pid" 2>/dev/null; then
+        current_start_time="$(process_start_time "$old_pid" || true)"
+        if [ "$current_start_time" = "$old_start_time" ] && nspawn_pid_matches "$old_pid"; then
+            kill -9 "$old_pid" 2>/dev/null || true
+        else
+            log "refusing to signal reused or changed nspawn PID $old_pid"
+        fi
+    fi
     rm -f "$PID_FILE"
     stop_log_writer
     rm -f "$LOG_PIPE"
@@ -268,6 +326,18 @@ umask 077
 umask 022
 chmod 600 "$ENV_IN_ROOTFS"
 
+if [ "$FORCE_KEEP_UNIT" = "1" ]; then
+    SOUNDCORK_NSPAWN_KEEP_UNIT=1
+fi
+case "$SOUNDCORK_NSPAWN_KEEP_UNIT" in
+    0|1)
+        ;;
+    *)
+        log "SOUNDCORK_NSPAWN_KEEP_UNIT must be 0 or 1"
+        exit 1
+        ;;
+esac
+
 normalize_log_limits
 stop_previous
 
@@ -279,14 +349,23 @@ log_pid="$!"
 echo "$log_pid" >"$LOG_PID_FILE"
 
 log "starting SoundCork nspawn rootfs=${ROOTFS} base_url=${BASE_URL} bind=${GUNICORN_BIND}"
+set -- \
+    "$NSPAWN_BIN" \
+    --quiet \
+    --register=no
+if [ "$SOUNDCORK_NSPAWN_KEEP_UNIT" = "1" ]; then
+    set -- "$@" --keep-unit
+fi
+set -- \
+    "$@" \
+    --directory="$ROOTFS" \
+    --bind="${DATA_DIR}:/soundcork/data" \
+    --bind="${LOG_DIR}:/soundcork/logs" \
+    --as-pid2
 (
-    exec "$NSPAWN_BIN" \
-        --quiet \
-        --register=no \
-        --directory="$ROOTFS" \
-        --bind="${DATA_DIR}:/soundcork/data" \
-        --bind="${LOG_DIR}:/soundcork/logs" \
-        --as-pid2 \
+    # Variables in this command are expanded by the shell inside the rootfs.
+    # shellcheck disable=SC2016
+    exec "$@" \
         /bin/sh -c '. /etc/soundcork-nspawn.env && cd "$SOUNDCORK_APP_DIR" && exec "$SOUNDCORK_GUNICORN" -c gunicorn_conf.py --bind "$GUNICORN_BIND" --access-logfile - --error-logfile - --workers "$SOUNDCORK_WORKERS" main:app'
 ) >"$LOG_PIPE" 2>&1 < /dev/null &
 new_pid="$!"
