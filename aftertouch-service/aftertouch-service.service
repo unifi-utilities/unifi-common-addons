@@ -1,0 +1,23 @@
+[Unit]
+Description=AfterTouch SoundTouch Service
+Documentation=https://github.com/gesellix/Bose-SoundTouch
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/data/aftertouch-service/config.env
+WorkingDirectory=/data/aftertouch-service
+ExecStart=/data/aftertouch-service/run.sh
+Restart=on-failure
+RestartSec=5s
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/data/aftertouch-service/data
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

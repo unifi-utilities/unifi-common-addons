@@ -19,6 +19,12 @@ Runs the standalone
 [`soundtouch-player`](https://github.com/gesellix/Bose-SoundTouch) web player
 for Bose SoundTouch speakers as a persistent, systemd-managed UniFi OS addon.
 
+### [aftertouch-service](aftertouch-service)
+
+Runs the complete [AfterTouch](https://github.com/gesellix/Bose-SoundTouch)
+backend and embedded player on a UniFi OS gateway with verified releases,
+persistent state, health checks, and separate artifact and state rollback.
+
 ### att-ipv6
 
 Enables receiving up to 8 Prefix Delegations on AT&T connections.
