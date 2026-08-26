@@ -55,7 +55,10 @@ enough on firmware that validates TLS certificates.
 Copy the addon files to the UniFi host and create persistent directories:
 
 ```sh
-mkdir -p /data/on_boot.d /data/soundcork/data /data/soundcork/logs
+mkdir -p \
+  /data/on_boot.d \
+  /data/soundcork/data \
+  /data/soundcork/logs
 cp soundcork.env.example /data/soundcork/soundcork.env
 cp docker-daemon.json.example /data/soundcork/docker-daemon.json
 cp 05-soundcork-runtime.sh /data/on_boot.d/05-soundcork-runtime.sh
@@ -166,7 +169,13 @@ rootfs:
 ```text
 /data/soundcork/data -> /soundcork/data
 /data/soundcork/logs -> /soundcork/logs
+/data/soundtouch-registry -> /soundtouch-registry (read-only)
 ```
+
+The registry mount is optional application input. Set both
+`SOUNDTOUCH_REGISTRY_DIR` and `SOUNDTOUCH_REGISTRY_FILE` to let a compatible
+SoundCork fork read an exported inventory. The launcher creates the controller
+directory when needed and never grants the application write access to it.
 
 Set nspawn-specific variables in `/data/soundcork/soundcork.env`:
 
@@ -181,6 +190,8 @@ SOUNDCORK_VENV=/opt/soundcork-venv
 SOUNDCORK_GUNICORN=/opt/soundcork-venv/bin/gunicorn
 DATA_DIR=/data/soundcork/data
 LOG_DIR=/data/soundcork/logs
+SOUNDTOUCH_REGISTRY_DIR=/data/soundtouch-registry
+SOUNDTOUCH_REGISTRY_FILE=/soundtouch-registry/site.json
 ```
 
 Install the supplied boot hook after moving the Docker/Podman hooks aside:
