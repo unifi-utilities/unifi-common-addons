@@ -26,6 +26,8 @@ BASE_URL="${BASE_URL:-http://${SOUNDCORK_HOST}:${SOUNDCORK_PORT}}"
 GUNICORN_BIND="${GUNICORN_BIND:-0.0.0.0:${SOUNDCORK_PORT}}"
 DATA_DIR="${DATA_DIR:-/data/soundcork/data}"
 LOG_DIR="${LOG_DIR:-/data/soundcork/logs}"
+SOUNDTOUCH_REGISTRY_DIR="${SOUNDTOUCH_REGISTRY_DIR:-}"
+SOUNDTOUCH_REGISTRY_FILE="${SOUNDTOUCH_REGISTRY_FILE:-}"
 ROOTFS="${SOUNDCORK_ROOTFS:-/data/soundcork/nspawn-rootfs}"
 NSPAWN_BIN="${SOUNDCORK_NSPAWN:-}"
 APP_DIR="${SOUNDCORK_APP_DIR:-/opt/soundcork/soundcork}"
@@ -231,6 +233,8 @@ process_has_arg() {
 }
 
 nspawn_pid_matches() {
+    # Optional mounts may change between generations; the core SoundCork binds
+    # identify a launcher-owned process that is safe to replace.
     identity_exe="$(readlink -f "/proc/$1/exe" 2>/dev/null || true)"
     configured_exe="$(readlink -f "$NSPAWN_BIN" 2>/dev/null || true)"
     [ -n "$identity_exe" ] && [ "$identity_exe" = "$configured_exe" ] || return 1
@@ -299,8 +303,21 @@ fi
 [ -d "$ROOTFS" ] || { log "missing rootfs at $ROOTFS"; exit 1; }
 [ -d "$ROOTFS$APP_DIR" ] || { log "missing SoundCork app dir at $ROOTFS$APP_DIR"; exit 1; }
 [ -x "$ROOTFS$GUNICORN_BIN" ] || { log "missing gunicorn at $ROOTFS$GUNICORN_BIN"; exit 1; }
+if [ -n "$SOUNDTOUCH_REGISTRY_DIR" ] || [ -n "$SOUNDTOUCH_REGISTRY_FILE" ]; then
+    [ -n "$SOUNDTOUCH_REGISTRY_DIR" ] && [ -n "$SOUNDTOUCH_REGISTRY_FILE" ] || {
+        log "SOUNDTOUCH_REGISTRY_DIR and SOUNDTOUCH_REGISTRY_FILE must be set together"
+        exit 1
+    }
+fi
 
-mkdir -p "$DATA_DIR" "$LOG_DIR" "$ROOTFS/soundcork/data" "$ROOTFS/soundcork/logs"
+mkdir -p \
+    "$DATA_DIR" \
+    "$LOG_DIR" \
+    "$ROOTFS/soundcork/data" \
+    "$ROOTFS/soundcork/logs"
+if [ -n "$SOUNDTOUCH_REGISTRY_DIR" ]; then
+    mkdir -p "$SOUNDTOUCH_REGISTRY_DIR" "$ROOTFS/soundtouch-registry"
+fi
 ENV_IN_ROOTFS="$ROOTFS/etc/soundcork-nspawn.env"
 umask 077
 {
@@ -316,6 +333,9 @@ umask 077
     write_env_var SPOTIFY_ZEROCONF_PRIME_DEVICES "$SPOTIFY_ZEROCONF_PRIME_DEVICES"
     write_env_var SOUNDCORK_SPOTIFY_PRIME_DEVICES "$SOUNDCORK_SPOTIFY_PRIME_DEVICES"
     write_env_var SPOTIFY_ZEROCONF_PRIMER_INTERVAL_SECONDS "$SPOTIFY_ZEROCONF_PRIMER_INTERVAL_SECONDS"
+    if [ -n "$SOUNDTOUCH_REGISTRY_FILE" ]; then
+        write_env_var SOUNDTOUCH_REGISTRY_FILE "$SOUNDTOUCH_REGISTRY_FILE"
+    fi
     write_env_var SOUNDCORK_MODE "local"
     write_env_var SOUNDCORK_LOG_DIR "/soundcork/logs/traffic"
     write_env_var SOUNDCORK_APP_DIR "$APP_DIR"
@@ -360,8 +380,11 @@ set -- \
     "$@" \
     --directory="$ROOTFS" \
     --bind="${DATA_DIR}:/soundcork/data" \
-    --bind="${LOG_DIR}:/soundcork/logs" \
-    --as-pid2
+    --bind="${LOG_DIR}:/soundcork/logs"
+if [ -n "$SOUNDTOUCH_REGISTRY_DIR" ]; then
+    set -- "$@" --bind-ro="${SOUNDTOUCH_REGISTRY_DIR}:/soundtouch-registry"
+fi
+set -- "$@" --as-pid2
 (
     # Variables in this command are expanded by the shell inside the rootfs.
     # shellcheck disable=SC2016
