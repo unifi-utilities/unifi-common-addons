@@ -9,6 +9,8 @@ systemd-tmpfiles --create /etc/tmpfiles.d/att-ipv6.conf
 
 for unit in \
     att-ipv6-acquire.service \
+    att-ipv6-recover.service \
+    att-ipv6-recover.path \
     att-ipv6-reconcile.service \
     att-ipv6-reconcile.path \
     att-ipv6-reconcile.timer
@@ -19,6 +21,7 @@ systemctl daemon-reload
 if [ -e /data/att-ipv6/native-enabled ]; then
     systemctl enable --now \
         att-ipv6-acquire.service \
+        att-ipv6-recover.path \
         att-ipv6-reconcile.path \
         att-ipv6-reconcile.timer
 fi

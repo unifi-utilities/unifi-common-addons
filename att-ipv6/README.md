@@ -99,6 +99,11 @@ Important fields are:
 - `delegations`: the authoritative IAID-to-network mapping.
 - `id`: stable local key used in acquisition and health output.
 - `iaid`: unique unsigned 32-bit IA_PD identity association.
+- `prefix_hint`: optional authoritative `/64` for a network. When present, the
+  reconciler maps the matching delegated prefix to that network even if the
+  server associates it with a different IAID, and rejects the configuration
+  if that prefix is absent. Use this for migrations that must preserve existing
+  subnet identity.
 - `network`, `vlan_id`, and `bridge`: values that must resolve to the same
   UniFi network and live Linux bridge.
 - `ra_priority`, `dhcpv6_suffix_range`, and `dhcpv6_lease_seconds`: static LAN
@@ -106,23 +111,48 @@ Important fields are:
 - `minimum_valid_lifetime`: minimum remaining prefix lifetime accepted for
   promotion.
 
+For migrations, always supply the existing authoritative DUID, IAID mapping,
+and any prefix hints needed to preserve established subnet identity. Do not use
+green-field identity generation to replace a working DHCPv6 identity.
+
 ## Runtime behavior
 
-`att-ipv6 acquire` loads `config.json`, constructs the odhcp6c command, and
-replaces itself with the foreground client. The hook reads the same config and
-writes atomic observations only to `/run/att-ipv6/acquisition.json`. A config
-digest binds each observation to the configuration used when the client
-started. If config changes while acquisition is running, the hook refuses new
-observations and health fails until an operator performs a controlled restart.
+`att-ipv6 acquire` loads `config.json`, records the configured acquisition
+contract, and replaces itself with the foreground client. The hook reads the
+same config and writes atomic observations only to
+`/run/att-ipv6/acquisition.json`. The contract contains only the WAN interface,
+DUID, and configured IAIDs. Changes to that contract cause the next
+reconciliation pass to restart the acquisition service once and wait for a
+current observation. Network mappings and UniFi settings remain
+configuration-owned but do not unnecessarily restart odhcp6c.
 
 Partial state remains `acquiring=N/M`, where `M` is derived from configured
 delegations. It is never applied. Complete state requires a fresh, unique,
 unexpired `/64` for every configured IAID and no unexpected IAID. Renew and
 Rebind timing remains internal to odhcp6c.
 
-The reconciler maps acquired IAIDs to configured UniFi networks, writes static
-IPv6 network configuration through the Integration API, verifies API readback,
-and verifies exact bridge addresses and kernel-connected routes. It never
+When a binding is partial, the recovery watcher stops the managed client
+without RELEASE, requests each missing configured IAID separately, and then
+starts one full-set client to maintain the complete lease. Each temporary
+client also suppresses RELEASE and is stopped before the next begins. Recovery
+uses only runtime state under `/run`, makes one automatic attempt, and locks a
+still-partial result for operator review. A reboot starts a fresh runtime
+attempt; there is no persistent cooldown or recovery state.
+
+To authorize one more guarded cycle after reviewing a locked incident, run:
+
+```sh
+sudo /data/att-ipv6/att-ipv6 recover --force
+```
+
+This command permits one more bounded sequential attempt and does not bypass
+identity or ownership checks. Recovery controls only the acquisition process;
+it never changes UniFi networks, addresses, routes, or resolver files.
+
+The reconciler maps acquired prefixes to configured UniFi networks by
+`prefix_hint` when present, otherwise by IAID. It writes static IPv6 network
+configuration through the Integration API, verifies API readback, and verifies
+exact bridge addresses and kernel-connected routes. It never
 edits resolver, dnsmasq, interface, or UniFi runtime configuration files.
 
 Useful read-only checks are:
@@ -130,11 +160,6 @@ Useful read-only checks are:
 ```sh
 /data/att-ipv6/att-ipv6 status
 systemctl status att-ipv6-acquire.service
+journalctl -u att-ipv6-recover.service
 journalctl -u att-ipv6-acquire.service
 ```
-
-If a gateway remains partial through normal Renew/Rebind processing, an
-operator may perform one controlled stop, short wait, and start of
-`att-ipv6-acquire.service`. Preserve the DUID, confirm UDP/546 becomes free,
-never overlap acquisition clients, and observe the provider cooldown between
-attempts.
