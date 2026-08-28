@@ -189,7 +189,6 @@ class Installer:
             self.tmpfiles_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True, mode=0o755)
-
         _copy(self.source_dir / "att-ipv6", self.root / "att-ipv6", 0o755)
         _copy(self.source_dir / "att-ipv6-hook", self.root / "att-ipv6-hook", 0o755)
         installed_config_path = self.root / "config.json"
@@ -210,6 +209,8 @@ class Installer:
         )
         for name in (
             "att-ipv6-acquire.service",
+            "att-ipv6-recover.service",
+            "att-ipv6-recover.path",
             "att-ipv6-reconcile.service",
             "att-ipv6-reconcile.path",
             "att-ipv6-reconcile.timer",
