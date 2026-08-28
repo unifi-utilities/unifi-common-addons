@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for incomplete IPv6 acquisition recovery
+
+[Path]
+PathChanged=/run/att-ipv6/acquisition.json
+Unit=att-ipv6-recover.service
+
+[Install]
+WantedBy=multi-user.target

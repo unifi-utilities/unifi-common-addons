@@ -30,11 +30,17 @@ DEFAULT_API_ENDPOINT = "https://127.0.0.1/proxy/network/integration/v1"
 ODHCP6C = "/usr/sbin/odhcp6c"
 HOOK_PATH = "/data/att-ipv6/att-ipv6-hook"
 CONFIG_DIGEST_ENV = "ATT_IPV6_CONFIG_DIGEST"
+SINGLE_IAID_ENV = "ATT_IPV6_SINGLE_IAID"
 READ_ONLY_NETWORK_FIELDS = {"default", "id", "metadata"}
+RECOVERY_PRIME_TIMEOUT_SECONDS = 10
 
 
 class ReconcileError(RuntimeError):
     """Raised when state cannot be used without ambiguity."""
+
+
+class AcquisitionContractChanged(ReconcileError):
+    """Raised when the running client used a different request contract."""
 
 
 def _require(condition: bool, message: str) -> None:
@@ -80,6 +86,7 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
     config.setdefault("site", "default")
     config.setdefault("acquisition_path", "/run/att-ipv6/acquisition.json")
     config.setdefault("lock_path", "/run/att-ipv6/reconciler.lock")
+    config.setdefault("recovery_path", "/run/att-ipv6/recovery.json")
     config.setdefault("ra_priority", "HIGH")
     config.setdefault("dhcpv6_suffix_range", {"start": "::2", "stop": "::7d1"})
     config.setdefault("dhcpv6_lease_seconds", 86400)
@@ -103,6 +110,7 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
     seen_iaids: set[int] = set()
     seen_names: set[str] = set()
     seen_bridges: set[str] = set()
+    seen_prefix_hints: set[str] = set()
     for index, raw_item in enumerate(delegations):
         _require(isinstance(raw_item, dict), f"delegation {index} must be an object")
         item = copy.deepcopy(raw_item)
@@ -116,25 +124,43 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
         item["network"] = str(item["network"])
         item["vlan_id"] = int(item["vlan_id"])
         item["bridge"] = str(item["bridge"])
+        if item.get("prefix_hint") not in (None, ""):
+            item["prefix_hint"] = str(
+                _ipv6_network(
+                    str(item["prefix_hint"]),
+                    f"delegation {index} prefix hint",
+                )
+            )
+        else:
+            item.pop("prefix_hint", None)
         _require(item["id"] not in seen_ids, f"duplicate delegation id {item['id']}")
         _require(0 <= item["iaid"] <= 0xFFFFFFFF, f"delegation {index} IAID must be an unsigned 32-bit integer")
         _require(item["iaid"] not in seen_iaids, f"duplicate IAID {item['iaid']}")
         _require(item["network"] not in seen_names, f"duplicate network {item['network']}")
         _require(item["bridge"] not in seen_bridges, f"duplicate bridge {item['bridge']}")
+        if "prefix_hint" in item:
+            _require(
+                item["prefix_hint"] not in seen_prefix_hints,
+                f"duplicate prefix hint {item['prefix_hint']}",
+            )
         seen_ids.add(item["id"])
         seen_iaids.add(item["iaid"])
         seen_names.add(item["network"])
         seen_bridges.add(item["bridge"])
+        if "prefix_hint" in item:
+            seen_prefix_hints.add(item["prefix_hint"])
         normalized.append(item)
     config["delegations"] = sorted(normalized, key=lambda item: item["iaid"])
     return config
 
 
 def config_digest(config: dict[str, Any]) -> str:
-    """Return the stable digest shared by the launcher, hook, and health."""
-    if isinstance(config.get("_source_digest"), str):
-        return config["_source_digest"]
-    digest_value = {key: value for key, value in config.items() if key != "_source_digest"}
+    """Return the digest of fields that determine the odhcp6c request."""
+    digest_value = {
+        "wan_interface": config["wan_interface"],
+        "duid": config["duid"],
+        "iaids": sorted(item["iaid"] for item in config["delegations"]),
+    }
     return hashlib.sha256(
         json.dumps(digest_value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -151,6 +177,11 @@ def expected_state(config: dict[str, Any]) -> dict[str, Any]:
                 "network": item["network"],
                 "vlan_id": item["vlan_id"],
                 "bridge": item["bridge"],
+                **(
+                    {"prefix_hint": item["prefix_hint"]}
+                    if "prefix_hint" in item
+                    else {}
+                ),
             }
             for item in config["delegations"]
         },
@@ -159,13 +190,10 @@ def expected_state(config: dict[str, Any]) -> dict[str, Any]:
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     try:
-        payload = Path(path).read_bytes()
-        raw = json.loads(payload)
+        raw = json.loads(Path(path).read_bytes())
     except (OSError, json.JSONDecodeError) as exc:
         raise ReconcileError(f"unable to read configuration: {exc}") from exc
-    config = validate_config(raw)
-    config["_source_digest"] = hashlib.sha256(payload).hexdigest()
-    return config
+    return validate_config(raw)
 
 
 def load_acquisition(path: Path | str) -> dict[str, Any]:
@@ -177,14 +205,26 @@ def load_acquisition(path: Path | str) -> dict[str, Any]:
     return value
 
 
+def load_recovery(path: Path | str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReconcileError(f"unable to read recovery state: {exc}") from exc
+    _require(isinstance(value, dict), "recovery state must be an object")
+    _require(value.get("schema") == 1, "unsupported recovery state schema")
+    return value
+
+
 def validate_acquisition(
     config: dict[str, Any], state: dict[str, Any], *, now: int
 ) -> dict[str, dict[str, Any]]:
     _require(state.get("schema") == 1, "unsupported acquisition state schema")
-    _require(
-        state.get("config_digest") == config_digest(config),
-        "acquisition configuration changed; restart the client in a controlled window",
-    )
+    if state.get("config_digest") != config_digest(config):
+        raise AcquisitionContractChanged(
+            "acquisition request contract changed"
+        )
     _require(_duid(str(state.get("duid", ""))) == config["duid"], "acquisition DUID differs")
     observed = int(state.get("observed_at", 0))
     raw_assignments = state.get("assignments")
@@ -211,10 +251,26 @@ def validate_acquisition(
         _require(expires == observed + valid, f"IAID {iaid} expiry is stale")
         _require(expires - now >= config["minimum_valid_lifetime"], f"IAID {iaid} has insufficient valid lifetime")
         by_iaid[iaid] = {**item, "prefix": prefix}
-    return {
-        delegation["id"]: by_iaid[delegation["iaid"]]
-        for delegation in config["delegations"]
-    }
+    by_prefix = {item["prefix"]: item for item in by_iaid.values()}
+    resolved = {}
+    used_iaids: set[int] = set()
+    for delegation in config["delegations"]:
+        if "prefix_hint" in delegation:
+            assignment = by_prefix.get(delegation["prefix_hint"])
+            _require(
+                assignment is not None,
+                f"configured prefix hint {delegation['prefix_hint']} was not delegated",
+            )
+        else:
+            assignment = by_iaid[delegation["iaid"]]
+        _require(
+            assignment["iaid"] not in used_iaids,
+            f"delegated IAID {assignment['iaid']} maps to multiple networks",
+        )
+        used_iaids.add(assignment["iaid"])
+        resolved[delegation["id"]] = assignment
+    _require(used_iaids == expected_iaids, "acquisition mapping is incomplete")
+    return resolved
 
 
 def atomic_write(path: Path | str, data: bytes, mode: int = 0o600) -> None:
@@ -642,6 +698,35 @@ class Reconciler:
             text=True,
         ).returncode == 0
 
+    def _assignments_with_contract_recovery(
+        self, config: dict[str, Any]
+    ) -> dict[str, dict[str, Any]]:
+        state = load_acquisition(config["acquisition_path"])
+        try:
+            return validate_acquisition(config, state, now=int(self.now()))
+        except AcquisitionContractChanged:
+            self._command(
+                ["systemctl", "restart", "att-ipv6-acquire.service"]
+            )
+
+        expected_digest = config_digest(config)
+        state = {}
+        for attempt in range(30):
+            try:
+                state = load_acquisition(config["acquisition_path"])
+            except ReconcileError:
+                state = {}
+            if (
+                state.get("config_digest") == expected_digest
+                and str(state.get("status", "")).startswith("complete=")
+            ):
+                return validate_acquisition(config, state, now=int(self.now()))
+            if attempt != 29:
+                self.sleep(2)
+        if not state:
+            raise ReconcileError("acquisition did not publish current state after restart")
+        return validate_acquisition(config, state, now=int(self.now()))
+
     @staticmethod
     def _write_networks(
         api: ApiClient,
@@ -666,6 +751,7 @@ class Reconciler:
 
     def status(self) -> dict[str, Any]:
         config = load_config(self.config_path)
+        now = int(self.now())
         result: dict[str, Any] = {
             "active": config["active"],
             "expected": expected_state(config),
@@ -673,16 +759,18 @@ class Reconciler:
             "acquisition": {"ok": False, "status": "missing", "error": None, "assignments": {}},
             "api": {"ok": False, "site": config["site"], "networks": {}},
             "network": {"ok": False, "missing_addresses": [], "missing_routes": [], "conflicts": []},
+            "recovery": recovery_status(config, now=now),
             "permissions": {
                 "config": private_mode_ok(self.config_path),
                 "api_key": private_mode_ok(config["api_key_path"]),
                 "acquisition": private_mode_ok(config["acquisition_path"], optional=True),
+                "recovery": private_mode_ok(config["recovery_path"], optional=True),
             },
         }
         try:
             state = load_acquisition(config["acquisition_path"])
             result["acquisition"]["status"] = state.get("status", "unknown")
-            assignments = validate_acquisition(config, state, now=int(self.now()))
+            assignments = validate_acquisition(config, state, now=now)
             result["acquisition"].update({"ok": True, "assignments": assignments})
         except ReconcileError as exc:
             result["acquisition"]["error"] = str(exc)
@@ -720,8 +808,8 @@ class Reconciler:
         Path(config["lock_path"]).parent.mkdir(parents=True, exist_ok=True)
         with Path(config["lock_path"]).open("w", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            assignments = self._assignments_with_contract_recovery(config)
             state = load_acquisition(config["acquisition_path"])
-            assignments = validate_acquisition(config, state, now=int(self.now()))
             state_digest = _digest(state)
             api = self._api(config)
             site_id, networks = collect_networks(api, config["site"])
@@ -764,6 +852,121 @@ def _socket_546_inodes() -> set[str]:
     return inodes
 
 
+def _socket_546_pids() -> set[int]:
+    inodes = _socket_546_inodes()
+    owners: set[int] = set()
+    if not inodes:
+        return owners
+    for directory in Path("/proc").iterdir():
+        if not directory.name.isdigit():
+            continue
+        try:
+            descriptors = (directory / "fd").iterdir()
+            if any(
+                descriptor.is_symlink()
+                and descriptor.readlink().as_posix().removeprefix("socket:[").removesuffix("]") in inodes
+                for descriptor in descriptors
+            ):
+                owners.add(int(directory.name))
+        except OSError:
+            continue
+    return owners
+
+
+def _process_command(pid: int) -> list[str]:
+    try:
+        return [
+            value.decode(errors="replace")
+            for value in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if value
+        ]
+    except OSError as exc:
+        raise ReconcileError(f"unable to inspect acquisition process {pid}: {exc}") from exc
+
+
+def assert_managed_client(
+    config: dict[str, Any],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    result = run(
+        ["systemctl", "show", "--property=MainPID", "--value", "att-ipv6-acquire.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        pid = int(result.stdout.strip())
+    except ValueError as exc:
+        raise ReconcileError("managed acquisition PID is unavailable") from exc
+    _require(result.returncode == 0 and pid > 0, "managed acquisition client is not active")
+    command = _process_command(pid)
+    _require(command and command[0] == ODHCP6C, "managed acquisition process is not odhcp6c")
+    _require("-k" in command, "managed acquisition client may send RELEASE")
+    _require(
+        any(command[index:index + 2] == ["-N", "none"] for index in range(len(command) - 1)),
+        "managed acquisition client requests addresses",
+    )
+    _require("-R" in command, "managed acquisition client requests unmanaged options")
+    _require(
+        any(command[index:index + 2] == ["-s", HOOK_PATH] for index in range(len(command) - 1)),
+        "managed acquisition client uses the wrong hook",
+    )
+    _require(
+        any(command[index:index + 2] == ["-c", config["duid"]] for index in range(len(command) - 1)),
+        "managed acquisition client uses the wrong DUID",
+    )
+    _require(command[-1] == config["wan_interface"], "managed acquisition client uses the wrong interface")
+    requested = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "-P"
+    ]
+    expected = [f"64:{item['iaid']}" for item in config["delegations"]]
+    _require(requested == expected, "managed acquisition client uses the wrong IAID set")
+    _require(_socket_546_pids() == {pid}, "UDP/546 is not owned only by the managed client")
+
+
+def assert_udp_546_free() -> None:
+    _require(not _socket_546_inodes(), "UDP/546 is already owned")
+
+
+def recovery_status(config: dict[str, Any], *, now: int) -> dict[str, Any]:
+    try:
+        state = load_recovery(config["recovery_path"])
+    except ReconcileError as exc:
+        return {
+            "healthy": False,
+            "phase": "invalid",
+            "incident_age": None,
+            "last_attempt": None,
+            "lockout": True,
+            "outcome": str(exc),
+        }
+    if state is None:
+        return {
+            "healthy": True,
+            "phase": "idle",
+            "incident_age": None,
+            "last_attempt": None,
+            "lockout": False,
+            "outcome": None,
+        }
+    phase = str(state.get("phase", "invalid"))
+    opened = state.get("opened_at")
+    stale = state.get("config_digest") != config_digest(config)
+    healthy = phase == "idle" and not stale
+    return {
+        "healthy": healthy,
+        "phase": "stale" if stale else phase,
+        "incident_age": max(0, now - int(opened)) if opened is not None else None,
+        "last_attempt": state.get("last_attempt_at"),
+        "lockout": stale or phase == "locked",
+        "outcome": "config_changed" if stale else state.get("outcome"),
+        "attempts": int(state.get("attempts", 0)),
+    }
+
+
 def acquire(
     config_path: Path | str = DEFAULT_CONFIG_PATH,
     *,
@@ -771,6 +974,49 @@ def acquire(
 ) -> None:
     """Replace this process with odhcp6c using only config-derived arguments."""
     config = load_config(config_path)
+    digest = config_digest(config)
+    observed = int(time.time())
+    atomic_write(
+        config["acquisition_path"],
+        (
+            json.dumps(
+                {
+                    "schema": 1,
+                    "status": f"starting=0/{len(config['delegations'])}",
+                    "event": "starting",
+                    "interface": config["wan_interface"],
+                    "duid": config["duid"],
+                    "config_digest": digest,
+                    "observed_at": observed,
+                    "assignments": {},
+                    "missing_iaids": [
+                        item["iaid"] for item in config["delegations"]
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        ),
+    )
+    command = odhcp6c_command(config)
+    environment = os.environ.copy()
+    environment[CONFIG_DIGEST_ENV] = digest
+    execve(ODHCP6C, command, environment)
+
+
+def odhcp6c_command(
+    config: dict[str, Any], iaids: Iterable[int] | None = None
+) -> list[str]:
+    """Build a no-RELEASE PD-only command for all or selected configured IAIDs."""
+    requested = (
+        [item["iaid"] for item in config["delegations"]]
+        if iaids is None
+        else list(iaids)
+    )
+    expected = {item["iaid"] for item in config["delegations"]}
+    _require(bool(requested), "at least one IAID is required")
+    _require(set(requested) <= expected, "requested IAID is not configured")
     command = [
         ODHCP6C,
         "-e",
@@ -784,12 +1030,10 @@ def acquire(
         "-s",
         HOOK_PATH,
     ]
-    for delegation in config["delegations"]:
-        command.extend(("-P", f"64:{delegation['iaid']}"))
+    for iaid in requested:
+        command.extend(("-P", f"64:{iaid}"))
     command.append(config["wan_interface"])
-    environment = os.environ.copy()
-    environment[CONFIG_DIGEST_ENV] = config_digest(config)
-    execve(ODHCP6C, command, environment)
+    return command
 
 
 def client_guard(config_path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
@@ -813,6 +1057,196 @@ def client_guard(config_path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, Any
     }
 
 
+def assert_no_acquisition_client() -> None:
+    for directory in Path("/proc").iterdir():
+        if not directory.name.isdigit():
+            continue
+        try:
+            command = (directory / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        _require(ODHCP6C not in command, "another odhcp6c process is running")
+    assert_udp_546_free()
+
+
+class RecoveryManager:
+    """Prime missing IAIDs once, then return ownership to the full-set client."""
+
+    def __init__(
+        self,
+        config_path: Path | str = DEFAULT_CONFIG_PATH,
+        *,
+        run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        now: Callable[[], float] = time.time,
+        managed_guard: Callable[[dict[str, Any]], None] | None = None,
+        free_guard: Callable[[], None] = assert_no_acquisition_client,
+        primer: Callable[[dict[str, Any], int], None] | None = None,
+    ) -> None:
+        self.config_path = Path(config_path)
+        self.run = run
+        self.now = now
+        self.managed_guard = managed_guard or (
+            lambda config: assert_managed_client(config, run=self.run)
+        )
+        self.free_guard = free_guard
+        self.primer = primer or self._prime_iaid
+
+    def _systemctl(self, operation: str) -> bool:
+        return self.run(
+            ["systemctl", operation, "att-ipv6-acquire.service"],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode == 0
+
+    @staticmethod
+    def _write(config: dict[str, Any], state: dict[str, Any]) -> None:
+        atomic_write(
+            config["recovery_path"],
+            json.dumps(state, indent=2, sort_keys=True).encode() + b"\n",
+        )
+
+    @staticmethod
+    def _check_observation(
+        config: dict[str, Any], state: dict[str, Any]
+    ) -> None:
+        _require(state.get("schema") == 1, "unsupported acquisition state schema")
+        _require(
+            state.get("config_digest") == config_digest(config),
+            "acquisition request contract changed",
+        )
+        _require(_duid(str(state.get("duid", ""))) == config["duid"], "acquisition DUID differs")
+        _require(state.get("interface") == config["wan_interface"], "acquisition interface differs")
+        _require(isinstance(state.get("assignments"), dict), "acquisition assignments must be an object")
+
+    def _prime_iaid(self, config: dict[str, Any], iaid: int) -> None:
+        state_path = Path(config["acquisition_path"])
+        state_path.unlink(missing_ok=True)
+        environment = os.environ.copy()
+        environment[CONFIG_DIGEST_ENV] = config_digest(config)
+        environment[SINGLE_IAID_ENV] = str(iaid)
+        process = subprocess.Popen(
+            odhcp6c_command(config, [iaid]),
+            env=environment,
+        )
+        deadline = time.monotonic() + RECOVERY_PRIME_TIMEOUT_SECONDS
+        acquired = False
+        try:
+            while process.poll() is None and time.monotonic() < deadline:
+                try:
+                    state = load_acquisition(state_path)
+                except ReconcileError:
+                    state = {}
+                assignments = state.get("assignments", {})
+                assignment = assignments.get(str(iaid), {})
+                try:
+                    valid_lifetime = int(assignment.get("valid_lifetime", 0))
+                except (AttributeError, TypeError, ValueError):
+                    valid_lifetime = 0
+                if (
+                    state.get("config_digest") == config_digest(config)
+                    and state.get("duid") == config["duid"]
+                    and set(assignments) == {str(iaid)}
+                    and isinstance(assignment, dict)
+                    and valid_lifetime > 0
+                ):
+                    acquired = True
+                    break
+                time.sleep(0.1)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        _require(acquired, f"IAID {iaid} was not acquired during recovery")
+        self.free_guard()
+
+    def process(self, *, force: bool = False) -> dict[str, Any]:
+        config = load_config(self.config_path)
+        now = int(self.now())
+        digest = config_digest(config)
+        recovery = load_recovery(config["recovery_path"])
+
+        if recovery is not None:
+            _require(
+                recovery.get("config_digest") == digest,
+                "recovery state belongs to a different acquisition contract",
+            )
+
+        state = load_acquisition(config["acquisition_path"])
+        self._check_observation(config, state)
+        status = str(state.get("status", ""))
+        complete = status.startswith("complete=")
+
+        if force:
+            _require(not complete, "complete acquisition does not need recovery")
+
+        if complete:
+            validate_acquisition(config, state, now=now)
+            Path(config["recovery_path"]).unlink(missing_ok=True)
+            return {"schema": 1, "phase": "idle", "config_digest": digest}
+
+        _require(status.startswith(("acquiring=", "starting=")), "unknown acquisition status")
+        if status.startswith("starting=") and (
+            recovery is None or recovery.get("phase") in {"idle", "awaiting_full"}
+        ):
+            return recovery or {"schema": 1, "phase": "idle", "config_digest": digest}
+        if state.get("event") != "bound" and not force:
+            return recovery or {"schema": 1, "phase": "idle", "config_digest": digest}
+
+        if recovery is not None and int(recovery.get("attempts", 0)) > 0 and not force:
+            recovery.update({"phase": "locked", "outcome": "partial_after_attempt"})
+            self._write(config, recovery)
+            return recovery
+
+        assignments = state.get("assignments", {})
+        expected = {item["iaid"] for item in config["delegations"]}
+        present = {int(value) for value in assignments}
+        _require(present < expected, "partial acquisition contains unexpected IAIDs")
+        missing = sorted(expected - present)
+        _require(
+            self._systemctl("is-active"),
+            "managed acquisition client is not active",
+        )
+        self.managed_guard(config)
+        attempts = int(recovery.get("attempts", 0)) + 1 if recovery else 1
+        recovery = {
+            "schema": 1,
+            "config_digest": digest,
+            "phase": "priming",
+            "opened_at": int(recovery.get("opened_at", now)) if recovery else now,
+            "last_attempt_at": now,
+            "attempts": attempts,
+            "missing_iaids": missing,
+            "outcome": "priming_missing_iaids",
+        }
+        self._write(config, recovery)
+
+        _require(self._systemctl("stop"), "unable to stop managed acquisition client")
+        self.free_guard()
+
+        prime_error: Exception | None = None
+        for iaid in missing:
+            try:
+                self.primer(config, iaid)
+            except (OSError, ReconcileError, subprocess.SubprocessError) as exc:
+                prime_error = exc
+                break
+
+        started = self._systemctl("start")
+        if not started:
+            recovery.update({"phase": "locked", "outcome": "start_failed"})
+        elif prime_error is not None:
+            recovery.update({"phase": "locked", "outcome": str(prime_error)})
+        else:
+            recovery.update({"phase": "awaiting_full", "outcome": "primed_missing_iaids"})
+        self._write(config, recovery)
+        return recovery
+
+
 def _healthy(result: dict[str, Any]) -> bool:
     expected_networks = set(result.get("expected", {}).get("networks", {}))
     return all(
@@ -825,6 +1259,7 @@ def _healthy(result: dict[str, Any]) -> bool:
             set(result.get("api", {}).get("networks", {})) == expected_networks,
             all(item.get("desired") for item in result.get("api", {}).get("networks", {}).values()),
             result.get("network", {}).get("ok") is True,
+            result.get("recovery", {}).get("healthy") is True,
             all(result.get("permissions", {}).values()),
         )
     )
@@ -841,6 +1276,8 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--activate", action="store_true")
     status = subparsers.add_parser("status")
     status.add_argument("--json", action="store_true")
+    recover = subparsers.add_parser("recover")
+    recover.add_argument("--force", action="store_true")
     subparsers.add_parser("client-guard")
     return parser
 
@@ -855,6 +1292,8 @@ def main(argv: list[str] | None = None) -> int:
             result = bootstrap(args.config, args.api_key_file, activate=args.activate)
         elif args.command == "client-guard":
             result = client_guard(args.config)
+        elif args.command == "recover":
+            result = RecoveryManager(args.config).process(force=args.force)
         else:
             reconciler = Reconciler(args.config)
             result = reconciler.apply() if args.command == "apply" else reconciler.status()
@@ -868,7 +1307,8 @@ def main(argv: list[str] | None = None) -> int:
             f"client={'ok' if result['client']['active'] else 'failed'} "
             f"acquisition={result['acquisition']['status']} "
             f"api={'ok' if result['api']['ok'] else 'failed'} "
-            f"network={'ok' if result['network']['ok'] else 'failed'}"
+            f"network={'ok' if result['network']['ok'] else 'failed'} "
+            f"recovery={result['recovery']['phase']}"
         )
     else:
         print(json.dumps(result, indent=2, sort_keys=True))
