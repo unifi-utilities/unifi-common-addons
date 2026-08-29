@@ -28,7 +28,9 @@ DEFAULT_CONFIG_PATH = Path("/data/att-ipv6/config.json")
 DEFAULT_API_KEY_PATH = Path("/data/att-ipv6/integration-api.key")
 DEFAULT_API_ENDPOINT = "https://127.0.0.1/proxy/network/integration/v1"
 ODHCP6C = "/usr/sbin/odhcp6c"
+RDISC6 = "rdisc6"
 HOOK_PATH = "/data/att-ipv6/att-ipv6-hook"
+SYSCTL_IPV6_CONF = Path("/proc/sys/net/ipv6/conf")
 CONFIG_DIGEST_ENV = "ATT_IPV6_CONFIG_DIGEST"
 SINGLE_IAID_ENV = "ATT_IPV6_SINGLE_IAID"
 READ_ONLY_NETWORK_FIELDS = {"default", "id", "metadata"}
@@ -641,6 +643,54 @@ def static_network_status(
     }
 
 
+def _accept_ra_path(config: dict[str, Any], sysctl_root: Path) -> Path:
+    interface = config["wan_interface"]
+    _require(
+        interface not in {".", ".."} and "/" not in interface,
+        "WAN interface name is unsafe",
+    )
+    return sysctl_root / interface / "accept_ra"
+
+
+def _ra_default_routes(
+    config: dict[str, Any], routes: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    matches = []
+    for route in routes:
+        if (
+            route.get("dst") not in {"default", "::/0"}
+            or route.get("dev") != config["wan_interface"]
+            or route.get("protocol") != "ra"
+            or route.get("type", "unicast") != "unicast"
+        ):
+            continue
+        try:
+            gateway = ipaddress.ip_address(str(route.get("gateway", "")))
+        except ValueError:
+            continue
+        if isinstance(gateway, ipaddress.IPv6Address) and gateway.is_link_local:
+            matches.append(route)
+    return matches
+
+
+def wan_network_status(
+    config: dict[str, Any],
+    routes: list[dict[str, Any]],
+    *,
+    sysctl_root: Path = SYSCTL_IPV6_CONF,
+) -> dict[str, Any]:
+    try:
+        accept_ra = int(_accept_ra_path(config, sysctl_root).read_text().strip())
+    except (OSError, ValueError):
+        accept_ra = None
+    default_routes = _ra_default_routes(config, routes)
+    return {
+        "ok": accept_ra == 2 and bool(default_routes),
+        "accept_ra": accept_ra,
+        "default_routes": default_routes,
+    }
+
+
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -654,12 +704,14 @@ class Reconciler:
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         api_factory: Callable[..., ApiClient] = ApiClient,
+        sysctl_root: Path = SYSCTL_IPV6_CONF,
     ) -> None:
         self.config_path = Path(config_path)
         self.run = run
         self.now = now
         self.sleep = sleep
         self.api_factory = api_factory
+        self.sysctl_root = sysctl_root
 
     def _command(self, args: list[str], *, check: bool = True) -> str:
         result = self.run(args, check=False, capture_output=True, text=True)
@@ -689,6 +741,67 @@ class Reconciler:
             raise ReconcileError("ip returned invalid JSON") from exc
         _require(isinstance(addresses, list) and isinstance(routes, list), "network state is not a list")
         return addresses, routes
+
+    def _route_state(self) -> list[dict[str, Any]]:
+        try:
+            routes = json.loads(
+                self._command(["ip", "-j", "-6", "route", "show", "table", "all"])
+            )
+        except json.JSONDecodeError as exc:
+            raise ReconcileError("ip returned invalid route JSON") from exc
+        _require(isinstance(routes, list), "route state is not a list")
+        return routes
+
+    def wan_guard(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        config = load_config(self.config_path) if config is None else config
+        accept_ra_path = _accept_ra_path(config, self.sysctl_root)
+        try:
+            current = int(accept_ra_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError) as exc:
+            raise ReconcileError(f"unable to read WAN accept_ra: {exc}") from exc
+        changed = current != 2
+        if changed:
+            try:
+                accept_ra_path.write_text("2\n", encoding="utf-8")
+            except OSError as exc:
+                raise ReconcileError(f"unable to enable WAN router advertisements: {exc}") from exc
+
+        routes = self._route_state()
+        status = wan_network_status(config, routes, sysctl_root=self.sysctl_root)
+        solicited = False
+        if not status["default_routes"]:
+            solicited = True
+            self._command([RDISC6, "-1", config["wan_interface"]])
+            for attempt in range(10):
+                routes = self._route_state()
+                status = wan_network_status(
+                    config, routes, sysctl_root=self.sysctl_root
+                )
+                if status["ok"]:
+                    break
+                if attempt != 9:
+                    self.sleep(0.5)
+        _require(status["ok"], "WAN router advertisement did not install a default route")
+        return {"changed": changed, "solicited": solicited, "wan": status}
+
+    def _combined_network_status(
+        self,
+        config: dict[str, Any],
+        addresses: list[dict[str, Any]],
+        routes: list[dict[str, Any]],
+        assignments: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        status = static_network_status(
+            addresses,
+            routes,
+            assignments,
+            {item["id"]: item["bridge"] for item in config["delegations"]},
+        )
+        status["wan"] = wan_network_status(
+            config, routes, sysctl_root=self.sysctl_root
+        )
+        status["ok"] = status["ok"] and status["wan"]["ok"]
+        return status
 
     def _client_active(self) -> bool:
         return self.run(
@@ -791,11 +904,8 @@ class Reconciler:
                 },
             }
             addresses, routes = self._network_state()
-            result["network"] = static_network_status(
-                addresses,
-                routes,
-                assignments,
-                {item["id"]: item["bridge"] for item in config["delegations"]},
+            result["network"] = self._combined_network_status(
+                config, addresses, routes, assignments
             )
         except ReconcileError as exc:
             result["api"]["error"] = str(exc)
@@ -808,6 +918,7 @@ class Reconciler:
         Path(config["lock_path"]).parent.mkdir(parents=True, exist_ok=True)
         with Path(config["lock_path"]).open("w", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            self.wan_guard(config)
             assignments = self._assignments_with_contract_recovery(config)
             state = load_acquisition(config["acquisition_path"])
             state_digest = _digest(state)
@@ -821,11 +932,8 @@ class Reconciler:
             network_status = None
             while self.now() <= deadline:
                 addresses, routes = self._network_state()
-                network_status = static_network_status(
-                    addresses,
-                    routes,
-                    assignments,
-                    {item["id"]: item["bridge"] for item in config["delegations"]},
+                network_status = self._combined_network_status(
+                    config, addresses, routes, assignments
                 )
                 if network_status["ok"]:
                     break
@@ -1279,6 +1387,7 @@ def build_parser() -> argparse.ArgumentParser:
     recover = subparsers.add_parser("recover")
     recover.add_argument("--force", action="store_true")
     subparsers.add_parser("client-guard")
+    subparsers.add_parser("wan-guard")
     return parser
 
 
@@ -1292,6 +1401,8 @@ def main(argv: list[str] | None = None) -> int:
             result = bootstrap(args.config, args.api_key_file, activate=args.activate)
         elif args.command == "client-guard":
             result = client_guard(args.config)
+        elif args.command == "wan-guard":
+            result = Reconciler(args.config).wan_guard()
         elif args.command == "recover":
             result = RecoveryManager(args.config).process(force=args.force)
         else:
@@ -1307,6 +1418,7 @@ def main(argv: list[str] | None = None) -> int:
             f"client={'ok' if result['client']['active'] else 'failed'} "
             f"acquisition={result['acquisition']['status']} "
             f"api={'ok' if result['api']['ok'] else 'failed'} "
+            f"wan={'ok' if result['network'].get('wan', {}).get('ok') else 'failed'} "
             f"network={'ok' if result['network']['ok'] else 'failed'} "
             f"recovery={result['recovery']['phase']}"
         )

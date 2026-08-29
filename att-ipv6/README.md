@@ -12,7 +12,7 @@ with the correct network for zone-based firewall classification.
 
 - The [`on_boot.d`](https://github.com/unifi-utilities/unifi-common) persistence
   mechanism used by this addon repository.
-- A UniFi gateway with `python3`, `odhcp6c`, and systemd.
+- A UniFi gateway with `python3`, `odhcp6c`, `rdisc6`, and systemd.
 - The AT&T residential gateway configured for IP Passthrough.
 - Gateway firewall rules permitting DHCPv6 server UDP/547 to client UDP/546
   and ICMPv6 router advertisements on the AT&T WAN.
@@ -126,6 +126,15 @@ reconciliation pass to restart the acquisition service once and wait for a
 current observation. Network mappings and UniFi settings remain
 configuration-owned but do not unnecessarily restart odhcp6c.
 
+Before acquisition starts, the WAN guard sets the configured interface's
+`accept_ra` value to `2`. IPv6 forwarding is enabled on a gateway, and Linux
+otherwise ignores upstream router advertisements. The guard asks the upstream
+router for a fresh advertisement only when no RA-owned default route exists.
+The enabled acquisition service reapplies the setting after every boot or
+firmware upgrade, and the periodic reconciliation pass reasserts it if UniFi
+later resets the runtime sysctl. It does not create a static default route;
+the kernel continues to honor the advertised router lifetime and withdrawals.
+
 Partial state remains `acquiring=N/M`, where `M` is derived from configured
 delegations. It is never applied. Complete state requires a fresh, unique,
 unexpired `/64` for every configured IAID and no unexpected IAID. Renew and
@@ -154,6 +163,8 @@ The reconciler maps acquired prefixes to configured UniFi networks by
 configuration through the Integration API, verifies API readback, and verifies
 exact bridge addresses and kernel-connected routes. It never
 edits resolver, dnsmasq, interface, or UniFi runtime configuration files.
+Status additionally requires `accept_ra=2` and a link-local, RA-owned IPv6
+default route on the configured WAN interface.
 
 Useful read-only checks are:
 

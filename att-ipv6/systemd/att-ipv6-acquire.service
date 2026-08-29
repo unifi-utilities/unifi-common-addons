@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=/data/att-ipv6/att-ipv6 client-guard
+ExecStartPre=/data/att-ipv6/att-ipv6 wan-guard
 ExecStart=/data/att-ipv6/att-ipv6 acquire
 Restart=on-failure
 RestartSec=15min
