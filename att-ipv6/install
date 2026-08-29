@@ -141,7 +141,13 @@ class Installer:
     ) -> str:
         if self.geteuid() != 0:
             raise InstallError("installer must run as root")
-        for command in ("python3", "odhcp6c", "systemctl", "systemd-tmpfiles"):
+        for command in (
+            "python3",
+            "odhcp6c",
+            "rdisc6",
+            "systemctl",
+            "systemd-tmpfiles",
+        ):
             if self.which(command) is None:
                 raise InstallError(f"required command is absent: {command}")
         api_key_path = self.resolve_api_key(
