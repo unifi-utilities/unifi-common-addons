@@ -159,6 +159,7 @@ class Installer:
         discovered = not config_path.exists()
         if discovered:
             command = [
+                sys.executable or "python3",
                 str(self.source_dir / "att-ipv6"),
                 "--config",
                 str(config_path),
