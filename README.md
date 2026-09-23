@@ -7,7 +7,7 @@ A collection of addons to enhance the capabilities of your UniFi products.
 ### on_boot.d
 
 > [!IMPORTANT]
-> Do this first. Enables init.d style scripts to run on every boot. This is required for all addons below.
+> Do this first. Enables init. d-style scripts to run on every boot. This is required for all addons below.
 
 <https://github.com/unifi-utilities/unifi-common>
 
@@ -47,7 +47,7 @@ Enables a [Hurricane Electric Tunnel Broker](https://tunnelbroker.net/) [6in4](h
 
 ### nspawn-container
 
-Enables Containers - replacing Podman.
+Enables Containers, replacing Podman.
 
 ### persist-changes
 
@@ -64,6 +64,6 @@ Miscellaneous scripts to help with Tailscale and UniFi integration from [tailsca
 ## Missing something?
 
 > [!TIP]
-> We have moved the old addons to a new repository to make it easier to maintain and add new addons. If you have an addon that you would like to see added, please open an issue or submit a pull request.
+> We have moved the old add-ons to a new repository to make them easier to maintain and add new ones. If you have an addon that you would like to see added, please open an issue or submit a pull request.
 
 <https://github.com/unifi-utilities/unifios-utilities-archived>
