@@ -13,7 +13,8 @@ For example, [configuring two IP addresses on your WAN interface, so that you ca
 1. [on_boot.d](https://github.com/unifi-utilities/unifi-common)
 2. Copy `42-watch-for-changes.sh` to `/data/on_boot.d/`
    - Check the `FILE` variable; it should point to a file that exists.
-3. Copy `on-state-change.sh` to `/data/scripts/`
+3. Copy `on-state-change.sh` to `/data/scripts/` and make both scripts executable:
+   `chmod +x /data/on_boot.d/42-watch-for-changes.sh /data/scripts/on-state-change.sh`
 4. Edit `/data/scripts/on-state-change.sh` to your heart's content
 
 > Make sure that your script doesn't error in the likely case that it tries to execute an update that has already been made

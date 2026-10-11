@@ -15,6 +15,7 @@ vlan_gateway="10.0.5.1"
 ##
 # Color  Variables
 ##
+red='\e[31m'
 green='\e[32m'
 blue='\e[34m'
 clear='\e[0m'
@@ -106,14 +107,20 @@ debootstrap --include=systemd,dbus bookworm "$container_name"
 echo "Set container Root password, Network setting and enable systemd-networkd"
 #systemd-nspawn -M "$container_name" -D /data/custom/machines/"$container_name"
 #systemd-nspawn -M "$container_name" -D /data/custom/machines/"$container_name" echo "This Echo is from inside the new Container ..."
-systemd-nspawn -M "$container_name" -D /data/custom/machines/"$container_name" /bin/bash -c "echo 'root:${container_root_pasword}' | chpasswd"
+# Feed the password on stdin so it is not exposed in the process list and may
+# contain any character.
+printf 'root:%s\n' "$container_root_pasword" |
+    systemd-nspawn --pipe -M "$container_name" -D /data/custom/machines/"$container_name" /usr/sbin/chpasswd
 
 echo "In container start network"
-systemd-nspawn -M "$container_name" -D /data/custom/machines/"$container_name" /bin/bash -c systemctl enable systemd-networkd
+systemd-nspawn -M "$container_name" -D /data/custom/machines/"$container_name" /bin/systemctl enable systemd-networkd
 
 echo "in container set default DNS 1.1.1.1"
-systemd-nspawn -M "$container_name" -D /data/custom/machines/"$container_name" /bin/bash -c echo "nameserver 1.1.1.1" > /etc/resolv.conf \
-echo ""$container_name"" > /etc/hostname
+# Write these files inside the container rootfs, never on the gateway itself.
+container_root=/data/custom/machines/"$container_name"
+rm -f "$container_root/etc/resolv.conf"
+echo "nameserver 1.1.1.1" > "$container_root/etc/resolv.conf"
+echo "$container_name" > "$container_root/etc/hostname"
 
 #### we will link the container to /var/lib/machines so we can control it with machinectl
 echo "Linking the container to /var/lib/machines"
@@ -163,11 +170,10 @@ EOF
 
 ##### Configure the Container to use an Isolated MacVLAN Network
 echo " Configuring the Container to use an Isolated MacVLAN Network"
+mkdir -p /data/on_boot.d
 cd /data/on_boot.d
-if [ -f "$file" ] ; then
-    rm "$file"
-fi
-curl -LO https://raw.githubusercontent.com/unifi-utilities/unifios-common-addons/main/nspawn-container/scripts/10-setup-network.sh
+curl -fsSL -o 10-setup-network.sh.tmp https://raw.githubusercontent.com/unifi-utilities/unifi-common-addons/main/nspawn-container/scripts/10-setup-network.sh
+mv -f 10-setup-network.sh.tmp 10-setup-network.sh
 chmod +x 10-setup-network.sh
 
 cat <<EOF > /etc/systemd/nspawn/"$container_name".nspawn
@@ -223,11 +229,11 @@ function setup_persistence() {
     echo ""
 #### Configure Persistence Across Firmware Updates
 echo "Configuring Persistence Across Firmware Updates"
+mkdir -p /data/on_boot.d
 cd /data/on_boot.d
-curl -LO https://raw.githubusercontent.com/unifi-utilities/unifios-common-addons/main/nspawn-container/scripts/0-setup-system.sh
-chmod +x 0-setup-system.sh
-
-mv 0-setup-system.sh 02-setup-system.sh
+curl -fsSL -o 02-setup-system.sh.tmp https://raw.githubusercontent.com/unifi-utilities/unifi-common-addons/main/nspawn-container/scripts/0-setup-system.sh
+chmod +x 02-setup-system.sh.tmp
+mv -f 02-setup-system.sh.tmp 02-setup-system.sh
 }
 
 function setup_backup_dpkg_files() {
@@ -264,7 +270,7 @@ $(ColorBlue 'Choose an option:') "
             5) set_variables ; menu ;;
             6) set_container_network_variables ; menu ;;
 		0) exit 0 ;;
-		*) echo -e $red"Wrong option."$clear; WrongCommand;;
+		*) echo -e "${red}Wrong option.${clear}"; menu ;;
         esac
 }
 

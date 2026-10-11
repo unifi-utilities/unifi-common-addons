@@ -239,6 +239,20 @@ class Installer:
             self._run([str(self.on_boot_dir / "11-att-ipv6-native.sh")])
             return "installed and started"
         marker.unlink(missing_ok=True)
+        # Deactivation must also stop units enabled by an earlier activation;
+        # otherwise odhcp6c keeps sending DHCPv6 traffic until the next reboot
+        # or firmware update.
+        self._run(
+            [
+                "systemctl",
+                "disable",
+                "--now",
+                "att-ipv6-reconcile.timer",
+                "att-ipv6-reconcile.path",
+                "att-ipv6-recover.path",
+                "att-ipv6-acquire.service",
+            ]
+        )
         return "installed but inactive"
 
 

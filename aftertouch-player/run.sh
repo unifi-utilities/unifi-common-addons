@@ -7,7 +7,11 @@ CURRENT_DIR=$APP_HOME/current
 BINARY=$CURRENT_DIR/soundtouch-player
 MANIFEST=$CURRENT_DIR/manifest
 
-if [ -r "$CONFIG_FILE" ]; then
+# Under systemd (INVOCATION_ID is set) the unit's EnvironmentFile= is the only
+# source of configuration. Sourcing the file again as shell would re-parse
+# values containing "$", quotes or backslashes differently from systemd and
+# silently change them, e.g. MGMT_PASSWORD.
+if [ -z "${INVOCATION_ID:-}" ] && [ -r "$CONFIG_FILE" ]; then
 	set -a
 	# systemd reads EnvironmentFile before applying DynamicUser. This fallback
 	# supports direct root invocation without requiring the transient user to

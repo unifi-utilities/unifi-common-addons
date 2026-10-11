@@ -25,11 +25,13 @@ fi
 
 # Link containers from /data/custom/machines to /var/lib/machines
 mkdir -p /var/lib/machines
-for machine in $(ls /data/custom/machines/); do
+for machine_dir in /data/custom/machines/*/; do
+[ -d "$machine_dir" ] || continue
+machine=$(basename "$machine_dir")
 if [ ! -e "/var/lib/machines/$machine" ]; then
 ln -s "/data/custom/machines/$machine" "/var/lib/machines/"
-machinectl enable $machine
-machinectl start $machine
+machinectl enable "$machine"
+machinectl start "$machine"
 fi
 done
 echo "Setup complete."

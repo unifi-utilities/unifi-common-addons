@@ -50,6 +50,16 @@ def _require(condition: bool, message: str) -> None:
         raise ReconcileError(message)
 
 
+def _int(value: Any, field: str) -> int:
+    """Convert untrusted config or state values without leaking a traceback."""
+    if isinstance(value, bool):
+        raise ReconcileError(f"{field} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ReconcileError(f"{field} must be an integer") from exc
+
+
 def _duid(value: str) -> str:
     normalized = value.replace(":", "").lower()
     _require(re.fullmatch(r"[0-9a-f]+", normalized) is not None, "DUID is malformed")
@@ -95,7 +105,7 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
     config.setdefault("minimum_valid_lifetime", 600)
     _require(config["ra_priority"] in {"LOW", "MEDIUM", "HIGH"}, "invalid RA priority")
     for field in ("dhcpv6_lease_seconds", "minimum_valid_lifetime"):
-        config[field] = int(config[field])
+        config[field] = _int(config[field], field)
         _require(config[field] > 0, f"{field} must be positive")
     suffixes = config["dhcpv6_suffix_range"]
     _require(isinstance(suffixes, dict), "dhcpv6_suffix_range must be an object")
@@ -119,12 +129,9 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
         for field in ("id", "iaid", "network", "vlan_id", "bridge"):
             _require(item.get(field) not in (None, ""), f"delegation {index} is missing {field}")
         item["id"] = str(item["id"])
-        try:
-            item["iaid"] = int(item["iaid"])
-        except (TypeError, ValueError) as exc:
-            raise ReconcileError(f"delegation {index} IAID must be an integer") from exc
+        item["iaid"] = _int(item["iaid"], f"delegation {index} IAID")
         item["network"] = str(item["network"])
-        item["vlan_id"] = int(item["vlan_id"])
+        item["vlan_id"] = _int(item["vlan_id"], f"delegation {index} vlan_id")
         item["bridge"] = str(item["bridge"])
         if item.get("prefix_hint") not in (None, ""):
             item["prefix_hint"] = str(
@@ -228,10 +235,10 @@ def validate_acquisition(
             "acquisition request contract changed"
         )
     _require(_duid(str(state.get("duid", ""))) == config["duid"], "acquisition DUID differs")
-    observed = int(state.get("observed_at", 0))
+    observed = _int(state.get("observed_at", 0), "acquisition observed_at")
     raw_assignments = state.get("assignments")
     _require(isinstance(raw_assignments, dict), "acquisition assignments must be an object")
-    present = {int(value) for value in raw_assignments}
+    present = {_int(value, "acquisition IAID") for value in raw_assignments}
     expected_iaids = {item["iaid"] for item in config["delegations"]}
     _require(present == expected_iaids, "acquisition state is incomplete")
     prefixes: set[str] = set()
@@ -240,15 +247,15 @@ def validate_acquisition(
         item = raw_assignments.get(str(iaid))
         _require(not isinstance(item, list), f"IAID {iaid} is ambiguous")
         _require(isinstance(item, dict), f"IAID {iaid} is missing")
-        _require(int(item.get("iaid", -1)) == iaid, f"IAID {iaid} is inconsistent")
+        _require(_int(item.get("iaid", -1), f"IAID {iaid} iaid") == iaid, f"IAID {iaid} is inconsistent")
         prefix = str(_ipv6_network(str(item.get("prefix", "")), f"IAID {iaid} prefix"))
         _require(prefix not in prefixes, f"duplicate delegated prefix {prefix}")
         prefixes.add(prefix)
-        preferred = int(item.get("preferred_lifetime", -1))
-        valid = int(item.get("valid_lifetime", -1))
-        expires = int(item.get("expires_at", 0))
+        preferred = _int(item.get("preferred_lifetime", -1), f"IAID {iaid} preferred_lifetime")
+        valid = _int(item.get("valid_lifetime", -1), f"IAID {iaid} valid_lifetime")
+        expires = _int(item.get("expires_at", 0), f"IAID {iaid} expires_at")
         _require(preferred >= 0 and valid > 0, f"IAID {iaid} lifetimes are invalid")
-        _require(int(item.get("observed_at", 0)) == observed, f"IAID {iaid} observation is stale")
+        _require(_int(item.get("observed_at", 0), f"IAID {iaid} observed_at") == observed, f"IAID {iaid} observation is stale")
         _require(expires > now, f"IAID {iaid} is expired")
         _require(expires == observed + valid, f"IAID {iaid} expiry is stale")
         _require(expires - now >= config["minimum_valid_lifetime"], f"IAID {iaid} has insufficient valid lifetime")
@@ -1082,6 +1089,7 @@ def acquire(
 ) -> None:
     """Replace this process with odhcp6c using only config-derived arguments."""
     config = load_config(config_path)
+    _require(config["active"], "acquisition is not active")
     digest = config_digest(config)
     observed = int(time.time())
     atomic_write(
@@ -1146,6 +1154,7 @@ def odhcp6c_command(
 
 def client_guard(config_path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     config = load_config(config_path)
+    _require(config["active"], "acquisition is not active")
     hook = Path(HOOK_PATH)
     _require(hook.is_file() and os.access(hook, os.X_OK), "managed state hook is absent")
     current = os.getpid()
@@ -1312,7 +1321,7 @@ class RecoveryManager:
 
         assignments = state.get("assignments", {})
         expected = {item["iaid"] for item in config["delegations"]}
-        present = {int(value) for value in assignments}
+        present = {_int(value, "acquisition IAID") for value in assignments}
         _require(present < expected, "partial acquisition contains unexpected IAIDs")
         missing = sorted(expected - present)
         _require(
@@ -1410,6 +1419,9 @@ def main(argv: list[str] | None = None) -> int:
             result = reconciler.apply() if args.command == "apply" else reconciler.status()
     except ReconcileError as exc:
         print(f"att_ipv6 error={exc}", file=sys.stderr)
+        return 1
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"att_ipv6 error=invalid configuration or state: {exc!r}", file=sys.stderr)
         return 1
     if args.command == "status" and not args.json:
         print(
