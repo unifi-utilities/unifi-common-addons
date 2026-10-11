@@ -15,7 +15,7 @@
     }
   ],
   "ra_priority": "HIGH",
-  "dhcpv6_suffix_range": {"start": "::2", "stop": "::7d1"},
+  "dhcpv6_suffix_range": { "start": "::2", "stop": "::7d1" },
   "dhcpv6_lease_seconds": 86400,
   "minimum_valid_lifetime": 600
 }
