@@ -134,6 +134,39 @@ fi
 
 log "starting ${CONTAINER_NAME} from ${IMAGE} with base_url=${BASE_URL} bind=${GUNICORN_BIND}"
 
+# Pass settings through a private env file instead of -e arguments so the
+# Spotify client secret does not appear in the host process list.
+RUNTIME_DIR="${SOUNDCORK_RUNTIME_DIR:-/data/soundcork/runtime}"
+mkdir -p "$RUNTIME_DIR"
+chmod 0700 "$RUNTIME_DIR"
+CONTAINER_ENV_FILE="$(umask 077 && mktemp "${RUNTIME_DIR}/container.env.XXXXXX")"
+trap 'rm -f "$CONTAINER_ENV_FILE"' EXIT HUP INT TERM
+
+write_container_env() {
+    case "$2" in
+        *"
+"*)
+            log "refusing to start: $1 contains a newline"
+            exit 1
+            ;;
+    esac
+    printf '%s=%s\n' "$1" "$2" >>"$CONTAINER_ENV_FILE"
+}
+
+write_container_env base_url "$BASE_URL"
+write_container_env data_dir /soundcork/data
+write_container_env spotify_client_id "$SPOTIFY_CLIENT_ID"
+write_container_env spotify_client_secret "$SPOTIFY_CLIENT_SECRET"
+write_container_env spotify_redirect_uri "$SPOTIFY_REDIRECT_URI"
+write_container_env SPOTIFY_SCOPES "$SPOTIFY_SCOPES"
+write_container_env SOUNDCORK_SPOTIFY_SCOPES "$SOUNDCORK_SPOTIFY_SCOPES"
+write_container_env SPOTIFY_ZEROCONF_PRIMER_ENABLED "$SPOTIFY_ZEROCONF_PRIMER_ENABLED"
+write_container_env SPOTIFY_ZEROCONF_PRIME_DEVICES "$SPOTIFY_ZEROCONF_PRIME_DEVICES"
+write_container_env SOUNDCORK_SPOTIFY_PRIME_DEVICES "$SOUNDCORK_SPOTIFY_PRIME_DEVICES"
+write_container_env SPOTIFY_ZEROCONF_PRIMER_INTERVAL_SECONDS "$SPOTIFY_ZEROCONF_PRIMER_INTERVAL_SECONDS"
+write_container_env SOUNDCORK_MODE local
+write_container_env SOUNDCORK_LOG_DIR /soundcork/logs/traffic
+
 CONTAINER_LOG_ARGS=""
 if [ "$RUNTIME" = docker ]; then
     CONTAINER_LOG_ARGS="--log-driver ${SOUNDCORK_CONTAINER_LOG_DRIVER} --log-opt max-size=${SOUNDCORK_CONTAINER_LOG_MAX_SIZE} --log-opt max-file=${SOUNDCORK_CONTAINER_LOG_MAX_FILE}"
@@ -144,28 +177,13 @@ CONTAINER_ID=$("$RUNTIME" run -d \
     --network host \
     --restart unless-stopped \
     $CONTAINER_LOG_ARGS \
-    -e "base_url=${BASE_URL}" \
-    -e "data_dir=/soundcork/data" \
-    -e "spotify_client_id=${SPOTIFY_CLIENT_ID}" \
-    -e "spotify_client_secret=${SPOTIFY_CLIENT_SECRET}" \
-    -e "spotify_redirect_uri=${SPOTIFY_REDIRECT_URI}" \
-    -e "SPOTIFY_SCOPES=${SPOTIFY_SCOPES}" \
-    -e "SOUNDCORK_SPOTIFY_SCOPES=${SOUNDCORK_SPOTIFY_SCOPES}" \
-    -e "SPOTIFY_ZEROCONF_PRIMER_ENABLED=${SPOTIFY_ZEROCONF_PRIMER_ENABLED}" \
-    -e "SPOTIFY_ZEROCONF_PRIME_DEVICES=${SPOTIFY_ZEROCONF_PRIME_DEVICES}" \
-    -e "SOUNDCORK_SPOTIFY_PRIME_DEVICES=${SOUNDCORK_SPOTIFY_PRIME_DEVICES}" \
-    -e "SPOTIFY_ZEROCONF_PRIMER_INTERVAL_SECONDS=${SPOTIFY_ZEROCONF_PRIMER_INTERVAL_SECONDS}" \
-    -e "SOUNDCORK_MODE=local" \
-    -e "SOUNDCORK_LOG_DIR=/soundcork/logs/traffic" \
+    --env-file "$CONTAINER_ENV_FILE" \
     -v "${DATA_DIR}:/soundcork/data" \
     -v "${LOG_DIR}:/soundcork/logs" \
     "$IMAGE" \
-    sh -c "exec gunicorn -c gunicorn_conf.py \
-        --bind "$GUNICORN_BIND" \
-        --access-logfile - \
-        --error-logfile - \
-        --workers "$SOUNDCORK_WORKERS" \
-        main:app")
+    sh -c 'exec gunicorn -c gunicorn_conf.py --bind "$1" --access-logfile - --error-logfile - --workers "$2" main:app' \
+    soundcork-gunicorn "$GUNICORN_BIND" "$SOUNDCORK_WORKERS")
+rm -f "$CONTAINER_ENV_FILE"
 
 log "SoundCork container started as ${CONTAINER_ID}; waiting for ${SOUNDCORK_READY_URL}"
 if ! wait_for_ready; then

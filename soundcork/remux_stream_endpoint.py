@@ -282,7 +282,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-any-upstream", action="store_true")
     parser.add_argument("--ffmpeg-stop-timeout", type=float, default=3.0)
     parser.add_argument("--ffmpeg-bin", default="ffmpeg")
-    parser.add_argument("--max-active-processes", type=int, default=0)
+    parser.add_argument(
+        "--max-active-processes",
+        type=int,
+        default=4,
+        help="maximum concurrent ffmpeg processes; 0 means unlimited",
+    )
     return parser.parse_args()
 
 

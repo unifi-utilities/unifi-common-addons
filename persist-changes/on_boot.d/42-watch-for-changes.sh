@@ -17,10 +17,15 @@ EXECUTE01="${DATA_DIR}/scripts/on-state-change.sh"
 FILE="${DATA_DIR}/udapi-config/ubios-udapi-server/ubios-udapi-server.state"
 # /usr/bin/logger -t "${PROCESSNAME}" "$*"
 
-# run on boot aswell
-$EXECUTE01
+run_hook() {
+  if [ -x "$EXECUTE01" ]; then
+    "$EXECUTE01"
+  else
+    echo "${EXECUTE01} is missing or not executable; run: chmod +x ${EXECUTE01}" >&2
+  fi
+}
 
-if [ "$1" = "DAEMON" ]; then
+if [ "${1:-}" = "DAEMON" ]; then
   # is this necessary? Add other signals at will (TTIN TTOU INT STOP TSTP)
   trap '' INT
   cd /tmp || exit
@@ -38,7 +43,7 @@ if [ "$1" = "DAEMON" ]; then
     if [ "$NEW" != "$LAST" ]; then
       DATE=$(date)
       echo "${DATE}: Executing ${EXECUTE01}"
-      $EXECUTE01
+      run_hook
       LAST="$NEW"
     fi
   done
@@ -51,4 +56,6 @@ export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin
 umask 022
 # You can add nice and ionice before nohup but they might not be installed
 # nohup setsid $0 DAEMON $* 2>/var/log/mydaemon.err >/var/log/mydaemon.log &
-nohup setsid $0 DAEMON WATCH $* 2>/var/log/watch.err >/var/log/watch.log &
+# Run once at boot, then start the watcher.
+run_hook
+nohup setsid "$0" DAEMON WATCH "$@" 2>/var/log/watch.err >/var/log/watch.log &

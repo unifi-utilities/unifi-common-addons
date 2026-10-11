@@ -82,6 +82,11 @@ configuration, then the installed default key, then `./integration-api.key`.
 For an upgrade, run `sudo ./install`; the existing configuration, key, and
 activation state are preserved.
 
+Installing a configuration with `active=false` deactivates the addon: the
+installer disables and stops the acquisition, recovery, and reconciliation
+units, and the acquisition client refuses to start while the configuration is
+inactive.
+
 ## Manual configuration
 
 Automatic discovery intentionally skips unusual topologies, including multiple

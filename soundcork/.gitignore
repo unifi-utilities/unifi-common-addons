@@ -3,3 +3,4 @@ soundcork-logs/
 backups/
 runtime/
 *.log
+__pycache__/

@@ -25,7 +25,7 @@ SOUNDTOUCH_REMUX_UPSTREAM="${SOUNDTOUCH_REMUX_UPSTREAM:-https://amp.cesnet.cz:84
 SOUNDTOUCH_REMUX_FFMPEG="${SOUNDTOUCH_REMUX_FFMPEG:-}"
 SOUNDTOUCH_REMUX_RUNTIME_PATH="${SOUNDTOUCH_REMUX_RUNTIME_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 SOUNDTOUCH_REMUX_ALLOW_HOSTS="${SOUNDTOUCH_REMUX_ALLOW_HOSTS:-}"
-SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES="${SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES:-}"
+SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES="${SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES:-4}"
 SOUNDTOUCH_REMUX_REBUILD="${SOUNDTOUCH_REMUX_REBUILD:-0}"
 SOUNDTOUCH_REMUX_READY_TIMEOUT="${SOUNDTOUCH_REMUX_READY_TIMEOUT:-60}"
 SOUNDTOUCH_REMUX_READY_INTERVAL="${SOUNDTOUCH_REMUX_READY_INTERVAL:-2}"
@@ -123,20 +123,59 @@ container_runtime() {
     [ -n "$RUNTIME" ]
 }
 
+process_start_time() {
+    sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '
+        NF >= 20 { print $20; found = 1 }
+        END { if (!found) exit 1 }
+    '
+}
+
+# The PID file lives under /data and survives reboots, so its PID may now
+# belong to an unrelated process. Only signal a process whose command line
+# still identifies it as the remux endpoint launched by this hook.
+remux_pid_matches() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\000' '\n' <"/proc/$1/cmdline" | grep -Fqx -e /app/remux_stream_endpoint.py
+}
+
 stop_rootfs_process() {
     if [ ! -f "$SOUNDTOUCH_REMUX_PID_FILE" ]; then
         return 0
     fi
 
     old_pid="$(cat "$SOUNDTOUCH_REMUX_PID_FILE" 2>/dev/null || true)"
-    if [ -n "${old_pid:-}" ] && kill -0 "$old_pid" 2>/dev/null; then
-        log "stopping previous rootfs remux process $old_pid"
-        kill "$old_pid" 2>/dev/null || true
-        for _ in $(seq 1 10); do
-            kill -0 "$old_pid" 2>/dev/null || break
-            sleep 1
-        done
-        kill -9 "$old_pid" 2>/dev/null || true
+    case "$old_pid" in
+        ''|*[!0-9]*)
+            rm -f "$SOUNDTOUCH_REMUX_PID_FILE"
+            return 0
+            ;;
+    esac
+
+    if ! kill -0 "$old_pid" 2>/dev/null; then
+        rm -f "$SOUNDTOUCH_REMUX_PID_FILE"
+        return 0
+    fi
+
+    old_start_time="$(process_start_time "$old_pid" || true)"
+    if [ -z "$old_start_time" ] || ! remux_pid_matches "$old_pid"; then
+        log "ignoring stale remux PID $old_pid owned by another process"
+        rm -f "$SOUNDTOUCH_REMUX_PID_FILE"
+        return 0
+    fi
+
+    log "stopping previous rootfs remux process $old_pid"
+    kill "$old_pid" 2>/dev/null || true
+    for _ in $(seq 1 10); do
+        kill -0 "$old_pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$old_pid" 2>/dev/null; then
+        current_start_time="$(process_start_time "$old_pid" || true)"
+        if [ "$current_start_time" = "$old_start_time" ] && remux_pid_matches "$old_pid"; then
+            kill -9 "$old_pid" 2>/dev/null || true
+        else
+            log "refusing to signal reused or changed remux PID $old_pid"
+        fi
     fi
     rm -f "$SOUNDTOUCH_REMUX_PID_FILE"
 }
@@ -214,9 +253,11 @@ build_remux_args() {
             --port "$SOUNDTOUCH_REMUX_PORT" \
             --default-upstream "$SOUNDTOUCH_REMUX_UPSTREAM"
 
+    set -f
     for allow_host in $(printf '%s\n' "$SOUNDTOUCH_REMUX_ALLOW_HOSTS" | tr ',' ' '); do
         set -- "$@" --allow-host "$allow_host"
     done
+    set +f
 
     if [ -n "$SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES" ]; then
         set -- "$@" --max-active-processes "$SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES"
@@ -239,8 +280,12 @@ start_rootfs() {
     rotate_log_if_needed
 
     build_remux_args /usr/bin/python3
+    # REMUX_ARGS is split on spaces; disable globbing so URL characters such
+    # as "?" and "*" are passed through literally.
+    set -f
     # shellcheck disable=SC2086
     set -- $REMUX_ARGS
+    set +f
 
     log "starting rootfs remux on port ${SOUNDTOUCH_REMUX_PORT} rootfs=${SOUNDTOUCH_REMUX_ROOTFS}"
     (
@@ -265,14 +310,27 @@ start_rootfs() {
 start_nspawn() {
     nspawn_ready || fatal_or_skip "nspawn remux runtime is not ready; missing systemd-nspawn, rootfs, python3, or ffmpeg"
 
+    # systemd-nspawn locks the directory tree it boots from. If SoundCork's
+    # nspawn launcher is already using this rootfs, a second nspawn on the
+    # same directory fails as "currently busy".
+    if [ "$SOUNDTOUCH_REMUX_ROOTFS" = "${SOUNDCORK_ROOTFS:-/data/soundcork/nspawn-rootfs}" ] \
+        && command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet soundcork-nspawn.service 2>/dev/null; then
+        fatal_or_skip "nspawn remux cannot share the running SoundCork rootfs ${SOUNDTOUCH_REMUX_ROOTFS}; set SOUNDTOUCH_REMUX_ROOTFS to a separate rootfs or use SOUNDTOUCH_REMUX_RUNTIME=rootfs"
+    fi
+
     stop_rootfs_process
     stop_container_if_present
     mkdir -p "$(dirname "$SOUNDTOUCH_REMUX_LOG_FILE")" "$SOUNDTOUCH_REMUX_ROOTFS/app"
     rotate_log_if_needed
 
     build_remux_args /usr/bin/python3
+    # REMUX_ARGS is split on spaces; disable globbing so URL characters such
+    # as "?" and "*" are passed through literally.
+    set -f
     # shellcheck disable=SC2086
     set -- $REMUX_ARGS
+    set +f
 
     log "starting nspawn remux on port ${SOUNDTOUCH_REMUX_PORT} rootfs=${SOUNDTOUCH_REMUX_ROOTFS}"
     (
@@ -331,8 +389,10 @@ fi
 
 log "starting ${SOUNDTOUCH_REMUX_CONTAINER} on port ${SOUNDTOUCH_REMUX_PORT}"
 build_remux_args python3
+set -f
 # shellcheck disable=SC2086
 set -- $REMUX_ARGS
+set +f
 
 "$RUNTIME" run -d \
     --name "$SOUNDTOUCH_REMUX_CONTAINER" \

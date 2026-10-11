@@ -316,7 +316,7 @@ SOUNDTOUCH_REMUX_UPSTREAM=https://amp.cesnet.cz:8443/cro3.flac
 # SOUNDTOUCH_REMUX_RUNTIME_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Optional comma- or whitespace-separated upstream host allowlist.
 SOUNDTOUCH_REMUX_ALLOW_HOSTS="amp.cesnet.cz radio.cesnet.cz"
-# Optional ffmpeg concurrency cap. 0 or unset means unlimited.
+# Optional ffmpeg concurrency cap. Defaults to 4; 0 means unlimited.
 SOUNDTOUCH_REMUX_MAX_ACTIVE_PROCESSES=4
 # Optional rootfs paths; defaults match the direct SoundCork nspawn launcher.
 # SOUNDTOUCH_REMUX_ROOTFS=/data/soundcork/nspawn-rootfs
