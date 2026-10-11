@@ -6,22 +6,21 @@ This guide assumes you have already created and started an nspawn container as i
 
 To install Pi-Hole, we run the automated install as instructed in the [Pi-Hole documentation](https://docs.pi-hole.net/main/basic-install/) and follow the prompts.
 
-
 1. Spawn a shell to your container.
 
-    ```sh
-    machinectl shell debian-custom
-    ```
+   ```sh
+   machinectl shell debian-custom
+   ```
 
 2. Run the automated install command from the Pi-Hole documentation and follow the prompts. Refer to the Pi-Hole documentation for more details.
 
-    ```sh
-    apt -y install curl
-    curl -sSL https://install.pi-hole.net | PIHOLE_SKIP_OS_CHECK=true bash
-    ```
+   ```sh
+   apt -y install curl
+   curl -sSL https://install.pi-hole.net | PIHOLE_SKIP_OS_CHECK=true bash
+   ```
 
-    * You must use `PIHOLE_SKIP_OS_CHECK=true` so Pi-Hole can be installed on Debian unstable.
-    * After installation, the debian-custom container has a size of 611 MB after running `apt clean` to delete the package cache.
+   - You must use `PIHOLE_SKIP_OS_CHECK=true` so Pi-Hole can be installed on Debian unstable.
+   - After installation, the debian-custom container has a size of 611 MB after running `apt clean` to delete the package cache.
 
 3. When the installer says a static IP is needed, press Continue.
 4. Select an upstream DNS provider on the next page, or add your custom DNS provider. Note that all these options can be changed later in the admin panel, so you don't need to be perfect here.
@@ -38,13 +37,12 @@ To install Pi-Hole, we run the automated install as instructed in the [Pi-Hole d
 
 To update Pi-Hole, run the following from within the container.
 
-  ```sh
-  PIHOLE_SKIP_OS_CHECK=true pihole -up
-  ```
+```sh
+PIHOLE_SKIP_OS_CHECK=true pihole -up
+```
 
 In case there is a configuration error and Pi-Hole is having trouble, you can reconfigure it from scratch by running:
 
-
-  ```sh
-  PIHOLE_SKIP_OS_CHECK=true pihole -r
-  ```
+```sh
+PIHOLE_SKIP_OS_CHECK=true pihole -r
+```
