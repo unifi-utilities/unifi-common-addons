@@ -45,6 +45,10 @@ Enables 6RD on CenturyLink connections. This allows you to use IPv6 on your LAN 
 
 Enables a [Hurricane Electric Tunnel Broker](https://tunnelbroker.net/) [6in4](https://www.rfc-editor.org/rfc/rfc4213.html) tunnel on UniFi OS gateways where the ISP only provides IPv4.
 
+### nfsv4-compat
+
+Enables NFSv4 for shares exported by UniFi Drive
+
 ### nspawn-container
 
 Enables Containers, replacing Podman.

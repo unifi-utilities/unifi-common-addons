@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch UniFi Drive's NFS exports and share symlinks for nfsv4-compat
+
+[Path]
+PathChanged=/etc/exports.d
+PathChanged=/var/nfs/shared
+
+[Install]
+WantedBy=paths.target
