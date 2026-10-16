@@ -1,0 +1,36 @@
+# /data/centurylink-ipv6/centurylink-ipv6.conf - sourced by centurylink-ipv6. Defaults shown are CenturyLink/Lumen.
+
+# ISP 6rd parameters (from your ISP, or DHCP option 212 on their own router)
+SIXRD_PREFIX="2602::/24"
+SIXRD_BR="205.91.4.61"        # older, widely documented relay: 205.171.2.64 - try it if this one fails
+SIXRD_V4MASKLEN=0
+
+# Leave empty to auto-detect the interface that routes to SIXRD_BR
+# (ppp0 when UniFi does PPPoE). Set it if auto-detection picks the wrong one.
+WAN_IF=""
+
+# Empty = WAN MTU - 20 (1472 over PPPoE, 1480 on plain DHCP/static WAN).
+MTU=""
+
+# LAN bridges to number, as "<interface>:<hex subnet id>". Subnet ids must be
+# 1..ff for a /56 (0 is used by the tunnel). UniFi names the default network
+# br0 and VLAN networks br<vlan-id>; check with `ip -br link show type bridge`.
+LAN_IFACES="br0:1"
+# LAN_IFACES="br0:1 br10:a br20:14"
+
+# IPv6 resolvers to advertise (RDNSS + stateless DHCPv6). Empty = none; clients
+# keep using the IPv4 DNS server, which answers AAAA queries fine.
+DNS6=""
+# DNS6="::"     # advertise the gateway itself (dnsmasq's [::] shorthand)
+# DNS6="2606:4700:4700::1111 2001:4860:4860::8888"
+
+# Set to 0 if you do RA some other way and don't want dnsmasq touched.
+RA_ENABLE=1
+# Remove ULA (fd../fc..) addresses from the LAN bridges - i.e. the fd00:N::/64
+# placeholders you entered as UniFi LAN IPv6 "Static". Keep at 1 for that setup.
+DROP_ULA=1
+# Override if autodetection of UniFi's dnsmasq conf-dir fails.
+DNSMASQ_DIR=""
+
+# Seconds between re-apply passes (re-adds anything UniFi wipes on re-provision).
+INTERVAL=30

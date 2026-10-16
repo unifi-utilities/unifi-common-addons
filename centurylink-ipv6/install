@@ -1,0 +1,62 @@
+#!/bin/sh
+# Install, upgrade or remove the centurylink-ipv6 addon.
+#
+#   ./install              copy the addon to /data/centurylink-ipv6, install the
+#                          on_boot.d hook, and start the service
+#   ./install --uninstall  stop the service and remove the unit and hook
+#                          (config in /data/centurylink-ipv6 is kept)
+set -eu
+
+ROOT=/data/centurylink-ipv6
+HOOK=/data/on_boot.d/20-centurylink-ipv6.sh
+UNIT=/etc/systemd/system/centurylink-ipv6.service
+SRC=$(cd "$(dirname "$0")" && pwd)
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
+
+case "${1:-}" in
+  --uninstall)
+    systemctl disable --now centurylink-ipv6.service 2>/dev/null || true
+    rm -f "$UNIT" "$HOOK"
+    systemctl daemon-reload
+    echo "removed; config left in $ROOT"
+    exit 0
+    ;;
+  "") ;;
+  *) echo "usage: $0 [--uninstall]" >&2; exit 2 ;;
+esac
+
+[ -d /data/on_boot.d ] || { echo "/data/on_boot.d missing - install unifi-common first" >&2; exit 1; }
+
+install -d -m 0755 "$ROOT" "$ROOT/systemd"
+if [ "$SRC" != "$ROOT" ]; then
+  install -m 0755 "$SRC/centurylink-ipv6" "$ROOT/centurylink-ipv6"
+  install -m 0644 "$SRC/centurylink-ipv6.conf.example" "$ROOT/centurylink-ipv6.conf.example"
+  install -m 0644 "$SRC/systemd/centurylink-ipv6.service" "$ROOT/systemd/centurylink-ipv6.service"
+  install -m 0755 "$SRC/on_boot.sh" "$ROOT/on_boot.sh"
+  install -m 0755 "$SRC/install" "$ROOT/install"
+fi
+if [ ! -f "$ROOT/centurylink-ipv6.conf" ]; then
+  install -m 0644 "$ROOT/centurylink-ipv6.conf.example" "$ROOT/centurylink-ipv6.conf"
+  echo "created $ROOT/centurylink-ipv6.conf - review LAN_IFACES before relying on it"
+fi
+
+# Move the previous one-shot version of this addon out of the way; leaving it
+# would rebuild the tunnel at boot and load a second dnsmasq RA config.
+legacy=""
+for f in /data/on_boot.d/20-centurylink-6rd.sh /data/on_boot.d/25-customipv6.sh \
+         /data/on_boot.d/customipv6.conf /run/dnsmasq.dhcp.conf.d/customipv6.conf; do
+  [ -e "$f" ] || continue
+  install -d -m 0755 "$ROOT/legacy"
+  mv "$f" "$ROOT/legacy/"
+  legacy="$legacy $f"
+done
+if [ -n "$legacy" ]; then
+  echo "moved previous version to $ROOT/legacy:$legacy"
+  echo "reboot once to clear the addresses it set (e.g. subnet 00 on br0)"
+fi
+
+install -m 0755 "$ROOT/on_boot.sh" "$HOOK"
+"$HOOK"
+systemctl restart centurylink-ipv6.service
+echo "running; check with: $ROOT/centurylink-ipv6 status   or   journalctl -u centurylink-ipv6 -f"

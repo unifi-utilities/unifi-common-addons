@@ -1,0 +1,15 @@
+[Unit]
+Description=CenturyLink 6rd IPv6 tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/data/centurylink-ipv6/centurylink-ipv6 run
+ExecStop=/data/centurylink-ipv6/centurylink-ipv6 stop
+Restart=always
+RestartSec=10
+SyslogIdentifier=centurylink-ipv6
+
+[Install]
+WantedBy=multi-user.target

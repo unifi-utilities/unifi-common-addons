@@ -1,135 +1,129 @@
 # centurylink-ipv6
 
-On CenturyLink (Lumen) IPv6, PPPoE subscribers receive a `/24` 6RD prefix (`2602::/24`) delivered via a SIT tunnel to a relay server. Rather than native DHCPv6-PD, the router must calculate its unique `/64` prefixes by embedding the WAN IPv4 address into the 6RD prefix, then advertise those prefixes to LAN clients via Router Advertisements.
+CenturyLink (Lumen) gives PPPoE subscribers IPv6 through 6RD ([RFC 5969](https://www.rfc-editor.org/rfc/rfc5969)), not native DHCPv6-PD. The router embeds its WAN IPv4 address in CenturyLink's `2602::/24` prefix to get a `/56`. It reaches the internet through a SIT tunnel to a border relay, and advertises `/64`s from that `/56` to the LAN.
 
-This script enables the device to create and maintain a CenturyLink 6RD tunnel, assign derived `/64` prefixes to each LAN bridge interface, and configure dnsmasq to send Router Advertisements so clients can self-configure via SLAAC.
+This addon runs a small systemd service that does that. Every 30 seconds, it does the following:
 
-Note that IPv6 Interface Type in the UniFi UI must be set to `Static` (with a placeholder prefix) for each network - not `None` - to prevent the device from auto-generating conflicting ULA addresses. The boot script immediately overrides those placeholders with the correct 6RD-derived prefixes.
+- creates or repairs the `6rd` tunnel, the default route and an unreachable route for the `/56`
+- puts a `/64` from the `/56` on each LAN bridge you list, and removes UniFi's `fd00:` placeholder address
+- adds its own firewall chains: drops unsolicited inbound IPv6, allows essential ICMPv6 and protocol 41, and clamps TCP MSS to the tunnel MTU
+- writes a dnsmasq config so clients get Router Advertisements, with the tunnel MTU, and configure themselves with SLAAC
+
+Each pass only fixes what is missing, so the service handles three things a boot-only script can't:
+
+- a PPPoE reconnect that hands out a new IPv4, which means a new IPv6 prefix
+- UniFi re-provisioning, which can wipe the firewall rules and the dnsmasq config
+- firmware updates, which can remove the systemd unit; the `on_boot.d` hook reinstalls it on every boot
+
+The defaults are CenturyLink's. Any other 6RD ISP works by changing `SIXRD_PREFIX`, `SIXRD_BR` and `SIXRD_V4MASKLEN` in the config.
 
 ## Requirements
 
-1. You have successfully set up the `on_boot.d` script described [here](https://github.com/unifi-utilities/unifi-common).
-2. You must have a working CenturyLink PPPoE connection (`ppp0`) on the device.
-3. You must set IPv6 to `Static` in the UniFi UI for each network/VLAN (not `None`), using unique placeholder prefixes:
-   - Default/Home network (`br0`): `fd00:1::/64`
-   - Each additional VLAN: `fd00:2::/64`, `fd00:3::/64`, etc.
-   - Enable **Router Advertisement (RA)** on each network.
-4. You must add firewall rules equivalent to (this can be done in the UI, select `Internet v6 Local` chain):
+1. The `on_boot.d` runner from [unifi-common](https://github.com/unifi-utilities/unifi-common).
+2. A working CenturyLink PPPoE WAN (`ppp0`) with a public IPv4. 6RD can't work behind CGNAT or double NAT.
+3. In the UniFi UI:
+   - **WAN → IPv6:** Disabled. The addon handles the WAN side.
+   - **Each LAN network the addon serves → IPv6 Interface Type:** Static, with a unique placeholder prefix and **Router Advertisement (RA)** enabled:
+     - Default network (`br0`): `fd00:1::/64`
+     - Each additional VLAN: `fd00:2::/64`, `fd00:3::/64`, and so on
 
-   ```
-   -A UBIOS_WAN_LOCAL_USER -p ipv6-icmp -m icmp6 --icmpv6-type 134 -j RETURN # select IPv6 Protocol "ICMPv6" and IPv6 ICMP Type Name "Router Advertisement"
-   ```
-
-## Customization
-
-Near the top of `20-centurylink-6rd.sh`:
-
-```sh
-RELAY="205.91.4.61"   # CenturyLink's 6RD relay server
-PREFIX="2602::/24"    # CenturyLink's 6RD prefix
-WAN_IF="ppp0"         # PPPoE interface name
-```
-
-And the bridge interface blocks further down:
-
-```sh
-# Configure br0 (LAN bridge) with IPv6 - flush first
-ip -6 addr flush dev br0 scope global
-ip -6 addr add ${IPV6_ADDR}/64 dev br0
-
-# Configure br300 (VLAN 300) - duplicate this block for each additional VLAN
-if ip link show br300 >/dev/null 2>&1; then
-    IPV6_VLAN300=$(printf "2602:%02x:%02x%02x:%02x01::1" $o1 $o2 $o3 $o4)
-    ip -6 addr flush dev br300 scope global
-    ip -6 addr add ${IPV6_VLAN300}/64 dev br300
-fi
-```
-
-Each additional VLAN gets a unique hex suffix (`01`, `02`, `03`,…) appended to the prefix. Matching `dhcp-range` lines must also be added to `customipv6.conf`:
-
-```conf
-dhcp-range=::,constructor:br300,ra-names,slaac,64,12h
-```
-
-This generates a configuration in `/data/on_boot.d/`. The files can be edited directly or reset by re-running the scripts.
+     With the type set to None, UniFi creates conflicting ULA addresses of its own. With Static plus RA, UniFi keeps RA running on the bridge, and the addon swaps in the real prefix.
 
 ## Installation
 
 ```sh
-cd /data/on_boot.d
-curl -LO https://raw.githubusercontent.com/unifi-utilities/unifi-common-addons/refs/heads/main/centurylink-ipv6/20-centurylink-6rd.sh
-curl -LO https://raw.githubusercontent.com/unifi-utilities/unifi-common-addons/refs/heads/main/centurylink-ipv6/customipv6.conf
-curl -LO https://raw.githubusercontent.com/unifi-utilities/unifi-common-addons/refs/heads/main/centurylink-ipv6/25-customipv6.sh
-chmod +x 20-centurylink-6rd.sh 25-customipv6.sh
-./20-centurylink-6rd.sh
-./25-customipv6.sh
+workdir="$(mktemp -d)"
+curl -fsSL \
+  https://github.com/unifi-utilities/unifi-common-addons/archive/refs/heads/main.tar.gz \
+  | tar -xz -C "$workdir"
+cd "$workdir/unifi-common-addons-main/centurylink-ipv6"
+./install
 ```
 
-Then reboot:
+The installer does the following:
+
+- copies the addon to `/data/centurylink-ipv6`, which survives firmware updates
+- creates `/data/centurylink-ipv6/centurylink-ipv6.conf` from the example if it doesn't exist yet
+- installs `/data/on_boot.d/20-centurylink-ipv6.sh`
+- starts `centurylink-ipv6.service`
+
+Running it again upgrades the addon and keeps your config.
+
+Then set the LAN bridges in `/data/centurylink-ipv6/centurylink-ipv6.conf`:
 
 ```sh
-reboot
+LAN_IFACES="br0:1"              # default network only
+LAN_IFACES="br0:1 br10:a br20:14"   # plus VLANs 10 and 20
 ```
+
+- UniFi names the default network `br0` and each VLAN network `br<vlan-id>`. Check yours with `ip -br link show type bridge`.
+- The part after the colon is the hex subnet id inside your `/56`, from `1` to `ff`. Subnet `0` belongs to the tunnel.
+- The service rereads the config on its next pass, within 30 seconds.
+
+To preview the prefix for an IPv4 address:
+
+```sh
+/data/centurylink-ipv6/centurylink-ipv6 calc 71.212.1.2
+# 2602:0047:d401:0200::/56  (relay-prefix 0.0.0.0/0)
+```
+
+### Upgrading from the previous version
+
+The previous version of this addon put `20-centurylink-6rd.sh`, `25-customipv6.sh` and `customipv6.conf` in `/data/on_boot.d`. `./install` moves those files, and `/run/dnsmasq.dhcp.conf.d/customipv6.conf`, to `/data/centurylink-ipv6/legacy/`. Reboot once afterwards to clear the addresses the old script set.
+
+The old script gave `br0` subnet `00`. Here subnet `00` belongs to the tunnel, so `br0` moves to subnet `01` and LAN clients get a new prefix.
+
+### Uninstall
+
+```sh
+/data/centurylink-ipv6/install --uninstall
+```
+
+This stops the service, which removes the tunnel, routes, addresses, firewall chains and dnsmasq config. It also removes the unit and the `on_boot.d` hook. `/data/centurylink-ipv6` is kept.
+
+## Configuration
+
+Every setting is in `centurylink-ipv6.conf`; the file comments each one.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `SIXRD_PREFIX` | `2602::/24` | ISP 6RD prefix |
+| `SIXRD_BR` | `205.91.4.61` | Border relay. The older, widely documented CenturyLink relay is `205.171.2.64`; try it if IPv6 doesn't pass. |
+| `SIXRD_V4MASKLEN` | `0` | IPv4 bits common to all subscribers |
+| `WAN_IF` | auto | Interface routing to `SIXRD_BR` (`ppp0`) |
+| `MTU` | auto | WAN MTU - 20, which is 1472 over PPPoE |
+| `LAN_IFACES` | `br0:1` | `<bridge>:<hex subnet id> ...` |
+| `DNS6` | empty | IPv6 resolvers to advertise. `::` means the gateway itself. Empty means clients keep using IPv4 DNS. |
+| `RA_ENABLE` | `1` | Write the dnsmasq RA config |
+| `DROP_ULA` | `1` | Remove the `fd..` placeholders from the LAN bridges |
+| `INTERVAL` | `30` | Seconds between passes |
 
 ## Validation
 
-After reboot (2–3 minutes), SSH back in and run the following.
-
-On the device:
+On the gateway:
 
 ```sh
-$ ip -6 addr show 6rd    # should see your 6RD tunnel address
-2602:xx:xxxx:xx00::1/24 dev 6rd ...
-
-$ ip -6 addr show br0    # should see a 2602: prefix, NOT fd00:
-2602:xx:xxxx:xx00::1/64 dev br0 ...
-
-$ ip -6 route            # should see a default route via the relay on 6rd
-default via ::205.91.4.61 dev 6rd metric 1024 ...
-2602:xx:xxxx:xx00::/64 dev br0 proto kernel ...
-```
-
-Test outbound connectivity:
-
-```sh
-ping6 -c 3 google.com
-curl -6 ifconfig.co
-```
-
-Watch Router Advertisements being sent to clients:
-
-```sh
-tcpdump -i br0 -c 5 -vvv icmp6 and 'ip6[40] == 134'
-# should see RAs advertising your 2602: prefix
+/data/centurylink-ipv6/centurylink-ipv6 status   # tunnel, addresses, routes, firewall, ping6
+journalctl -u centurylink-ipv6 -f
+ip -6 addr show scope global | grep ' fd'        # should print nothing
+tcpdump -i br0 -c 3 -vv 'icmp6 and ip6[40] == 134'   # RAs should carry your 2602: prefix, not fd00:
 ```
 
 On clients:
 
 ```sh
-ip -6 addr show   # Linux/Mac - should see a 2602: address with "autoconf" flag
-ipconfig          # Windows   - should see a 2602: address listed as "Autoconfiguration"
+ip -6 addr show   # Linux/Mac: a 2602: address with the "autoconf" flag
+ipconfig          # Windows: a 2602: address listed as "Autoconfiguration"
+curl -6 ifconfig.co
 ```
 
-### Troubleshooting
+## Troubleshooting
 
-```sh
-# Verify boot scripts are present and executable
-ls -la /data/on_boot.d/
-
-# Check that dnsmasq has loaded the RA configuration
-cat /run/dnsmasq.dhcp.conf.d/customipv6.conf
-
-# Check for conflicting ULA addresses (fd00: means UI setting is still "None")
-ip -6 addr | grep fd
-
-# Manually re-run tunnel script after a WAN reconnect (boot scripts don't run on reconnect)
-/data/on_boot.d/20-centurylink-6rd.sh
-
-# Useful commands
-ip -6 route                    # verify default route is via 6rd
-ip tunnel show 6rd             # verify tunnel parameters
-systemctl status dnsmasq       # verify dnsmasq is running
-```
+- **`'ip tunnel 6rd' failed`:** the kernel lacks `CONFIG_IPV6_SIT_6RD`.
+- **`WAN IPv4 ... is not public`:** you're behind CGNAT or another router, and 6RD can't work there.
+- **The tunnel is up but `ping6` fails:** try the other relay. Set `SIXRD_BR="205.171.2.64"`.
+- **`removed ULA placeholder` on nearly every pass:** UniFi is actively putting the placeholder back, so the two are undoing each other. Please open an issue and include your UniFi OS version.
+- **`dnsmasq did not respawn`:** LAN DHCP is down. Re-provision the gateway from UniFi Network.
 
 ## Credits
 

@@ -1,0 +1,353 @@
+#!/bin/bash
+# 6rd (RFC 5969) IPv6 for UniFi OS gateways (UDR7 et al).
+#
+# UniFi Network has no 6rd WAN mode, so this builds the sit tunnel, derives the
+# delegated prefix from the WAN IPv4, numbers the LAN bridges, adds the default
+# route, opens the firewall, and drops a dnsmasq RA snippet so LAN clients SLAAC.
+#
+# Every step is idempotent. `run` loops forever (systemd), re-applying anything
+# UniFi wipes on re-provision and rebuilding when the WAN IPv4 changes.
+#
+#   centurylink-ipv6 run           loop forever (what the systemd unit runs)
+#   centurylink-ipv6 once          apply once and exit
+#   centurylink-ipv6 stop          tear everything down
+#   centurylink-ipv6 status        show tunnel / addresses / routes / reachability
+#   centurylink-ipv6 calc <ipv4>   print the delegated prefix for an IPv4 address
+set -u
+
+CONF=${SIXRD_CONF:-/data/centurylink-ipv6/centurylink-ipv6.conf}
+STATE=/run/centurylink-ipv6.state
+RA_FILE_NAME=centurylink-ipv6.conf
+
+# Defaults are CenturyLink/Lumen; override in $CONF.
+SIXRD_PREFIX="2602::/24"     # ISP 6rd prefix/len
+SIXRD_BR="205.91.4.61"       # border relay IPv4
+SIXRD_V4MASKLEN=0            # leading IPv4 bits common to all CEs (0 = embed all 32)
+WAN_IF=""                    # empty = interface that routes to SIXRD_BR (ppp0 for PPPoE)
+TUN_IF="6rd"
+MTU=""                       # empty = WAN MTU - 20 (1472 on PPPoE, 1480 otherwise)
+LAN_IFACES="br0:1"           # "<bridge>:<hex subnet id> ..." e.g. "br0:1 br10:a br20:14"
+DNS6=""                      # space-separated IPv6 resolvers to advertise; empty = none (clients use IPv4 DNS)
+RA_ENABLE=1                  # 0 = don't touch dnsmasq (you handle RA yourself)
+DROP_ULA=1                   # remove ULA (fc00::/7) addresses, i.e. UniFi's "Static" fd00 placeholders, from the LAN bridges
+DNSMASQ_DIR=""               # empty = autodetect UniFi's dnsmasq conf-dir
+INTERVAL=30
+
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+log() { echo "$*" >&2; }
+
+# ---------------------------------------------------------------- address math
+
+ip4_to_int() { local IFS=.; set -- $1; echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 )); }
+int_to_ip4() { local n=$1; echo "$(( (n >> 24) & 255 )).$(( (n >> 16) & 255 )).$(( (n >> 8) & 255 )).$(( n & 255 ))"; }
+
+is_public_ip4() {
+  local n; n=$(ip4_to_int "$1")
+  (( (n & 0xff000000) == 0x0a000000 )) && return 1   # 10/8
+  (( (n & 0xfff00000) == 0xac100000 )) && return 1   # 172.16/12
+  (( (n & 0xffff0000) == 0xc0a80000 )) && return 1   # 192.168/16
+  (( (n & 0xffc00000) == 0x64400000 )) && return 1   # 100.64/10 (CGNAT)
+  (( (n & 0xffff0000) == 0xa9fe0000 )) && return 1   # 169.254/16
+  (( (n & 0xff000000) == 0x7f000000 )) && return 1   # 127/8
+  return 0
+}
+
+# Expand an IPv6 address to 32 hex nibbles (no embedded-IPv4 forms).
+expand6() {
+  local addr=$1 left right g i out="" missing
+  local -a L=() R=()
+  if [[ $addr == *::* ]]; then
+    left=${addr%%::*}; right=${addr#*::}
+    [ -n "$left" ] && IFS=: read -ra L <<<"$left"
+    [ -n "$right" ] && IFS=: read -ra R <<<"$right"
+  else
+    IFS=: read -ra L <<<"$addr"
+  fi
+  missing=$(( 8 - ${#L[@]} - ${#R[@]} ))
+  (( missing >= 0 )) || return 1
+  for g in ${L[@]+"${L[@]}"}; do out+=$(printf '%04x' "0x$g"); done
+  for (( i = 0; i < missing; i++ )); do out+="0000"; done
+  for g in ${R[@]+"${R[@]}"}; do out+=$(printf '%04x' "0x$g"); done
+  echo "$out"
+}
+
+groups64() { local h=$1; echo "${h:0:4}:${h:4:4}:${h:8:4}:${h:12:4}"; }
+
+# compute <wan ipv4>  ->  PD (16 hex nibbles = upper 64 bits), PD_LEN, PFX_LEN, RELAY_PREFIX
+compute() {
+  local v4=$1 p=${SIXRD_PREFIX%/*} hex hi v4n s
+  PFX_LEN=${SIXRD_PREFIX#*/}
+  s=$(( 32 - SIXRD_V4MASKLEN ))
+  if (( PFX_LEN < 1 || PFX_LEN > 63 || PFX_LEN + s > 64 )); then
+    log "bad 6rd params: prefix /$PFX_LEN + $s IPv4 bits must fit in 64"; return 1
+  fi
+  hex=$(expand6 "$p") || { log "cannot parse SIXRD_PREFIX $SIXRD_PREFIX"; return 1; }
+  hi=$(( 0x${hex:0:16} & ~((1 << (64 - PFX_LEN)) - 1) ))
+  v4n=$(ip4_to_int "$v4")
+  (( s < 32 )) && v4n=$(( v4n & ((1 << s) - 1) ))
+  hi=$(( hi | (v4n << (64 - PFX_LEN - s)) ))
+  PD=$(printf '%016x' "$hi")
+  PD_LEN=$(( PFX_LEN + s ))
+  if (( SIXRD_V4MASKLEN == 0 )); then
+    RELAY_PREFIX=0.0.0.0/0
+  else
+    RELAY_PREFIX="$(int_to_ip4 $(( $(ip4_to_int "$v4") & ~((1 << s) - 1) & 0xffffffff )))/$SIXRD_V4MASKLEN"
+  fi
+}
+
+# lan_addrs -> LAN_ADDRS="br0=2602:...:01::1/64 br10=..." (validated)
+lan_addrs() {
+  local spec ifc sid max
+  max=$(( 1 << (64 - PD_LEN) ))
+  LAN_ADDRS=""
+  for spec in $LAN_IFACES; do
+    ifc=${spec%%:*}; sid=$(( 16#${spec#*:} ))
+    if (( sid < 1 || sid >= max )); then
+      log "subnet id ${spec#*:} for $ifc out of range 1..$(printf '%x' $((max - 1))) (0 is the tunnel's)"; return 1
+    fi
+    LAN_ADDRS+="$ifc=$(groups64 "$(printf '%016x' $(( 0x$PD | sid )))")::1/64 "
+  done
+}
+
+# ---------------------------------------------------------------- firewall
+
+FW_CHAINS="ip6tables:filter:SIXRD_IN:INPUT ip6tables:filter:SIXRD_FWD:FORWARD ip6tables:mangle:SIXRD_MSS:FORWARD iptables:filter:SIXRD_IN4:INPUT"
+
+# True when every jump exists and is rule #1 of its parent chain.
+fw_ok() {
+  local e t tbl c p
+  for e in $FW_CHAINS; do
+    IFS=: read -r t tbl c p <<<"$e"
+    [ "$($t -t "$tbl" -S "$p" 2>/dev/null | sed -n 2p)" = "-A $p -j $c" ] || return 1
+  done
+}
+
+fw_chain() {  # create/flush chain and pin its jump at the top of the parent
+  local t=$1 tbl=$2 c=$3 p=$4
+  $t -t "$tbl" -N "$c" 2>/dev/null || $t -t "$tbl" -F "$c"
+  while $t -t "$tbl" -D "$p" -j "$c" 2>/dev/null; do :; done
+  $t -t "$tbl" -I "$p" 1 -j "$c"
+}
+
+fw_apply() {
+  local spec ifc
+  fw_chain ip6tables filter SIXRD_IN INPUT
+  ip6tables -A SIXRD_IN -i "$TUN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ip6tables -A SIXRD_IN -i "$TUN_IF" -p ipv6-icmp -j ACCEPT
+  ip6tables -A SIXRD_IN -i "$TUN_IF" -j DROP
+  for spec in $LAN_IFACES; do
+    ifc=${spec%%:*}
+    ip6tables -A SIXRD_IN -i "$ifc" -p ipv6-icmp -j ACCEPT              # NDP / RS
+    ip6tables -A SIXRD_IN -i "$ifc" -p udp --dport 547 -j ACCEPT        # stateless DHCPv6
+  done
+
+  fw_chain ip6tables filter SIXRD_FWD FORWARD
+  ip6tables -A SIXRD_FWD -i "$TUN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  for t in destination-unreachable packet-too-big time-exceeded parameter-problem echo-request; do
+    ip6tables -A SIXRD_FWD -i "$TUN_IF" -p ipv6-icmp --icmpv6-type "$t" -j ACCEPT
+  done
+  ip6tables -A SIXRD_FWD -i "$TUN_IF" -j DROP
+  for spec in $LAN_IFACES; do
+    ip6tables -A SIXRD_FWD -i "${spec%%:*}" -o "$TUN_IF" -j ACCEPT
+  done
+
+  fw_chain ip6tables mangle SIXRD_MSS FORWARD
+  ip6tables -t mangle -A SIXRD_MSS -o "$TUN_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  ip6tables -t mangle -A SIXRD_MSS -i "$TUN_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+  fw_chain iptables filter SIXRD_IN4 INPUT
+  iptables -A SIXRD_IN4 -i "$WAN_DEV" -p 41 -j ACCEPT                  # 6in4 from BR and other CEs
+  log "firewall rules (re)applied"
+}
+
+fw_remove() {
+  local e t tbl c p
+  for e in $FW_CHAINS; do
+    IFS=: read -r t tbl c p <<<"$e"
+    while $t -t "$tbl" -D "$p" -j "$c" 2>/dev/null; do :; done
+    $t -t "$tbl" -F "$c" 2>/dev/null; $t -t "$tbl" -X "$c" 2>/dev/null
+  done
+}
+
+# ---------------------------------------------------------------- dnsmasq RA
+
+dnsmasq_dir() {
+  local d
+  [ -n "$DNSMASQ_DIR" ] && { echo "$DNSMASQ_DIR"; return; }
+  d=$(grep -h '^conf-dir=' /run/dnsmasq*.conf 2>/dev/null | head -n1 | cut -d= -f2 | cut -d, -f1)
+  [ -n "$d" ] && [ -d "$d" ] && { echo "$d"; return; }
+  for d in /run/dnsmasq.dhcp.conf.d /run/dnsmasq.conf.d; do
+    [ -d "$d" ] && { echo "$d"; return; }
+  done
+  return 1
+}
+
+restart_dnsmasq() {
+  local i
+  pkill -x dnsmasq || return 0
+  for i in $(seq 1 20); do
+    sleep 1
+    pidof dnsmasq >/dev/null && { log "dnsmasq restarted (respawned after ${i}s)"; return 0; }
+  done
+  log "WARNING: dnsmasq did not respawn within 20s; LAN DHCP may be down. Re-provision the gateway from UniFi Network."
+}
+
+unifi_has_ra_param() {  # <ifc> <conf-dir> <our file>
+  local f
+  for f in /run/dnsmasq*.conf "$2"/*; do
+    [ "$f" = "$3" ] && continue
+    grep -qs "^ra-param=$1," "$f" && return 0
+  done
+  return 1
+}
+
+ra_ensure() {
+  (( RA_ENABLE )) || return 0
+  local dir file tmp spec ifc mode=ra-only dns=""
+  dir=$(dnsmasq_dir) || { log "no dnsmasq conf-dir found; set DNSMASQ_DIR"; return 1; }
+  file=$dir/$RA_FILE_NAME
+  if [ -n "$DNS6" ]; then
+    mode=ra-stateless
+    for d in $DNS6; do dns+="${dns:+,}[$d]"; done
+  fi
+  tmp=$(mktemp)
+  {
+    echo "# managed by /data/centurylink-ipv6/centurylink-ipv6 - do not edit"
+    echo "enable-ra"
+    for spec in $LAN_IFACES; do
+      ifc=${spec%%:*}
+      # With LAN IPv6 "Static" + RA on, UniFi may emit its own ra-param for the
+      # bridge; don't add a second one for dnsmasq to choke on.
+      if unifi_has_ra_param "$ifc" "$dir" "$file"; then
+        echo "# ra-param for $ifc left to UniFi"
+      else
+        echo "ra-param=$ifc,mtu:$MTU,30,1800"
+      fi
+      echo "dhcp-range=::,constructor:$ifc,$mode,64,1h"
+    done
+    [ -n "$dns" ] && echo "dhcp-option=option6:dns-server,$dns"
+  } >"$tmp"
+  if cmp -s "$tmp" "$file"; then rm -f "$tmp"; return 0; fi
+  mv "$tmp" "$file"; chmod 644 "$file"
+  log "wrote $file"
+  restart_dnsmasq
+}
+
+ra_remove() {
+  local dir
+  dir=$(dnsmasq_dir) || return 0
+  [ -f "$dir/$RA_FILE_NAME" ] || return 0
+  rm -f "$dir/$RA_FILE_NAME"
+  restart_dnsmasq
+}
+
+# ---------------------------------------------------------------- tunnel
+
+teardown_net() {
+  local OLD_WAN4="" OLD_PD="" OLD_PD_LEN="" OLD_LAN_ADDRS="" a
+  # shellcheck source=/dev/null
+  [ -r "$STATE" ] && . "$STATE"
+  for a in $OLD_LAN_ADDRS; do ip -6 addr del "${a#*=}" dev "${a%%=*}" 2>/dev/null; done
+  [ -n "$OLD_PD" ] && ip -6 route del unreachable "$(groups64 "$OLD_PD")::/$OLD_PD_LEN" 2>/dev/null
+  ip link show "$TUN_IF" >/dev/null 2>&1 && ip tunnel del "$TUN_IF"
+  rm -f "$STATE"
+}
+
+# UniFi LAN IPv6 is set to "Static" with an fd00:N::/64 placeholder so it
+# doesn't invent ULAs of its own and keeps RA on; strip that placeholder so
+# clients only see the 6rd prefix. Re-runs every pass in case UniFi re-adds it.
+drop_ula() {
+  (( DROP_ULA )) || return 0
+  local ifc=$1 addr
+  for addr in $(ip -6 -o addr show dev "$ifc" scope global | awk '{print $4}' | grep -Ei '^f[cd][0-9a-f]{2}:'); do
+    ip -6 addr del "$addr" dev "$ifc" && log "removed ULA placeholder $addr from $ifc"
+  done
+}
+
+ensure_tunnel() {
+  if ip link show "$TUN_IF" >/dev/null 2>&1; then
+    if ip -d link show "$TUN_IF" | grep -q "local $WAN4 "; then
+      ip link set "$TUN_IF" mtu "$MTU" up; return 0
+    fi
+    ip tunnel del "$TUN_IF"
+  fi
+  ip tunnel add "$TUN_IF" mode sit local "$WAN4" ttl 64 || return 1
+  if ! ip tunnel 6rd dev "$TUN_IF" 6rd-prefix "$SIXRD_PREFIX" 6rd-relay_prefix "$RELAY_PREFIX"; then
+    log "'ip tunnel 6rd' failed - kernel may lack CONFIG_IPV6_SIT_6RD"; ip tunnel del "$TUN_IF"; return 1
+  fi
+  sysctl -qw "net.ipv6.conf.$TUN_IF.accept_ra=0"
+  ip link set "$TUN_IF" mtu "$MTU" up
+  log "tunnel $TUN_IF up: local $WAN4, 6rd-prefix $SIXRD_PREFIX, relay-prefix $RELAY_PREFIX, mtu $MTU"
+}
+
+apply_once() {
+  local route a OLD_WAN4="" OLD_PD="" changed=0
+  route=$(ip -4 route get "$SIXRD_BR" 2>/dev/null) || { log "no IPv4 route to border relay $SIXRD_BR (WAN down?)"; return 1; }
+  if [ -n "$WAN_IF" ]; then
+    WAN_DEV=$WAN_IF
+    WAN4=$(ip -4 -o addr show dev "$WAN_IF" scope global | awk '{print $4}' | cut -d/ -f1 | head -n1)
+  else
+    WAN_DEV=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<<"$route" | head -n1)
+    WAN4=$(sed -n 's/.* src \([^ ]*\).*/\1/p' <<<"$route" | head -n1)
+  fi
+  [ -n "$WAN4" ] || { log "no IPv4 address on WAN ($WAN_DEV)"; return 1; }
+  is_public_ip4 "$WAN4" || { log "WAN IPv4 $WAN4 is not public (double NAT / CGNAT) - 6rd cannot work"; return 1; }
+  [ -n "$MTU" ] || MTU=$(( $(cat "/sys/class/net/$WAN_DEV/mtu") - 20 ))
+
+  compute "$WAN4" || return 1
+  lan_addrs || return 1
+
+  # shellcheck source=/dev/null
+  [ -r "$STATE" ] && . "$STATE"
+  if [ "$OLD_WAN4" != "$WAN4" ] || [ "$OLD_PD" != "$PD" ]; then
+    [ -n "$OLD_WAN4" ] && log "WAN IPv4 changed $OLD_WAN4 -> $WAN4, rebuilding"
+    teardown_net
+    changed=1
+  fi
+
+  ensure_tunnel || return 1
+  sysctl -qw net.ipv6.conf.all.forwarding=1
+  sysctl -qw "net.ipv6.conf.$TUN_IF.disable_ipv6=0"
+  ip -6 addr replace "$(groups64 "$PD")::1/$PFX_LEN" dev "$TUN_IF"
+  ip -6 route replace default via "::$SIXRD_BR" dev "$TUN_IF" mtu "$MTU"
+  ip -6 route replace unreachable "$(groups64 "$PD")::/$PD_LEN"
+
+  for a in $LAN_ADDRS; do
+    ip link show "${a%%=*}" >/dev/null 2>&1 || { log "LAN interface ${a%%=*} missing, skipping"; continue; }
+    sysctl -qw "net.ipv6.conf.${a%%=*}.disable_ipv6=0"
+    ip -6 addr replace "${a#*=}" dev "${a%%=*}"
+    drop_ula "${a%%=*}"
+  done
+
+  if (( changed )) || ! fw_ok; then fw_apply; fi
+  ra_ensure
+
+  if (( changed )); then
+    printf 'OLD_WAN4=%q\nOLD_PD=%q\nOLD_PD_LEN=%q\nOLD_LAN_ADDRS=%q\n' "$WAN4" "$PD" "$PD_LEN" "$LAN_ADDRS" >"$STATE"
+    log "delegated prefix $(groups64 "$PD")::/$PD_LEN; LAN: $LAN_ADDRS"
+  fi
+}
+
+status() {
+  ip -d link show "$TUN_IF" 2>/dev/null || echo "tunnel $TUN_IF: absent"
+  echo; ip -6 addr show scope global
+  echo; ip -6 route show default; ip -6 route show type unreachable
+  echo; [ -r "$STATE" ] && cat "$STATE"
+  echo; fw_ok && echo "firewall: ok" || echo "firewall: jumps missing or not first"
+  echo; ping -6 -c 3 -W 2 2001:4860:4860::8888 && echo "IPv6 reachability: ok"
+}
+
+case "${1:-}" in
+  run)
+    trap 'exit 0' TERM INT
+    while :; do apply_once || true; sleep "$INTERVAL" & wait $!; done ;;
+  once)   apply_once ;;
+  stop)   teardown_net; fw_remove; ra_remove; log "6rd stopped" ;;
+  status) status ;;
+  calc)
+    [ -n "${2:-}" ] || { echo "usage: $0 calc <ipv4>" >&2; exit 2; }
+    compute "$2" && echo "$(groups64 "$PD")::/$PD_LEN  (relay-prefix $RELAY_PREFIX)" ;;
+  *) echo "usage: $0 run|once|stop|status|calc <ipv4>" >&2; exit 2 ;;
+esac
