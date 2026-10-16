@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# host path: /data/unifi-common-addons/nfsv4-compat/scripts/nfsv4-compat
+# usage: nfsv4-compat   (run by nfsv4-compat.service; safe to run by hand)
+#
+# UniFi Drive exports each shared drive at /var/nfs/shared/<name>, a symlink into the data volume.
+# NFSv4 clients walk the export path through the server's v4 namespace and can't follow that
+# symlink, so v4 mounts fail. This mirrors every shard in /etc/exports.d/shared-*.exports into a
+# symlink-free tree: the symlink's target is bind-mounted at /run/nfs/var/nfs/shared/v4/<name> and
+# exported with the shard's own clients and options (plus mp), under a read-only fsid=0 root at
+# /run/nfs. v4 clients then mount <nas>:/var/nfs/shared/v4/<name>, i.e. UniFi's displayed path with
+# /v4 inserted before the share name. v3 clients are unaffected: they still resolve UniFi's paths.
+#
+# Every run rebuilds the whole desired state from the shards. The generated exports file is only
+# rewritten when its content changes, so an unchanged run skips the exportfs -ra below.
+#
+# A share is only exported while its mirror is actually bind-mounted, and a mirror directory that
+# isn't bound is removed: the fsid=0 root is a real (read-only) export, so any plain directory left
+# under it would be served to clients as an empty share. mp is a second guard: if a mirror loses its
+# bind mount between runs, the share's own read-write export is withheld.
+# Mirrors are removed with rmdir, never rm -r: a failed unmount can leave an empty directory behind,
+# but can never delete share data.
+
+set -Eeuo pipefail
+
+# uncomment the line below for debugging
+# trap 'STATUS=${?}; echo >&2 "${0}: Error on line "${LINENO}": ${BASH_COMMAND}"; exit ${STATUS}' ERR
+
+shopt -s nullglob
+export LC_ALL=C # names are handled byte by byte, matching exports(5) octal escapes
+
+readonly v4_root='/run/nfs'         # exported as fsid=0: what v4 clients see as /
+readonly shard_dir='/etc/exports.d' # watched by `nfsv4-compat.path` while `nfsv4-compat.service` is not running
+readonly unifi_root='/var/nfs/shared'
+readonly mirror_root="${v4_root}${unifi_root}/v4"        # v4 path /var/nfs/shared/v4/<name>
+readonly mirror_file="${shard_dir}/nfsv4-compat.exports" # only written when the content actually changes
+readonly staging_file="${shard_dir}/.nfsv4-compat.new"   # .new suffix; not a *.exports file, ignored by exportfs
+readonly root_options='ro,fsid=0,no_subtree_check'
+
+readonly bare_client_pattern='^[^()-][^()]*$'
+readonly quoted_line_pattern='^("[^"]*")[[:space:]]+(.+)$'
+readonly plain_line_pattern='^([^[:space:]"]+)[[:space:]]+(.+)$'
+readonly client_with_options_pattern='^([^()-][^()]*)\(([^()]*)\)$'
+
+changes_made='false'
+
+declare -a share_names=() bound_names=()
+declare -A share_export_paths=() share_clients=() share_hosts=()
+
+# <N> priority prefixes are only parsed when the stream is the journal's; see systemd.exec(5).
+if [[ -n "${JOURNAL_STREAM:-}" ]] && [[ "${JOURNAL_STREAM:-}" == "$(stat -L -c '%d:%i' "/proc/$$/fd/1" 2>/dev/null)" ]]; then
+  readonly log_to_journal='true'
+else
+  readonly log_to_journal='false'
+fi
+
+log() { # $1=syslog priority, $2=message
+  if [[ "${log_to_journal}" == 'true' ]]; then
+    printf '<%s>%s\n' "${1}" "${2}"
+  else
+    printf '%s\n' "${2}"
+  fi
+}
+
+decode_export_path() { # $1=path as written in an exports file; prints the literal path
+  local encoded="${1}"
+
+  if [[ "${encoded}" == '"'*'"' ]]; then
+    encoded="${encoded:1:-1}"
+  fi
+
+  printf '%b' "${encoded//\\/\\0}" # exports(5) octal escapes (\040) in printf %b's form (\0040)
+}
+
+encode_export_path() { # $1=literal path; prints it with exports(5) octal escapes for anything unusual
+  local path="${1}" encoded='' character index
+
+  for ((index = 0; index < ${#path}; index++)); do
+    character="${path:index:1}"
+
+    if [[ "${character}" =~ [A-Za-z0-9._/+-] ]]; then
+      encoded+="${character}"
+    else
+      encoded+="$(printf '\\%03o' "'${character}")"
+    fi
+  done
+
+  echo "${encoded}"
+}
+
+load_shard() { # $1=shard file; records each share it exports
+  local shard="${1}" line path_token client_list export_path name client_spec host options
+  local -a lines=() client_specs=() mirrored_specs=() line_hosts=()
+
+  mapfile -t lines <"${shard}" # also reads a final line that has no trailing newline
+
+  for line in "${lines[@]}"; do
+    if [[ "${line}" =~ ^[[:space:]]*(#|$) ]]; then
+      continue
+    fi
+
+    if [[ "${line}" =~ ${quoted_line_pattern} ]]; then
+      path_token="${BASH_REMATCH[1]}"
+      client_list="${BASH_REMATCH[2]}"
+    elif [[ "${line}" =~ ${plain_line_pattern} ]]; then
+      path_token="${BASH_REMATCH[1]}"
+      client_list="${BASH_REMATCH[2]}"
+    else
+      log 4 "${shard}: skipping unparseable line: ${line}"
+      continue
+    fi
+
+    export_path="$(decode_export_path "${path_token}")"
+    name="${export_path#"${unifi_root}/"}"
+
+    if [[ "${export_path}" != "${unifi_root}/"* || -z "${name}" || "${name}" == */* || "${name}" == .* ]]; then
+      log 4 "${shard}: skipping ${export_path}: not a share directly under ${unifi_root}"
+      continue
+    fi
+
+    if [[ ! -L "${export_path}" && ! -e "${export_path}" ]]; then
+      log 4 "${shard}: skipping ${export_path}: no such path (misparsed name?)"
+      continue
+    fi
+
+    if [[ -n "${share_export_paths[${name}]:-}" ]]; then
+      log 4 "${shard}: skipping ${export_path}: share '${name}' already defined by another shard"
+      continue
+    fi
+
+    read -ra client_specs <<<"${client_list}"
+    mirrored_specs=()
+    line_hosts=()
+
+    for client_spec in "${client_specs[@]}"; do
+      if [[ "${client_spec}" =~ ${client_with_options_pattern} ]]; then
+        host="${BASH_REMATCH[1]}"
+        options="${BASH_REMATCH[2]}"
+
+        if [[ -n "${options}" ]]; then
+          options+=','
+        fi
+
+        mirrored_specs+=("${host}(${options}mp)")
+      elif [[ "${client_spec}" =~ ${bare_client_pattern} ]]; then
+        host="${client_spec}"
+        mirrored_specs+=("${host}(mp)")
+      else
+        log 4 "${shard}: skipping ${export_path}: unsupported client spec '${client_spec}'"
+        continue 2
+      fi
+
+      line_hosts+=("${host}")
+    done
+
+    share_names+=("${name}")
+    share_export_paths["${name}"]="${export_path}"
+    share_clients["${name}"]="${mirrored_specs[*]}"
+    share_hosts["${name}"]="${line_hosts[*]}"
+  done
+}
+
+unbind_mirror() { # $1=name; unmounts (lazily) and removes the share's mirror directory, if present
+  local name="${1}" mirror_path="${mirror_root}/${1}"
+
+  if findmnt -rn -M "${mirror_path}" >/dev/null; then
+    if ! umount -l "${mirror_path}" 9>&-; then
+      log 3 "${name}: unmounting ${mirror_path} failed; retrying next run"
+      return 1
+    fi
+
+    changes_made='true'
+  fi
+
+  if [[ -d "${mirror_path}" ]]; then
+    if ! rmdir "${mirror_path}"; then
+      log 4 "${name}: could not remove ${mirror_path}; leaving it in place"
+      return 1
+    fi
+  fi
+}
+
+bind_share() { # $1=name; makes sure the share's real directory is bound at its mirror path
+  local name="${1}" mirror_path="${mirror_root}/${1}" real_path source_identity mirror_identity
+
+  if ! real_path="$(readlink -e "${share_export_paths[${name}]}")"; then
+    log 4 "${name}: ${share_export_paths[${name}]} does not resolve; not mirroring it"
+    unbind_mirror "${name}"
+    return 1
+  fi
+
+  if ! source_identity="$(stat -c '%d:%i' "${real_path}")"; then
+    log 4 "${name}: ${real_path} vanished while binding; will retry on next run"
+    return 1
+  fi
+
+  if findmnt -rn -M "${mirror_path}" >/dev/null; then
+    if ! mirror_identity="$(stat -c '%d:%i' "${mirror_path}")"; then
+      log 4 "${name}: ${mirror_path} vanished while binding; will retry on next run"
+      return 1
+    fi
+
+    if [[ "${mirror_identity}" == "${source_identity}" ]]; then
+      return 0 # already bound to the right directory
+    fi
+
+    log 5 "${name}: mirror is bound to a different directory; rebinding"
+
+    if ! unbind_mirror "${name}"; then
+      return 1
+    fi
+  fi
+
+  log 5 "${name}: binding ${real_path} at ${mirror_path}"
+  mkdir -p "${mirror_path}"
+
+  if ! mount --bind "${real_path}" "${mirror_path}" 9>&-; then
+    log 3 "${name}: bind mount failed; retrying next run"
+    unbind_mirror "${name}" # removes the empty directory
+    return 1
+  fi
+
+  changes_made='true'
+}
+
+render_exports() { # prints the generated exports file for the shares that are bound
+  local name host
+  local -a root_specs=() hosts=()
+  local -A seen_hosts=()
+
+  for name in "${bound_names[@]}"; do
+    read -ra hosts <<<"${share_hosts[${name}]}"
+
+    for host in "${hosts[@]}"; do
+      if [[ -z "${seen_hosts[${host}]:-}" ]]; then
+        seen_hosts["${host}"]='1'
+        root_specs+=("${host}(${root_options})")
+      fi
+    done
+  done
+
+  echo "# Generated by nfsv4-compat from ${shard_dir}/shared-*.exports; manual edits are overwritten."
+  printf '%s %s\n' "$(encode_export_path "${v4_root}")" "${root_specs[*]}"
+
+  for name in "${bound_names[@]}"; do
+    printf '%s %s\n' "$(encode_export_path "${mirror_root}/${name}")" "${share_clients[${name}]}"
+  done
+}
+
+update_exports_file() {
+  local rendered current=''
+
+  if ((${#bound_names[@]} == 0)); then
+    if [[ -e "${mirror_file}" ]]; then
+      log 5 "no shares to export; removing ${mirror_file}"
+      rm -f "${mirror_file}"
+      changes_made='true'
+    fi
+
+    return
+  fi
+
+  rendered="$(render_exports)"
+
+  if [[ -f "${mirror_file}" ]]; then
+    current="$(<"${mirror_file}")"
+  fi
+
+  if [[ "${rendered}" == "${current}" ]]; then
+    return
+  fi
+
+  log 5 "updating ${mirror_file}"
+  printf '%s\n' "${rendered}" >"${staging_file}"
+  mv -f "${staging_file}" "${mirror_file}" # atomic rename: exportfs never sees a partial file
+  changes_made='true'
+}
+
+remove_stale_mirrors() { # unmounts and removes mirrors of shares that no longer exist
+  local mirror_path name
+
+  for mirror_path in "${mirror_root}"/*; do
+    name="${mirror_path##*/}"
+
+    if [[ -n "${share_export_paths[${name}]:-}" ]]; then
+      continue
+    fi
+
+    log 5 "${name}: no longer shared; removing ${mirror_path}"
+    if ! unbind_mirror "${name}"; then
+      continue # already logged; retried next run
+    fi
+  done
+}
+
+exec 9>'/run/nfsv4-compat.lock'
+
+if ! flock -n 9; then
+  log 4 'another run already holds the lock; exiting'
+  exit 0
+fi
+
+for shard in "${shard_dir}"/shared-*.exports; do
+  load_shard "${shard}"
+done
+
+mkdir -p "${mirror_root}"
+
+# Ensure lookup by name still works, but readdir does not, so share names don't leak across clients.
+chmod 711 "${mirror_root}"
+
+for name in "${share_names[@]}"; do
+  if bind_share "${name}"; then
+    bound_names+=("${name}")
+  fi
+done
+
+update_exports_file # after binding, so only bound mirrors are listed
+
+if [[ "${changes_made}" == 'true' ]]; then
+  log 5 "re-exporting"
+  exportfs -ra 9>&-
+fi
+
+# After re-exporting, so removed shares are no longer exported when unmounted.
+# These mirrors are already absent from the generated file, so the `changes_made`
+# that `unbind_mirror` sets here is moot.
+remove_stale_mirrors

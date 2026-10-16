@@ -1,0 +1,18 @@
+[Unit]
+Description=Mirror UniFi Drive NFS exports into an NFSv4-traversable tree
+# Runs after the NFS server so its own startup exportfs can't race this script's.
+After=nfs-server.service
+
+# A UniFi share edit touches several files; the 2s settle below folds that burst into
+# one or two runs. These limits still stop a genuine trigger loop, but leave room for
+# legitimate bursts:  hitting a start limit would also fail nfsv4-compat.path, which then
+# stops watching.
+StartLimitBurst=20
+StartLimitIntervalSec=60
+ConditionPathExists=/var/nfs/shared
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2min
+ExecStartPre=/bin/sleep 2
+ExecStart=/data/unifi-common-addons/nfsv4-compat/scripts/nfsv4-compat
