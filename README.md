@@ -39,7 +39,7 @@ Enables emulation of a Cascaded Router setup and allows full use of your CIDR on
 
 ### centurylink-ipv6
 
-Enables 6RD on CenturyLink connections. This allows you to use IPv6 on your LAN and have it routed over the 6RD tunnel to the internet.
+Enables 6RD on CenturyLink connections. This allows you to use IPv6 on your LAN and have it routed over the 6RD tunnel to the internet. A systemd service keeps the tunnel, LAN prefixes, firewall and Router Advertisements in place across PPPoE reconnects, UniFi re-provisioning and firmware updates.
 
 ### he-ipv6
 
