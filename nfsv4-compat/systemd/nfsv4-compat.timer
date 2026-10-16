@@ -1,0 +1,10 @@
+[Unit]
+Description=Run nfsv4-compat at boot and periodically, as a backstop for missed path events
+
+[Timer]
+# PathChanged= never fires for state that already exists, so the boot run comes from here.
+OnBootSec=30s
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
