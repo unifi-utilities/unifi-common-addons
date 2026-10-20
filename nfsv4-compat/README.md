@@ -6,10 +6,10 @@ Enables clients to mount shares exported by UniFi Drive using NFSv4.
 
 1. [on_boot.d](https://github.com/unifi-utilities/unifi-common)
 2. Copy
-    - `11-nfsv4-compat.sh` to `/data/on_boot.d/`
-    - the systemd unit files to `/data/unifi-common-addons/nfsv4-compat/systemd/`
-    - the main `nfsv4-compat` script to `/data/unifi-common-addons/nfsv4-compat/scripts/`
-3. You *should* end up with:
+   - `11-nfsv4-compat.sh` to `/data/on_boot.d/`
+   - the systemd unit files to `/data/unifi-common-addons/nfsv4-compat/systemd/`
+   - the main `nfsv4-compat` script to `/data/unifi-common-addons/nfsv4-compat/scripts/`
+3. You _should_ end up with:
 
 ```text
 /data
