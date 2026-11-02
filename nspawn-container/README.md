@@ -110,9 +110,9 @@ Now that the container is created, let's configure it. Make sure you are back on
 
 ### Step 2A: Configure the Container to use an Isolated MacVLAN Network
 
-This configuration is only needed if you want to isolate the container's network with a macvlan bridge. The following steps are all performed on the host OS.
+This configuration is only needed if you want to isolate the container's network with a macvlan bridge. 
 
-1. Download the [10-setup-network.sh](scripts/10-setup-network.sh) script to `/data/on_boot.d` and configure it with your VLAN and IPs for your container and gateway. This script will create a brX.mac interface as a gateway bridge for containers to communicate with.
+1. SSH into the device to download the [10-setup-network.sh](scripts/10-setup-network.sh) script to `/data/on_boot.d` and configure it with your VLAN and IPs for your container and gateway. This script will create a brX.mac interface as a gateway bridge for containers to communicate with.
 
    ```sh
    mkdir -p /data/on_boot.d && cd /data/on_boot.d
@@ -125,23 +125,47 @@ This configuration is only needed if you want to isolate the container's network
    - Modify `IPV4_IP` to your preferred container IP. The default is 10.0.5.3, but you can use whatever you want as long as it's on the same subnet as the gateway subnet `IPV4_GW`.
    - Also modify `IPV6_GW` and `IPV6_IP` if you need IPV6 support. Leave them empty to turn off IPv6 support.
 
-2. Configure Firewall
+2. Configure the Firewall from the web interface
    - If you are running a network application < 9, or not using Zone-Based-Firewall yet, then go to step `4`.
    - If your network does not have Inter-VLAN restrictions, then go to step 4.
-   - visit `Uniti Dashboard -> Settings -> Profiles -> Network Objects` (object names below are examples, you can type any name).
-     - Create a new object `Devices/IPv4: Pi-Hole DNS Servers` and add your container IP address (`10.0.5.3` in this example)
-     - Create a new object `Ports: DNS` and add the following ports: `53`, `853`, `5053`
-   - visit your UniFi dashboard -> Nework Application -> Settings -> Security -> Firewall tab
-     - Scroll down and press `Create Policy.`
+   - Navigate to `UniFi Dashboard -> Network -> Settings -> Networks`
+     - Click **Create New** to create a network based on what you configured in the `/data/on_boot.d/10-setup-network.sh`
+       - Name: [whatever you want to name it]
+       - Zone: Internal is fine unless you already have another Zone in mind to use
+       - Uncheck **Auto-Scale Network**
+       - Enter your IPv4 Address, Netmask, VLAN ID
+       - Toggle from **Auto** to **Manual**
+       - Uncheck **Additional IPs**
+       - Uncheck **Isolate Network**
+       - Check **Allow Internet Access**
+       - Set DHCP Mode to **None**
+       - Uncheck **DHCP Guarding**
+       - Set IPv6 according to your preferences
+   - Navigate to `UniFi Dashboard -> Network -> Settings -> Policy Engine -> Zones`
+     - Scroll down and Click **Create Policy**.
      - Give it a reasonable name, for example, `VLANs to Internal DNS.`
-     - Source Zone `Internal`
-     - Action `Allow`
-     - Destination Zone `External` (that's correct, even tho IP is internal, however, ZBF works with UniFi networks, and our VLAN (5 in this example) is not technically a UniFi network, and rules from `Internal` zone do not apply to it).
-     - Check `IP` -> `Object`, then from the dropdown select the address network object we've created above (`Devices/IPv4: Pi-Hole DNS Servers`).
-     - Check `Port` -> `Object` and from the dropdown select the port network object we've created above (`Ports: DNS`)
-     - Press `Add Policy`
-     - In `Zone Matrix`, filter policies by `Internal` (Source) and `External` (Destination) and make sure the new policy is above all block rules; if not, scroll down, press `Reorder`, and move the new rule up
-3. Create or modify your `/etc/systemd/nspawn/debian-custom.nspawn` file with the following parameters. This will tell nspawn to isolate the network and create a macvlan interface in the container from our VLAN bridge. This interface will be called mv-br5.
+     - Set the Source Zone to whatever Zone this container should handle DNS and determine your source targeting (Any, Device, Network, IP, MAC, Identity)
+     - Set the port to **Any**
+     - Action **Allow**
+     - Set the Destination Zone to **Internal** (or whatever Zone you set for the network in the previous step)
+     - Select **IP**, **Specific**, and add the IP address of the container.
+     - If you don't already have a Port list configured, select **List** then click **New** to name and populate a port list with 53, 853, 5053.
+     - Click **Add Policy**
+     - In the **Zone Matrix**, locate the intersection of your Source and Destination Zones to make sure the new policy is above all block rules; if not, scroll down, press `Reorder`, and move the new rule up
+     - Repeat this process for any other Zones that should route their DNS traffic to the nspanwn-container since Zone-Based Firewall Rules only allow you to select one Source and one Destination Zone.
+     - (Optional) If you want to force all DNS53 traffic to the nspawn container, create an additional on_boot script to prepend a pair of iptables rules via your SSH session:
+        ```
+        cat << 'EOF' > /data/on_boot.d/5-redirect-dns.sh
+        #!/bin/bash
+        iptables -t nat -I PREROUTING 1 -i brX ! -d 10.0.5.3 -p udp --dport 53 -j DNAT --to-destination 10.0.5.3
+        iptables -t nat -I PREROUTING 1 -i brX ! -d 10.0.5.3 -p tcp --dport 53 -j DNAT --to-destination 10.0.5.3
+        EOF
+        chmod +x /data/on_boot.d/5-redirect-dns.sh
+        ```
+          - Replace the **X** in `brX` with the VLAN ID that should route port 53 traffic to your nspawn container's IP--replace 10.0.5.3 if your IP differs.
+          - Repeat these lines to add additional VLANs.
+          - Note: This is NOT a replacement for creating the Network or Zone-Based Firewall Rule steps above.
+3. From your SSH session, create or modify your `/etc/systemd/nspawn/debian-custom.nspawn` file with the following parameters. This will tell nspawn to isolate the network and create a macvlan interface in the container from our VLAN bridge. This interface will be called mv-br5.
 
    ```ini
    [Exec]
