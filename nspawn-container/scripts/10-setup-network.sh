@@ -33,6 +33,19 @@ FORCED_INTFC=""
 
 ## END OF CONFIGURATION
 
+# Insert a nat PREROUTING rule at the top of the chain. UniFi adds its own
+# jump chains (UBIOS_*) to PREROUTING, and appended rules can be skipped if one
+# of those matches first (e.g. traffic subject to policy-based routes).
+# Any existing copies are removed first, so re-running this script keeps the
+# rule at the top without creating duplicates.
+# Usage: prepend_nat_rule <iptables|ip6tables> <rule spec...>
+prepend_nat_rule() {
+  local cmd="$1"
+  shift
+  while "${cmd}" -t nat -D PREROUTING "$@" 2>/dev/null; do :; done
+  "${cmd}" -t nat -I PREROUTING 1 "$@"
+}
+
 # set VLAN bridge promiscuous
 ip link set "br${VLAN}" promisc on
 
@@ -61,9 +74,9 @@ fi
 # Dnsmasq is now started with --conf-dir=/run/dnsmasq.dhcp.conf.d/ so we can drop
 # our own config files into that directory, even if they aren't related to DHCP.
 if [ -d /run/dnsmasq.dhcp.conf.d ]; then
-    # unifi network > 9.3.29
-    echo "interface=br${VLAN}.mac" > /run/dnsmasq.dhcp.conf.d/macvlan.conf
-    kill -9 "$(cat /run/dnsmasq-main.pid)"
+  # unifi network > 9.3.29
+  echo "interface=br${VLAN}.mac" > /run/dnsmasq.dhcp.conf.d/macvlan.conf
+  kill -9 "$(cat /run/dnsmasq-main.pid)"
 else
   # older versions
   if ! grep -qxF "interface=br${VLAN}.mac" /run/dnsmasq.conf.d/custom.conf; then
@@ -73,20 +86,22 @@ else
 fi
 
 # (optional) IPv4 force DNS (TCP/UDP 53) through DNS container
+# Rules are inserted at the top of PREROUTING, so DNAT is inserted before LOG
+# to leave LOG above DNAT.
 for intfc in ${FORCED_INTFC}; do
   if [ -d "/sys/class/net/${intfc}" ]; then
     for proto in udp tcp; do
-      prerouting_rule="PREROUTING -i ${intfc} -p ${proto} ! -s ${IPV4_IP} ! -d ${IPV4_IP} --dport 53 -j LOG --log-prefix [DNAT-${intfc}-${proto}]"
-      iptables -t nat -C ${prerouting_rule} 2>/dev/null || iptables -t nat -A ${prerouting_rule}
-      prerouting_rule="PREROUTING -i ${intfc} -p ${proto} ! -s ${IPV4_IP} ! -d ${IPV4_IP} --dport 53 -j DNAT --to ${IPV4_IP}"
-      iptables -t nat -C ${prerouting_rule} 2>/dev/null || iptables -t nat -A ${prerouting_rule}
+      prepend_nat_rule iptables -i "${intfc}" -p "${proto}" ! -s "${IPV4_IP}" ! -d "${IPV4_IP}" --dport 53 \
+        -j DNAT --to "${IPV4_IP}"
+      prepend_nat_rule iptables -i "${intfc}" -p "${proto}" ! -s "${IPV4_IP}" ! -d "${IPV4_IP}" --dport 53 \
+        -j LOG --log-prefix "[DNAT-${intfc}-${proto}]"
 
       # (optional) IPv6 force DNS (TCP/UDP 53) through DNS container
       if [ -n "${IPV6_IP}" ]; then
-        prerouting_rule="PREROUTING -i ${intfc} -p ${proto} ! -s ${IPV6_IP} ! -d ${IPV6_IP} --dport 53 -j LOG --log-prefix [DNAT-${intfc}-${proto}]"
-        ip6tables -t nat -C ${prerouting_rule} 2>/dev/null || ip6tables -t nat -A ${prerouting_rule}
-        prerouting_rule="PREROUTING -i ${intfc} -p ${proto} ! -s ${IPV6_IP} ! -d ${IPV6_IP} --dport 53 -j DNAT --to ${IPV6_IP}"
-        ip6tables -t nat -C ${prerouting_rule} 2>/dev/null || ip6tables -t nat -A ${prerouting_rule}
+        prepend_nat_rule ip6tables -i "${intfc}" -p "${proto}" ! -s "${IPV6_IP}" ! -d "${IPV6_IP}" --dport 53 \
+          -j DNAT --to "${IPV6_IP}"
+        prepend_nat_rule ip6tables -i "${intfc}" -p "${proto}" ! -s "${IPV6_IP}" ! -d "${IPV6_IP}" --dport 53 \
+          -j LOG --log-prefix "[DNAT-${intfc}-${proto}]"
       fi
     done
   fi
