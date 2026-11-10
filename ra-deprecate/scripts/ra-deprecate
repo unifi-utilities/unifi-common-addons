@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""ra-deprecate - announce vanished delegated IPv6 prefixes as deprecated.
+
+On a gateway with a single WAN, UniFi OS stops dnsmasq *before* it removes an
+old delegated prefix from the bridges, so dnsmasq's own deprecation (old
+prefix with preferred lifetime 0 for up to 2 h) never runs. LAN clients then
+keep addresses from the dead prefix as "preferred" for up to 24 h and may pick
+them as source address.
+
+This daemon watches the global /64s on the bridges. When one disappears it
+sends Router Advertisements for that prefix with preferred lifetime 0 and the
+remaining part of a 2 h valid lifetime (RFC 4862 5.5.3), so clients stop using
+it for new connections at once. Header values (M/O flags, router preference,
+router lifetime) are copied from the dnsmasq config of the same interface, so
+the packets look like dnsmasq's own.
+
+Only stdlib. Needs CAP_NET_RAW.
+"""
+import argparse
+import ctypes
+import glob
+import ipaddress
+import json
+import os
+import re
+import socket
+import struct
+import sys
+import time
+
+STATE_FILE = "/data/unifi-common-addons/ra-deprecate/state.json"
+DNSMASQ_GLOB = "/run/dnsmasq.dhcp.conf.d/*.conf"
+IFACE_RE = re.compile(r"^br[0-9]*$")
+POLL = 5
+DEPRECATE_WINDOW = 7200          # RFC 4862: valid lifetime can't go below 2 h
+FORGET_AFTER = 86400             # dnsmasq hands out 86400 s; older is gone anyway
+SCHEDULE = [0, 10, 30, 60, 120, 300, 600]
+REPEAT = 600
+# The state file is written when something changes (a prefix appears, is lost,
+# or a deprecation RA goes out), never otherwise, to spare the flash. The one
+# exception is a refresh of the "last seen" times, at most this often and only
+# while a prefix is on a bridge: a reboot must be able to tell whether a missing
+# prefix was still valid when the gateway went down (see FORGET_AFTER).
+SEEN_REFRESH = 21600
+# A saved prefix that is missing from a bridge without any other global /64 is
+# not treated as gone right away, so one that returns unchanged is never
+# announced as deprecated. Two hold-offs apply: STARTUP_GRACE after a start (a
+# bridge can exist before the WAN has handed out a prefix) and DEBOUNCE after the
+# prefix first went missing (a provisioning run that removes and re-adds an
+# address). A bridge that already carries a different /64 is handled at once.
+STARTUP_GRACE = 300
+DEBOUNCE = 30
+# Saved timestamps are only compared with a clock that can be trusted. After a
+# start the loop idles until the kernel reports the clock as set by a time
+# source, for at most CLOCK_WAIT seconds (no WAN, no NTP). Nothing is decided,
+# sent or written meanwhile. MIN_PLAUSIBLE (2025-01-01) catches a clock that
+# starts at the epoch where the kernel flag is not available.
+CLOCK_WAIT = 600
+MIN_PLAUSIBLE = 1735689600
+TIME_ERROR = 5                   # adjtimex() return value of an unsynchronised clock
+ULA = ipaddress.IPv6Network("fc00::/7")
+PRF = {"high": 0x08, "medium": 0x00, "low": 0x18}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+class Timex(ctypes.Structure):
+    """struct timex from <sys/timex.h>, enough for a read-only adjtimex(2)."""
+    _fields_ = [("modes", ctypes.c_uint), ("offset", ctypes.c_long),
+                ("freq", ctypes.c_long), ("maxerror", ctypes.c_long),
+                ("esterror", ctypes.c_long), ("status", ctypes.c_int),
+                ("constant", ctypes.c_long), ("precision", ctypes.c_long),
+                ("tolerance", ctypes.c_long), ("time_sec", ctypes.c_long),
+                ("time_usec", ctypes.c_long), ("tick", ctypes.c_long),
+                ("ppsfreq", ctypes.c_long), ("jitter", ctypes.c_long),
+                ("shift", ctypes.c_int), ("stabil", ctypes.c_long),
+                ("jitcnt", ctypes.c_long), ("calcnt", ctypes.c_long),
+                ("errcnt", ctypes.c_long), ("stbcnt", ctypes.c_long),
+                ("tai", ctypes.c_int), ("pad", ctypes.c_int * 11)]
+
+
+def clock_synced():
+    """True if the wall clock looks set by a time source (what timedatectl shows
+    as "System clock synchronized"); without adjtimex only the plausibility check."""
+    if time.time() < MIN_PLAUSIBLE:
+        return False
+    try:
+        return ctypes.CDLL(None).adjtimex(ctypes.byref(Timex())) != TIME_ERROR
+    except (AttributeError, OSError):
+        return True
+
+
+def read_addrs():
+    """{iface: {"index": int, "ll": str|None, "global": set of "prefix/64"}}"""
+    res = {}
+    with open("/proc/net/if_inet6") as f:
+        for line in f:
+            hexaddr, ifidx, plen, scope, _flags, ifname = line.split()
+            if not IFACE_RE.match(ifname):
+                continue
+            addr = ipaddress.IPv6Address(bytes.fromhex(hexaddr))
+            e = res.setdefault(ifname, {"index": int(ifidx, 16), "ll": None,
+                                        "global": set()})
+            scope, plen = int(scope, 16), int(plen, 16)
+            if scope == 0x20:
+                e["ll"] = str(addr)
+            elif scope == 0 and plen == 64 and addr not in ULA:
+                net = ipaddress.IPv6Network((addr, 64), strict=False)
+                e["global"].add(str(net))
+    return res
+
+
+def ra_params(iface):
+    """Header values dnsmasq uses on iface, or None if dnsmasq sends no RA there."""
+    found = False
+    flags, prf, lifetime = 0, 0x00, None
+    for path in glob.glob(DNSMASQ_GLOB):
+        try:
+            with open(path) as f:
+                txt = f.read()
+        except FileNotFoundError:
+            continue                                # dnsmasq rewrote its configs
+        except OSError as exc:
+            log(f"cannot read {path}: {exc}")
+            continue
+        m = re.search(rf"^dhcp-range=.*constructor:{re.escape(iface)},([^\n]*)$",
+                      txt, re.MULTILINE)
+        if m:
+            found = True
+            tokens = m.group(1).split(",")
+            if "ra-only" in tokens or "ra-names" in tokens:
+                flags = 0x00
+            elif "ra-stateless" in tokens:
+                flags = 0x40
+            else:                                   # slaac / plain DHCPv6 range
+                flags = 0xC0
+        m = re.search(rf"^ra-param={re.escape(iface)},([^\n]*)$", txt, re.MULTILINE)
+        if m:
+            fields = [x for x in m.group(1).split(",") if not x.startswith("mtu:")]
+            if fields and fields[0].lower() in PRF:
+                prf = PRF[fields.pop(0).lower()]
+            nums = [int(x) for x in fields if x.isdigit()]
+            if len(nums) >= 2:
+                lifetime = nums[1]
+    if not found:
+        return None
+    return {"flags": flags | prf, "lifetime": 1800 if lifetime is None else lifetime}
+
+
+def build_ra(params, mac, prefix, valid, preferred):
+    # Same 16-byte layout as dnsmasq's struct ra_packet and Linux' struct ra_msg:
+    # type, code, checksum, hop limit, flags, router lifetime, reachable, retrans
+    hdr = struct.pack("!BBHBBHII", 134, 0, 0, 64, params["flags"], params["lifetime"], 0, 0)
+    slla = struct.pack("!BB6s", 1, 1, mac)
+    net = ipaddress.IPv6Network(prefix)
+    # PIO (RFC 4861 4.6.2): type, len=4 (32 bytes), plen, L|A, valid, preferred,
+    # 4 reserved bytes, prefix
+    pio = struct.pack("!BBBBIII16s", 3, 4, net.prefixlen, 0xC0, valid, preferred, 0,
+                      net.network_address.packed)
+    return hdr + slla + pio
+
+
+def mac_of(iface):
+    with open(f"/sys/class/net/{iface}/address") as f:
+        return bytes.fromhex(f.read().strip().replace(":", ""))
+
+
+def send_ra(iface, info, prefix, valid, dry_run=False, preferred=0, dest="ff02::1"):
+    params = ra_params(iface)
+    if params is None:
+        log(f"{iface}: no dnsmasq RA config, not announcing {prefix}")
+        return False
+    if not info["ll"]:
+        log(f"{iface}: no link-local address, cannot send")
+        return False
+    pkt = build_ra(params, mac_of(iface), prefix, valid, preferred)
+    if dry_run:
+        log(f"{iface}: DRY-RUN RA from {info['ll']} to {dest}: {pkt.hex()}")
+        return True
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    try:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 255)
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, info["index"])
+        s.bind((info["ll"], 0, 0, info["index"]))
+        s.sendto(pkt, (dest, 0, 0, info["index"]))
+    finally:
+        s.close()
+    log(f"{iface}: sent RA for {prefix} to {dest} (preferred {preferred}s, "
+        f"valid {valid}s, flags 0x{params['flags']:02x}, "
+        f"router lifetime {params['lifetime']})")
+    return True
+
+
+def due_at(n):
+    return SCHEDULE[n] if n < len(SCHEDULE) else SCHEDULE[-1] + REPEAT * (n - len(SCHEDULE) + 1)
+
+
+def load_state():
+    """The saved state, minus anything that is not a well-formed entry."""
+    try:
+        with open(STATE_FILE) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    state = {}
+    if not isinstance(raw, dict):
+        return state
+    for iface, prefixes in raw.items():
+        if not isinstance(prefixes, dict):
+            continue
+        for p, e in prefixes.items():
+            try:
+                ipaddress.IPv6Network(p)
+                seen = float(e["seen"])
+                lost = None if e["lost"] is None else float(e["lost"])
+                sent = int(e["sent"])
+            except (KeyError, TypeError, ValueError):
+                log(f"ignoring malformed state entry for {p} on {iface}")
+                continue
+            state.setdefault(iface, {})[p] = {"seen": seen, "lost": lost, "sent": sent}
+    return state
+
+
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
+    # make the rename itself survive a power cut
+    dfd = os.open(os.path.dirname(STATE_FILE) or ".", os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def run(dry_run):
+    # A gateway can boot with a wrong clock and step it once NTP has synced. The
+    # loop therefore waits for a synchronised clock (see CLOCK_WAIT) and only then
+    # takes wall time plus monotonic time as its clock, so a later step can
+    # neither end a deprecation early nor stretch it. Saved timestamps use the
+    # same clock.
+    wall0 = mono0 = 0.0
+
+    def clock():
+        return wall0 + (time.monotonic() - mono0)
+
+    state = load_state()
+    # what is on disk is as fresh as its newest "last seen"; nothing to write
+    # at start unless something changed or that time is older than SEEN_REFRESH
+    last_flush = max([e["seen"] for st in state.values() for e in st.values()] or [0])
+    dirty = False
+    started = None                  # set once the clock can be trusted
+    waiting_since = time.monotonic()
+    absent = {}                     # (iface, prefix) -> when it was first missing
+    log(f"started (state: {json.dumps(state, sort_keys=True)})")
+    while True:
+        if started is None:
+            synced = clock_synced()
+            if not synced and time.monotonic() - waiting_since < CLOCK_WAIT:
+                time.sleep(POLL)
+                continue
+            if not synced:
+                log(f"clock not synchronised after {CLOCK_WAIT}s, going on with it")
+            wall0, mono0 = time.time(), time.monotonic()
+            started = clock()
+            log("clock {}, running".format("synchronised" if synced else "unsynchronised"))
+        now = clock()
+        changed = False
+        alive = False
+        cur = read_addrs()
+        for iface, info in sorted(cur.items()):
+            st = state.setdefault(iface, {})
+            for p in info["global"]:
+                absent.pop((iface, p), None)
+                alive = True
+                e = st.get(p)
+                if e is None or e["lost"]:
+                    if e:
+                        log(f"{iface}: prefix {p} is back, stop deprecating")
+                    else:
+                        log(f"{iface}: watching prefix {p}")
+                    st[p] = {"seen": now, "lost": None, "sent": 0}
+                    changed = True
+                else:
+                    e["seen"] = now
+            for p, e in list(st.items()):
+                if e["lost"] is None and p not in info["global"]:
+                    if not info["global"]:
+                        # nothing replaces it yet: hold off (see STARTUP_GRACE, DEBOUNCE)
+                        if (iface, p) not in absent:
+                            absent[(iface, p)] = now
+                            log(f"{iface}: no global prefix, waiting for {p}")
+                        if now - started < STARTUP_GRACE or now - absent[(iface, p)] < DEBOUNCE:
+                            continue
+                    absent.pop((iface, p), None)
+                    if now - e["seen"] > FORGET_AFTER:
+                        log(f"{iface}: prefix {p} gone, last seen too long ago, dropping")
+                        del st[p]
+                    else:
+                        log(f"{iface}: prefix {p} disappeared, deprecating")
+                        e.update(lost=now, sent=0)
+                    changed = True
+                    continue
+                if e["lost"] is None:
+                    continue
+                age = now - e["lost"]
+                if age >= DEPRECATE_WINDOW:
+                    log(f"{iface}: done deprecating {p}")
+                    del st[p]
+                    changed = True
+                    continue
+                if age >= due_at(e["sent"]):
+                    try:
+                        send_ra(iface, info, p, int(DEPRECATE_WINDOW - age), dry_run)
+                    except OSError as exc:
+                        log(f"{iface}: send failed for {p}: {exc}")
+                    while due_at(e["sent"]) <= age:
+                        e["sent"] += 1
+                    changed = True
+        # entries of a bridge that is gone: nobody is left to tell, so forget
+        # them once their prefix cannot be on any client any more
+        for iface in [i for i in state if i not in cur]:
+            st = state[iface]
+            for p, e in list(st.items()):
+                if ((e["lost"] is None and now - e["seen"] > FORGET_AFTER)
+                        or (e["lost"] is not None and now - e["lost"] >= DEPRECATE_WINDOW)):
+                    log(f"{iface}: bridge gone, dropping {p}")
+                    del st[p]
+                    changed = True
+            if not st:
+                del state[iface]
+            # a bridge that comes back starts its hold-off from scratch
+            for key in [k for k in absent if k[0] == iface]:
+                del absent[key]
+        dirty = dirty or changed
+        if not dry_run and ((dirty and now - last_flush > 30)
+                             or (alive and now - last_flush > SEEN_REFRESH)):
+            try:
+                save_state(state)
+                last_flush = now
+                dirty = False
+            except OSError as exc:
+                log(f"cannot write state: {exc}")
+        time.sleep(POLL)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--dry-run", action="store_true", help="log packets instead of sending, and do not write the state file")
+    ap.add_argument("--test", metavar="PREFIX/64",
+                    help="send one deprecation RA for PREFIX on --iface and exit")
+    ap.add_argument("--iface", help="interface for --test")
+    ap.add_argument("--valid", type=int, default=300, help="valid lifetime for --test")
+    ap.add_argument("--preferred", type=int, default=0, help="preferred lifetime for --test")
+    ap.add_argument("--dest", default="ff02::1",
+                    help="destination for --test (a link-local unicast limits it to one host)")
+    a = ap.parse_args()
+    if a.test:
+        info = read_addrs().get(a.iface)
+        if not info:
+            sys.exit(f"unknown or unwatched interface: {a.iface}")
+        ok = send_ra(a.iface, info, str(ipaddress.IPv6Network(a.test)), a.valid, a.dry_run,
+                     a.preferred, a.dest)
+        sys.exit(0 if ok else 1)
+    run(a.dry_run)
+
+
+if __name__ == "__main__":
+    main()
