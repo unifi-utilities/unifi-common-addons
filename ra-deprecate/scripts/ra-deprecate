@@ -33,7 +33,6 @@ DNSMASQ_GLOB = "/run/dnsmasq.dhcp.conf.d/*.conf"
 IFACE_RE = re.compile(r"^br[0-9]*$")
 POLL = 5
 DEPRECATE_WINDOW = 7200          # RFC 4862: valid lifetime can't go below 2 h
-FORGET_AFTER = 86400             # dnsmasq hands out 86400 s; older is gone anyway
 SCHEDULE = [0, 10, 30, 60, 120, 300, 600]
 REPEAT = 600
 # The state file is written when something changes (a prefix appears, is lost,
@@ -42,6 +41,13 @@ REPEAT = 600
 # while a prefix is on a bridge: a reboot must be able to tell whether a missing
 # prefix was still valid when the gateway went down (see FORGET_AFTER).
 SEEN_REFRESH = 21600
+# dnsmasq advertises a prefix for 86400 s (the lease time UniFi writes into the
+# range), counted from the last RA. The saved "last seen" can lag behind the
+# real last RA by up to SEEN_REFRESH, so that much is added: older than this, no
+# client can still hold an address from the prefix.
+FORGET_AFTER = 86400 + SEEN_REFRESH
+SAVE_RETRY = 300                # after a failed write of the state file
+RETRY_WINDOW = 30               # a failed RA send is retried this long, or until the next slot
 # A saved prefix that is missing from a bridge without any other global /64 is
 # not treated as gone right away, so one that returns unchanged is never
 # announced as deprecated. Two hold-offs apply: STARTUP_GRACE after a start (a
@@ -112,10 +118,26 @@ def read_addrs():
   return res
 
 
+def router_lifetime(nums):
+  """The router lifetime dnsmasq puts into its RAs (calc_interval and
+  calc_lifetime in radv.c). nums are the numbers of the ra-param line: the
+  interval, then the lifetime. The interval defaults to 600 and is limited to
+  4..1800 s. A lifetime that is not given is 3 times the interval, one below the
+  interval is raised to it (0 stays 0), and one above 9000 is cut to 9000."""
+  interval = nums[0] if nums else 0
+  interval = min(max(interval or 600, 4), 1800)
+  life = nums[1] if len(nums) >= 2 else 3 * interval
+  if 0 < life < interval:
+    life = interval
+  elif life > 9000:
+    life = 9000
+  return life
+
+
 def ra_params(iface):
   """Header values dnsmasq uses on iface, or None if dnsmasq sends no RA there."""
-  found = False
-  flags, prf, lifetime = 0, 0x00, None
+  found, pio = False, 0xC0
+  flags, prf, ra_nums = 0, 0x00, []
   for path in glob.glob(DNSMASQ_GLOB):
     try:
       with open(path) as f:
@@ -134,19 +156,19 @@ def ra_params(iface):
         flags = 0x00
       elif "ra-stateless" in tokens:
         flags = 0x40
-      else:                                   # slaac / plain DHCPv6 range
+      else:                                   # DHCPv6 range, SLAAC only with "slaac"
         flags = 0xC0
+        if "slaac" not in tokens:
+          pio = 0x80                              # L only: no A, no new address
     m = re.search(rf"^ra-param={re.escape(iface)},([^\n]*)$", txt, re.MULTILINE)
     if m:
       fields = [x for x in m.group(1).split(",") if not x.startswith("mtu:")]
       if fields and fields[0].lower() in PRF:
         prf = PRF[fields.pop(0).lower()]
-      nums = [int(x) for x in fields if x.isdigit()]
-      if len(nums) >= 2:
-        lifetime = nums[1]
+      ra_nums = [int(x) for x in fields if x.isdigit()]
   if not found:
     return None
-  return {"flags": flags | prf, "lifetime": 1800 if lifetime is None else lifetime}
+  return {"flags": flags | prf, "lifetime": router_lifetime(ra_nums), "pio": pio}
 
 
 def build_ra(params, mac, prefix, valid, preferred):
@@ -156,9 +178,11 @@ def build_ra(params, mac, prefix, valid, preferred):
   slla = struct.pack("!BB6s", 1, 1, mac)
   net = ipaddress.IPv6Network(prefix)
   # PIO (RFC 4861 4.6.2): type, len=4 (32 bytes), plen, L|A, valid, preferred,
-  # 4 reserved bytes, prefix
-  pio = struct.pack("!BBBBIII16s", 3, 4, net.prefixlen, 0xC0, valid, preferred, 0,
-                    net.network_address.packed)
+  # 4 reserved bytes, prefix. A is set only where dnsmasq advertises the prefix
+  # for SLAAC: an RA with A set would make hosts configure a new address in the
+  # old prefix (RFC 4862 5.5.3 d).
+  pio = struct.pack("!BBBBIII16s", 3, 4, net.prefixlen, params["pio"],
+                    valid, preferred, 0, net.network_address.packed)
   return hdr + slla + pio
 
 
@@ -176,8 +200,12 @@ def send_ra(iface, info, prefix, valid, dry_run=False, preferred=0, dest="ff02::
     log(f"{iface}: no link-local address, cannot send")
     return False
   pkt = build_ra(params, mac_of(iface), prefix, valid, preferred)
+  # what the packet carries, for the journal: RA header flags, router lifetime,
+  # and the A flag of the prefix option
+  detail = (f"flags 0x{params['flags']:02x}, router lifetime {params['lifetime']}, "
+            f"A {'set' if params['pio'] & 0x40 else 'clear'}")
   if dry_run:
-    log(f"{iface}: DRY-RUN RA from {info['ll']} to {dest}: {pkt.hex()}")
+    log(f"{iface}: DRY-RUN RA from {info['ll']} to {dest} ({detail}): {pkt.hex()}")
     return True
   s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
   try:
@@ -189,8 +217,7 @@ def send_ra(iface, info, prefix, valid, dry_run=False, preferred=0, dest="ff02::
   finally:
     s.close()
   log(f"{iface}: sent RA for {prefix} to {dest} (preferred {preferred}s, "
-      f"valid {valid}s, flags 0x{params['flags']:02x}, "
-      f"router lifetime {params['lifetime']})")
+      f"valid {valid}s, {detail})")
   return True
 
 
@@ -255,6 +282,7 @@ def run(dry_run):
   # at start unless something changed or that time is older than SEEN_REFRESH
   last_flush = max([e["seen"] for st in state.values() for e in st.values()] or [0])
   dirty = False
+  retry_at = 0                    # after a failed write of the state file: not before
   started = None                  # set once the clock can be trusted
   waiting_since = time.monotonic()
   absent = {}                     # (iface, prefix) -> when it was first missing
@@ -280,7 +308,7 @@ def run(dry_run):
         absent.pop((iface, p), None)
         alive = True
         e = st.get(p)
-        if e is None or e["lost"]:
+        if e is None or e["lost"] is not None:
           if e:
             log(f"{iface}: prefix {p} is back, stop deprecating")
           else:
@@ -316,13 +344,17 @@ def run(dry_run):
           changed = True
           continue
         if age >= due_at(e["sent"]):
+          # dnsmasq may be rewriting its configs right now: retry on every poll
+          # for RETRY_WINDOW seconds or until the next slot is due, then move on
           try:
-            send_ra(iface, info, p, int(DEPRECATE_WINDOW - age), dry_run)
+            ok = send_ra(iface, info, p, int(DEPRECATE_WINDOW - age), dry_run)
           except OSError as exc:
             log(f"{iface}: send failed for {p}: {exc}")
-          while due_at(e["sent"]) <= age:
-            e["sent"] += 1
-          changed = True
+            ok = False
+          if ok or age >= min(due_at(e["sent"] + 1), due_at(e["sent"]) + RETRY_WINDOW):
+            while due_at(e["sent"]) <= age:
+              e["sent"] += 1
+            changed = True
     # entries of a bridge that is gone: nobody is left to tell, so forget
     # them once their prefix cannot be on any client any more
     for iface in [i for i in state if i not in cur]:
@@ -339,14 +371,19 @@ def run(dry_run):
       for key in [k for k in absent if k[0] == iface]:
         del absent[key]
     dirty = dirty or changed
-    if not dry_run and ((dirty and now - last_flush > 30)
-                         or (alive and now - last_flush > SEEN_REFRESH)):
+    if not dry_run and now >= retry_at and ((dirty and now - last_flush > 30)
+                                           or (alive and now - last_flush > SEEN_REFRESH)):
       try:
         save_state(state)
         last_flush = now
         dirty = False
+        if retry_at:
+          log("state file is writable again")
+          retry_at = 0
       except OSError as exc:
-        log(f"cannot write state: {exc}")
+        if not retry_at:
+          log(f"cannot write state, retrying every {SAVE_RETRY}s: {exc}")
+        retry_at = now + SAVE_RETRY
     time.sleep(POLL)
 
 
@@ -362,6 +399,8 @@ def main():
                   help="destination for --test (a link-local unicast limits it to one host)")
   a = ap.parse_args()
   if a.test:
+    if not a.iface:
+      ap.error("--test needs --iface")
     info = read_addrs().get(a.iface)
     if not info:
       sys.exit(f"unknown or unwatched interface: {a.iface}")
