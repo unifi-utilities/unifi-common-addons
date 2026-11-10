@@ -57,6 +57,10 @@ Enables Containers, replacing Podman.
 
 Persist changes to your device's configurations and prevent them from being overwritten by UniFi.
 
+### pppoe-reconnect
+
+Reconnects PPPoE once a day, at a time that differs from gateway to gateway, for connections where the ISP forces a disconnect every 24 hours, such as o2 in Germany. Without configuration it reconnects `ppp0` between 03:00 and 04:00 local time of the gateway.
+
 ### ra-deprecate
 
 Deprecates the old delegated IPv6 prefix after a PPPoE reconnect or a gateway reboot, so LAN clients stop using addresses from it. Mainly useful on connections with a regular forced disconnect and a new prefix each time, such as 1&1 or Telefónica o2 in Germany.
