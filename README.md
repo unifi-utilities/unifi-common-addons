@@ -57,6 +57,10 @@ Enables Containers, replacing Podman.
 
 Persist changes to your device's configurations and prevent them from being overwritten by UniFi.
 
+### ra-deprecate
+
+Deprecates the old delegated IPv6 prefix after a PPPoE reconnect or a gateway reboot, so LAN clients stop using addresses from it. Mainly useful on connections with a regular forced disconnect and a new prefix each time, such as 1&1 or Telefónica o2 in Germany.
+
 ### soundcork
 
 Runs [SoundCork](https://github.com/deborahgu/soundcork) on a UniFi OS gateway for local Bose SoundTouch cloud endpoint emulation.

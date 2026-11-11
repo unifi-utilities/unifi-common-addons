@@ -1,0 +1,21 @@
+[Unit]
+Description=Deprecate vanished delegated IPv6 prefixes via Router Advertisement
+Documentation=https://github.com/unifi-utilities/unifi-common-addons/tree/main/ra-deprecate
+Wants=network-online.target
+After=network-online.target udapi-server.service
+
+[Service]
+ExecStart=/usr/bin/python3 /data/unifi-common-addons/ra-deprecate/scripts/ra-deprecate
+Restart=always
+RestartSec=10
+SyslogIdentifier=ra-deprecate
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+ProtectSystem=strict
+ReadWritePaths=/data/unifi-common-addons/ra-deprecate
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
