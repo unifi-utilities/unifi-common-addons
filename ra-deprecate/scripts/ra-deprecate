@@ -30,6 +30,7 @@ import time
 
 STATE_FILE = "/data/unifi-common-addons/ra-deprecate/state.json"
 DNSMASQ_GLOB = "/run/dnsmasq.dhcp.conf.d/*.conf"
+SYS_NET = "/sys/class/net"
 IFACE_RE = re.compile(r"^br[0-9]*$")
 POLL = 5
 DEPRECATE_WINDOW = 7200          # RFC 4862: valid lifetime can't go below 2 h
@@ -187,7 +188,13 @@ def build_ra(params, mac, prefix, valid, preferred):
 
 
 def mac_of(iface):
-  with open(f"/sys/class/net/{iface}/address") as f:
+  """MAC address of iface. The path is built from the name as it is listed in
+  /sys/class/net, never from the argument, so a name like "../x" cannot point
+  the open() anywhere else."""
+  name = next((n for n in os.listdir(SYS_NET) if n == iface), None)
+  if name is None or not IFACE_RE.fullmatch(name):
+    raise OSError(f"no such bridge: {iface!r}")
+  with open(os.path.join(SYS_NET, name, "address")) as f:
     return bytes.fromhex(f.read().strip().replace(":", ""))
 
 
@@ -401,6 +408,8 @@ def main():
   if a.test:
     if not a.iface:
       ap.error("--test needs --iface")
+    if not IFACE_RE.fullmatch(a.iface):
+      ap.error(f"--iface must be a bridge (br, br0, br10, ...), not {a.iface!r}")
     info = read_addrs().get(a.iface)
     if not info:
       sys.exit(f"unknown or unwatched interface: {a.iface}")

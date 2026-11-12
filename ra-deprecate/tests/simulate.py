@@ -383,4 +383,39 @@ ok = (len(calls) == 2 and json.load(open(m.STATE_FILE))["br0"][P]["seen"] == 1.0
       and not os.path.exists(m.STATE_FILE + ".tmp"))
 results.append(report(ok, "J save_state fsyncs file and directory"))
 
+# --- mac_of only opens /sys/class/net/<bridge>/address for a listed bridge
+m = load()
+d = tempfile.mkdtemp()
+for name, mac in (("br0", "aa:bb:cc:dd:ee:ff"), ("eth0", "11:22:33:44:55:66")):
+  os.mkdir(os.path.join(d, name))
+  with open(os.path.join(d, name, "address"), "w") as f:
+    f.write(mac + "\n")
+m.SYS_NET = d
+results.append(report(m.mac_of("br0") == bytes.fromhex("aabbccddeeff"),
+                      "Z mac_of reads the MAC of a listed bridge"))
+for bad in ("eth0", "br9", "br0/../eth0", "../" + os.path.basename(d) + "/br0", "br0\n"):
+  try:
+    m.mac_of(bad)
+    rejected = False
+  except OSError:
+    rejected = True
+  results.append(report(rejected, "Z2 mac_of rejects %r" % bad))
+
+# --- --test refuses an --iface that is not a bridge name, before reading anything
+for bad in ("../../etc", "eth0", "br0/x"):
+  m = load()
+  m.read_addrs = lambda: (_ for _ in ()).throw(AssertionError("read_addrs called"))
+  argv, stderr = sys.argv, sys.stderr
+  sys.argv = ["ra-deprecate", "--test", P, "--iface", bad, "--dry-run"]
+  sys.stderr = open(os.devnull, "w")
+  try:
+    m.main()
+    code = None
+  except SystemExit as exc:
+    code = exc.code
+  finally:
+    sys.stderr.close()
+    sys.argv, sys.stderr = argv, stderr
+  results.append(report(code == 2, "Z3 --test --iface %r is a usage error" % bad))
+
 sys.exit(0 if all(results) else 1)
