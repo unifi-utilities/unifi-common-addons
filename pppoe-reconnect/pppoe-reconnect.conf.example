@@ -1,0 +1,30 @@
+# pppoe-reconnect.conf
+#
+# Optional. Without this file the addon uses the defaults below. To change
+# them, copy this file to /data/unifi-common-addons/pppoe-reconnect/pppoe-reconnect.conf
+
+# Time window for the daily PPPoE reconnect: HH:MM-HH:MM, 24 hours, in the local
+# time of the gateway, that is the time zone set on it ("timedatectl"), not UTC.
+# A window that ends before it starts runs over midnight (23:30-00:30).
+#
+# The exact minute and second inside the window are derived from the serial
+# number of the gateway: the same time after every boot, and a different one on
+# every gateway with a high probability, so that several gateways do not
+# reconnect together.
+RECONNECT_WINDOW="03:00-04:00"
+
+# Optional text that is mixed into the calculation. Set it, or change it, if two
+# of your gateways land on nearly the same time.
+RECONNECT_SEED=""
+
+# The PPPoE interfaces to reconnect, separated by spaces, as UniFi OS names them
+# ("ls /var/run/ppp*.pid" lists them). Default ppp0, the first PPPoE WAN. Every
+# interface gets its own time inside the window. "all" reconnects every pppd on
+# the gateway at one time, with one "killall -HUP pppd"; it must stand alone
+# and needs /usr/bin/killall.
+RECONNECT_INTERFACES="ppp0"
+
+# Optional, per interface: a window or a seed of its own, replacing the general
+# one for that interface only. The name after the underscore is the interface.
+#RECONNECT_WINDOW_ppp1="04:00-05:00"
+#RECONNECT_SEED_ppp1=""
