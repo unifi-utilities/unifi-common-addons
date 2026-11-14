@@ -1,0 +1,1267 @@
+#!/bin/sh
+# shellcheck shell=dash
+# Uses 'local', which is not POSIX. dash, busybox ash, and bash support it.
+# att-wpa-supplicant: AT&T fiber 802.1X (EAP-TLS) supplicant for UniFi OS.
+# Usage and design: README.md. Run "att-wpa-supplicant help".
+set -eu
+
+PROG=att-wpa-supplicant
+# ATT_WPA_ROOT prefixes every absolute path. Only the tests set it.
+# On a gateway it is empty.
+R="${ATT_WPA_ROOT:-}"
+PROD_DATA="/data/unifi-common-addons/$PROG"
+DATA="$R$PROD_DATA"
+INST="$DATA/instances"
+BUNDLES="$DATA/bundles"
+ONBOOT="$R/data/on_boot.d"
+ONBOOT_NAME="01-$PROG.sh"
+UNITS="$R/etc/systemd/system"
+PROC="$R/proc"
+SYSNET="$R/sys/class/net"
+OS_RELEASE="$R/etc/os-release"
+INSTANCE_UNIT="$PROG@.service"
+# The runtime: these packages from the bundle, unpacked. The firmware
+# supplies every other library that they need.
+RUNTIME_PKGS="wpasupplicant libpcsclite1"
+# The runtime of a bundle is <bundle>/root. fetch, import-bundle, and
+# install unpack it when the bundle arrives. A unit start only reads it.
+# It is on /data because UniFi OS mounts /run noexec.
+LOCKFILE="$R/run/$PROG.bundle.lock"
+OWNER_UID="${ATT_WPA_OWNER_UID:-0}"
+TAKEOVER_TIMEOUT="${ATT_WPA_TAKEOVER_TIMEOUT:-120}"
+POLL="${ATT_WPA_POLL:-5}"
+STOP_WAIT="${ATT_WPA_STOP_WAIT:-10}"
+LOCK_WAIT="${ATT_WPA_LOCK_WAIT:-60}"
+LOAD_TIMEOUT="${ATT_WPA_LOAD_TIMEOUT:-10}"
+
+log() {
+    [ "${log_quiet:-0}" -eq 0 ] || return 0
+    # Under systemd with stderr on the journal (JOURNAL_STREAM names the
+    # device and inode of that stream), the journal has the line once the
+    # write succeeds. logger would add it a second time. If the write
+    # fails, logger still records it. fd 3 keeps stderr for stat, whose
+    # own errors go to /dev/null.
+    if printf '%s: %s\n' "$PROG" "$*" >&2 && [ -n "${JOURNAL_STREAM:-}" ] &&
+        [ "$(stat -L -c '%d:%i' /proc/self/fd/3 3>&2 2>/dev/null)" = "$JOURNAL_STREAM" ]; then
+        return 0
+    fi
+    logger -t "$PROG" -- "$*" 2>/dev/null || true
+}
+die() { log "ERROR: $*"; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: att-wpa-supplicant <command> [args]
+
+Setup
+  install                         Copy the addon to /data. Unpack the runtime of
+                                  bundles that have none. Install the boot entry
+                                  and the unit. Starts nothing.
+  add-instance <iface> <dir>      Import the extracted certificates and
+                                  wpa_supplicant.conf (mfg_dat_decode output)
+                                  for one WAN interface.
+  fetch                           Download the bundle (the supplicant packages)
+                                  for this release. Needs internet access.
+  import-bundle <file.tgz>...     Install one or more bundles built with
+                                  tools/build-bundle.sh. Stops at the first failure.
+  activate <iface> [--takeover]   Start the supplicant on <iface>. --takeover
+                                  stops and quarantines known legacy setups. It
+                                  restores them if authorization fails.
+  deactivate <iface> [--restore-legacy]
+                                  Stop the supplicant on <iface>. --restore-legacy
+                                  restores the legacy setup that a takeover replaced.
+  uninstall [--restore-legacy]    Remove the units and the boot entry. Keep /data.
+                                  After a takeover, needs --restore-legacy.
+
+Read-only
+  validate [iface]                Check the files, and test that the runtime of
+                                  the bundle loads. Works before activation.
+                                  Changes nothing.
+  plan <iface>                    Show what activate would do: the legacy setup
+                                  that it would replace, and what blocks it. Tests
+                                  that the runtime loads. Changes nothing.
+  check [iface]                   Show the live 802.1X state. Exit status 0 only
+                                  if authorized. INFO lines show the WAN address
+                                  and route, and list the bundles on the gateway.
+                                  They do not change the exit status.
+
+Internal (used by the unit and the boot entry): boot, precheck, run.
+EOF
+}
+
+# ---------- small helpers ----------
+
+valid_iface() {
+    case "$1" in '' | . | .. | *[!A-Za-z0-9._-]*) return 1 ;; esac
+    [ "${#1}" -le 15 ]
+}
+need_iface() {
+    valid_iface "${1:-}" || die "invalid interface name: '${1:-}'"
+}
+inst_dir() { printf '%s/%s' "$INST" "$1"; }
+instances() {
+    local d n
+    [ -d "$INST" ] || return 0
+    for d in "$INST"/*/; do
+        [ -d "$d" ] || continue
+        n=${d%/}
+        n=${n##*/}
+        valid_iface "$n" && printf '%s\n' "$n"
+    done
+}
+is_active_flag() { [ -e "$(inst_dir "$1")/active" ]; }
+unit_of() { printf '%s@%s.service' "$PROG" "$1"; }
+# One-word unit states. Empty output (a query error) becomes "unknown".
+enabled_state() {
+    local st
+    st=$(systemctl is-enabled "$1" 2>/dev/null || true)
+    printf '%s' "${st:-unknown}" | head -n 1
+}
+active_state() {
+    local st
+    st=$(systemctl is-active "$1" 2>/dev/null || true)
+    printf '%s' "${st:-unknown}" | head -n 1
+}
+
+# Word-boundary match of an interface name in a file or text.
+iface_re() {
+    printf '(^|[^A-Za-z0-9_.-]|-i)%s([^A-Za-z0-9_.-]|$)' "$(printf '%s' "$1" | sed 's/\./\\./g')"
+}
+
+mode_of() { stat -c '%a' "$1"; }
+uid_of() { stat -c '%u' "$1"; }
+# True if the path is owner-only: files 600/400, directories 700/500.
+private() {
+    local m
+    m=$(mode_of "$1")
+    if [ -d "$1" ]; then
+        case "$m" in 700 | 500) return 0 ;; esac
+    else
+        case "$m" in 600 | 400) return 0 ;; esac
+    fi
+    return 1
+}
+
+codename() { sed -n 's/^VERSION_CODENAME=//p' "$OS_RELEASE" | tr -d '"' | head -n 1; }
+arch() { dpkg --print-architecture; }
+bundle_dir() { printf '%s/%s-%s' "$BUNDLES" "$(codename)" "$(arch)"; }
+
+# ---------- validate ----------
+
+# Prints each problem. Returns 1 if it found a problem, else 0 (for set -e).
+validate_instance() {
+    local i d bad conf f want_ctrl k v
+    i=$1
+    d=$(inst_dir "$i")
+    bad=0
+    if [ ! -d "$d" ]; then
+        log "$i: no instance directory $d"
+        return 1
+    fi
+    conf="$d/wpa_supplicant.conf"
+    for f in "$d" "$d/certs" "$conf"; do
+        if [ ! -e "$f" ]; then
+            log "$i: missing $f"
+            bad=1
+            continue
+        fi
+        private "$f" || { log "$i: $f must not be accessible to group/other (is $(mode_of "$f"))"; bad=1; }
+        [ "$(uid_of "$f")" = "$OWNER_UID" ] || { log "$i: $f must be owned by uid $OWNER_UID"; bad=1; }
+    done
+    [ -f "$conf" ] || return 1
+    want_ctrl="ctrl_interface=/run/$PROG/$i"
+    grep -qx "$want_ctrl" "$conf" || { log "$i: conf must contain the line: $want_ctrl"; bad=1; }
+    grep -Eq '^[[:space:]]*key_mgmt=IEEE8021X[[:space:]]*$' "$conf" || { log "$i: conf lacks key_mgmt=IEEE8021X"; bad=1; }
+    grep -Eq '^[[:space:]]*eap=TLS[[:space:]]*$' "$conf" || { log "$i: conf lacks eap=TLS"; bad=1; }
+    grep -Eq '^[[:space:]]*identity=' "$conf" || { log "$i: conf lacks identity"; bad=1; }
+    for k in ca_cert client_cert private_key; do
+        v=$(sed -n "s/^[[:space:]]*$k=\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*\$/\1/p" "$conf" | head -n 1)
+        case "$v" in
+            "$PROD_DATA/instances/$i/"*) ;;
+            *)
+                log "$i: $k must be an absolute path under $PROD_DATA/instances/$i/ (is '$v')"
+                bad=1
+                continue
+                ;;
+        esac
+        case "$v" in *..*) log "$i: $k must not contain '..'"; bad=1; continue ;; esac
+        if [ ! -f "$R$v" ]; then
+            log "$i: $k file missing: $v"
+            bad=1
+        elif [ "$(uid_of "$R$v")" != "$OWNER_UID" ]; then
+            log "$i: $v must be owned by uid $OWNER_UID"
+            bad=1
+        elif ! private "$R$v"; then
+            log "$i: $v must not be accessible to group/other (is $(mode_of "$R$v"))"
+            bad=1
+        fi
+    done
+    [ -e "$SYSNET/$i" ] || log "$i: WARNING interface not present now (fine if it appears later)"
+    return "$bad"
+}
+
+# The same choice and load check as the unit, plan, and activate.
+validate_platform() {
+    if runtime_select; then
+        log "supplicant: $rt_version from bundle $rt_from loads on this firmware"
+        return 0
+    fi
+    log "supplicant: the runtime failed its check (above). Run fetch or import-bundle"
+    return 1
+}
+
+cmd_validate() {
+    local rc n i
+    rc=0
+    if [ -d "$DATA" ]; then
+        if [ "$(uid_of "$DATA")" != "$OWNER_UID" ] || [ -n "$(find "$DATA" -maxdepth 0 -perm /022)" ]; then
+            log "$DATA must be owned by uid $OWNER_UID and not writable by group/other"
+            rc=1
+        fi
+    fi
+    if [ $# -ge 1 ]; then
+        need_iface "$1"
+        validate_instance "$1" || rc=1
+    else
+        n=0
+        for i in $(instances); do
+            n=$((n + 1))
+            validate_instance "$i" || rc=1
+        done
+        [ "$n" -gt 0 ] || log "no instances (run add-instance)"
+    fi
+    validate_platform || rc=1
+    [ "$rc" -eq 0 ] && log "validate: OK"
+    return "$rc"
+}
+
+# ---------- add-instance ----------
+
+pick_one() {
+    # $1 = dir, $2.. = glob patterns, most specific first. The first pattern
+    # that matches decides. One match is returned. More than one is an error.
+    local dir found count pat f
+    dir=$1
+    shift
+    for pat in "$@"; do
+        found=''
+        count=0
+        for f in "$dir"/$pat; do
+            [ -f "$f" ] || continue
+            found=$f
+            count=$((count + 1))
+        done
+        [ "$count" -eq 0 ] && continue
+        [ "$count" -eq 1 ] || return 1
+        printf '%s' "$found"
+        return 0
+    done
+    return 1
+}
+
+cmd_add_instance() {
+    local i src d ca cl pk sc id_line old_umask c tmp
+    [ $# -eq 2 ] || die "usage: add-instance <iface> <dir-with-extracted-files>"
+    i=$1
+    src=$2
+    need_iface "$i"
+    [ -d "$src" ] || die "not a directory: $src"
+    d=$(inst_dir "$i")
+    [ ! -e "$d/wpa_supplicant.conf" ] || die "$i already has a config. Deactivate and remove $d first"
+    ca=$(pick_one "$src" 'CA_*.pem' 'CA.pem') || die "need exactly one CA_*.pem or CA.pem in $src"
+    cl=$(pick_one "$src" 'Client_*.pem' 'Client.pem') || die "need exactly one Client_*.pem or Client.pem in $src"
+    pk=$(pick_one "$src" 'PrivateKey_PKCS1_*.pem' 'PrivateKey*.pem') || die "need exactly one PrivateKey*.pem in $src"
+    sc=$(pick_one "$src" 'wpa_supplicant.conf') || die "need wpa_supplicant.conf in $src (for the identity)"
+    # A trailing "# comment" is allowed and dropped.
+    id_line=$(grep -E '^[[:space:]]*identity="[^"]*"[[:space:]]*(#.*)?$' "$sc" | head -n 1 |
+        sed 's/^[[:space:]]*//;s/\("[^"]*"\).*/\1/')
+    [ -n "$id_line" ] || die "no identity=\"...\" line in $sc"
+
+    old_umask=$(umask)
+    umask 077
+    mkdir -p "$d/certs"
+    chmod 0700 "$d" "$d/certs"
+    install -m 0600 "$ca" "$d/certs/CA.pem"
+    install -m 0600 "$cl" "$d/certs/Client.pem"
+    install -m 0600 "$pk" "$d/certs/PrivateKey.pem"
+    c="$PROD_DATA/instances/$i/certs"
+    tmp="$d/.wpa_supplicant.conf.tmp"
+    cat >"$tmp" <<EOF
+# Written by $PROG add-instance. See README.md before editing.
+ctrl_interface=/run/$PROG/$i
+eapol_version=1
+ap_scan=0
+fast_reauth=1
+# AT&T certificates are SHA-1 signed. OpenSSL 3 rejects them at its default
+# security level. Keep this line global. wpa_supplicant 2.10 applies the
+# network-block form too late, after it rejects the certificate.
+openssl_ciphers=DEFAULT@SECLEVEL=0
+network={
+	ca_cert="$c/CA.pem"
+	client_cert="$c/Client.pem"
+	private_key="$c/PrivateKey.pem"
+	eap=TLS
+	eapol_flags=0
+	$id_line
+	key_mgmt=IEEE8021X
+	phase1="allow_canned_success=1"
+}
+EOF
+    chmod 0600 "$tmp"
+    mv "$tmp" "$d/wpa_supplicant.conf"
+    umask "$old_umask"
+    log "$i: instance created at $d"
+    validate_instance "$i" || die "$i: validation failed after import"
+}
+
+# ---------- bundles ----------
+
+# Paths of the .deb files in bundle $1 for package $2, one per line.
+bundle_debs() {
+    local f
+    for f in "$1"/*.deb; do
+        [ -f "$f" ] || continue
+        [ "$(dpkg-deb -f "$f" Package 2>/dev/null)" != "$2" ] || printf '%s\n' "$f"
+    done
+}
+
+# Checks bundle $1. $2 is its name (codename-arch); the default is the
+# directory name without .prev. Logs the first problem and returns 1.
+bundle_ok() {
+    local b name f n mc ma p c
+    b=$1
+    name=${2:-${b##*/}}
+    name=${name%.prev}
+    [ -f "$b/SHA256SUMS" ] || { log "bundle $b has no SHA256SUMS"; return 1; }
+    [ -f "$b/MANIFEST" ] || { log "bundle $b has no MANIFEST"; return 1; }
+    (cd "$b" && sha256sum --quiet -c SHA256SUMS) >/dev/null 2>&1 || { log "bundle $b failed its SHA256SUMS check"; return 1; }
+    for f in "$b"/*.deb; do
+        n=${f##*/}
+        grep -q "  $n\$" "$b/SHA256SUMS" || { log "bundle $b: $n is not listed in SHA256SUMS"; return 1; }
+    done
+    mc=$(sed -n 's/^codename=//p' "$b/MANIFEST")
+    ma=$(sed -n 's/^arch=//p' "$b/MANIFEST")
+    [ "$name" = "$mc-$ma" ] || { log "bundle $b: MANIFEST says $mc-$ma, not $name"; return 1; }
+    for p in $RUNTIME_PKGS; do
+        c=$(bundle_debs "$b" "$p" | wc -l | tr -d ' ')
+        [ "$c" -eq 1 ] || { log "bundle $b: needs one $p package, has $c"; return 1; }
+    done
+}
+
+# Write SHA256SUMS and MANIFEST for the .debs in $1.
+seal_bundle() {
+    local b c a src f
+    b=$1
+    c=$2
+    a=$3
+    src=$4
+    (cd "$b" && sha256sum -- *.deb >SHA256SUMS)
+    {
+        printf 'codename=%s\narch=%s\nbuilt=%s\nsource=%s\n' "$c" "$a" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$src"
+        for f in "$b"/*.deb; do
+            printf 'pkg=%s %s\n' "$(dpkg-deb -f "$f" Package)" "$(dpkg-deb -f "$f" Version)"
+        done
+    } >"$b/MANIFEST"
+}
+
+# After a swap that was cut short (power loss between the two renames), only
+# <bundle>.prev exists. Put it back. Call this only with the lock held
+# exclusive.
+recover_bundle() {
+    [ ! -e "$1" ] && [ -d "$1.prev" ] || return 0
+    mv "$1.prev" "$1" || die "bundle ${1##*/}: cannot restore the previous bundle"
+    log "bundle ${1##*/}: an earlier swap did not finish. Restored the previous bundle"
+}
+
+# Replaces a bundle and keeps the one before it as <bundle>.prev. It never
+# deletes the bundle in use. It holds the lock exclusive, so no unit start
+# checks a bundle while it changes. A supplicant that runs from a tree that
+# the swap deletes keeps running: its open files stay until it exits.
+swap_bundle() {
+    local new dest
+    new=$1
+    dest=$2
+    lock_take -x || die "a unit start or another fetch or import-bundle holds the bundle lock (waited ${LOCK_WAIT}s)"
+    recover_bundle "$dest"
+    # The new tree reaches the flash before the renames publish it.
+    sync 2>/dev/null || true
+    if [ -e "$dest" ] && in_use_fails "$dest"; then
+        # A start uses .prev. Keep it: replace the bundle that fails. A
+        # cut-short swap then leaves .prev, the runtime that starts.
+        log "bundle ${dest##*/} fails its load check. Replacing it; ${dest##*/}.prev stays"
+        rm -rf -- "${dest:?}" || die "cannot remove ${dest##*/}"
+    elif [ -e "$dest" ]; then
+        rm -rf -- "${dest:?}.prev" || die "cannot remove ${dest##*/}.prev"
+        mv "$dest" "$dest.prev" || die "cannot keep ${dest##*/} as ${dest##*/}.prev"
+    fi
+    mv "$new" "$dest" || die "cannot install ${dest##*/}. The previous bundle is ${dest##*/}.prev"
+    sync 2>/dev/null || true
+    lock_drop
+}
+
+# True if bundle $1 is for this release, $1.prev exists, and the runtime
+# of $1 fails the load check: a start then uses .prev. Logs nothing.
+in_use_fails() {
+    local rc
+    [ "${1##*/}" = "$(codename)-$(arch)" ] && [ -d "$1.prev/root" ] || return 1
+    rc=1
+    log_quiet=1
+    runtime_check "$1/root" || rc=0
+    log_quiet=0
+    return "$rc"
+}
+
+cmd_fetch() {
+    local c a
+    c=$(codename)
+    a=$(arch)
+    [ -n "$c" ] || die "cannot read VERSION_CODENAME from $OS_RELEASE"
+    mkdir -p "$BUNDLES"
+    chmod 0700 "$DATA" "$BUNDLES" 2>/dev/null || true
+    tmp=$(mktemp -d "$BUNDLES/.fetch.XXXXXX")
+    trap 'rm -rf -- "${tmp:?}"' EXIT
+    apt-get update -qq || die "apt-get update failed (no internet?). Existing bundle kept"
+    # shellcheck disable=SC2086 # package names are single words
+    (cd "$tmp" && apt-get download -qq $RUNTIME_PKGS) || die "download failed. Existing bundle kept"
+    seal_bundle "$tmp" "$c" "$a" "apt-get download on $(hostname 2>/dev/null || echo gateway)"
+    bundle_ok "$tmp" "$c-$a" || die "the new bundle failed its check. Existing bundle kept"
+    bundle_unpack "$tmp" "$tmp/root" "$c-$a" || die "the runtime of the new bundle failed its check (above). Existing bundle kept"
+    swap_bundle "$tmp" "$BUNDLES/$c-$a"
+    trap - EXIT
+    log "fetch: bundle $c-$a ready: $(sed -n 's/^pkg=//p' "$BUNDLES/$c-$a/MANIFEST" | tr '\n' ' ')"
+}
+
+import_one() {
+    local b name
+    mkdir -p "$BUNDLES"
+    tmp=$(mktemp -d "$BUNDLES/.import.XXXXXX")
+    trap 'rm -rf -- "${tmp:?}"' EXIT
+    tar -xzf "$1" -C "$tmp" --no-same-owner || die "cannot extract $1"
+    set -- "$tmp"/*/
+    [ $# -eq 1 ] && [ -d "$1" ] || die "bundle archive must contain exactly one top-level directory"
+    b=${1%/}
+    name=${b##*/}
+    bundle_ok "$b" "$name" || die "bundle $name failed its check (above)"
+    # Only the gateway unpacks a runtime. A tree in the archive is not used.
+    [ ! -e "$b/root" ] && [ ! -e "$b/.root.new" ] || die "bundle $name: the archive holds a root directory. Existing bundle kept"
+    chmod -R go-rwx "$b"
+    bundle_unpack "$b" "$b/root" "$name" || die "bundle $name: the runtime failed its check (above). Existing bundle kept"
+    swap_bundle "$b" "$BUNDLES/$name"
+    trap - EXIT
+    rm -rf -- "${tmp:?}"
+    log "import-bundle: $name installed"
+    [ "$name" = "$(codename)-$(arch)" ] || log "note: $name is not this gateway's release ($(codename)-$(arch)). Kept for a future firmware. Its load check runs there, at each start"
+}
+
+# Imports each archive in turn. Stops at the first failure. Bundles that were
+# imported before it stay. With more than one archive, each import runs in a
+# new process of this script, so that this function can name the file that
+# failed. Not a subshell: under "||", a subshell runs without set -e. The
+# EXIT trap in import_one removes that archive's temp dir in both cases.
+cmd_import_bundle() {
+    local f
+    [ $# -ge 1 ] || die "usage: import-bundle <file.tgz>..."
+    for f; do
+        [ -f "$f" ] || die "usage: import-bundle <file.tgz>... ($f is not a file)"
+    done
+    if [ $# -eq 1 ]; then
+        import_one "$1"
+        return
+    fi
+    for f; do
+        "$SELF_DIR/$PROG" import-bundle "$f" || die "import-bundle: $f failed (above). Archives before it stay imported; archives after it were not imported"
+    done
+}
+
+# ---------- runtime ----------
+
+# Take the bundle lock on fd 9. $1: -s (shared, for a load check) or -x
+# (exclusive, for a bundle swap or an unpack by install). Load checks do
+# not block each other. The
+# kernel releases the lock when fd 9 closes or the process exits, so a
+# crash cannot leave a stale lock. Returns 1 after LOCK_WAIT seconds.
+lock_take() {
+    mkdir -p "${LOCKFILE%/*}"
+    command -v flock >/dev/null 2>&1 || die "flock(1) not found (util-linux)"
+    # "command" makes a failed open return 1; a bare exec would end dash.
+    command exec 9>>"$LOCKFILE" || return 1
+    flock "$1" -w "$LOCK_WAIT" 9
+}
+lock_drop() { exec 9>&-; }
+
+# Set rt_bin, rt_cli, and rt_libs (for LD_LIBRARY_PATH) for the unpacked
+# tree $1. bullseye and bookworm use sbin/, trixie uses usr/sbin/.
+# Returns 1 if a binary is missing or the library search failed
+# (rt_libs_ok=0: the tree could not be read, which says nothing about the
+# packages).
+runtime_paths() {
+    local d
+    rt_bin=''
+    rt_cli=''
+    rt_libs=''
+    rt_libs_ok=1
+    # No tree is "no runtime", not a read error.
+    [ -d "$1" ] || return 1
+    for d in "$1/sbin" "$1/usr/sbin"; do
+        if [ -z "$rt_bin" ] && [ -x "$d/wpa_supplicant" ]; then rt_bin="$d/wpa_supplicant"; fi
+        if [ -z "$rt_cli" ] && [ -x "$d/wpa_cli" ]; then rt_cli="$d/wpa_cli"; fi
+    done
+    if ! rt_libs=$(find "$1" -name 'lib*.so*' ! -type d -printf '%h\n' 2>/dev/null) ||
+        ! rt_libs=$(printf '%s\n' "$rt_libs" | sort -u); then
+        rt_libs_ok=0
+        rt_libs=''
+        return 1
+    fi
+    # Join the lines with ":". The tree check rejects names with white
+    # space, so a line is one directory.
+    rt_libs=$(printf '%s\n' "$rt_libs" | paste -sd: -) || { rt_libs_ok=0; rt_libs=''; return 1; }
+    rt_libs=${rt_libs#:}
+    rt_libs=${rt_libs%:}
+    [ -n "$rt_bin" ] && [ -n "$rt_cli" ]
+}
+
+# True if every LD_LIBRARY_PATH element is a directory inside tree $1. An
+# empty element would make the loader search the current directory.
+libs_inside() {
+    local e rest
+    [ -n "$rt_libs" ] || return 1
+    rest=$rt_libs:
+    while [ -n "$rest" ]; do
+        e=${rest%%:*}
+        rest=${rest#*:}
+        case "$e" in "$1"/*) ;; *) return 1 ;; esac
+        [ -d "$e" ] || return 1
+    done
+}
+
+# Run a load-check command with a time limit, if timeout(1) exists.
+limited() {
+    # timeout(1) is in coreutils, which every Debian system has. -k sends
+    # KILL 5 s after TERM, for a process that ignores TERM.
+    timeout -k 5 "$LOAD_TIMEOUT" "$@"
+}
+
+# First line of the version output of the runtime in $1.
+runtime_version() {
+    runtime_paths "$1" || return 1
+    LD_LIBRARY_PATH=$rt_libs limited "$rt_bin" -v 2>/dev/null | head -n 1
+}
+
+# The loader's error line from output $1, else its last line.
+loader_line() {
+    printf '%s\n' "$1" | grep -m 1 'error while loading' || printf '%s\n' "$1" | tail -n 1
+}
+
+# The tree check of the unpacked tree $1: both programs, library
+# directories inside the tree, and every entry owned by OWNER_UID and not
+# writable by group or other. Reads only.
+runtime_tree_ok() {
+    local bad noexec f
+    if ! runtime_paths "$1"; then
+        if [ "$rt_libs_ok" -ne 1 ]; then
+            log "runtime: cannot read the tree $1"
+            return 1
+        fi
+        # A file that exists but cannot run points to a noexec mount.
+        noexec=0
+        for f in "$1"/sbin/wpa_supplicant "$1"/usr/sbin/wpa_supplicant "$1"/sbin/wpa_cli "$1"/usr/sbin/wpa_cli; do
+            if [ -f "$f" ] && [ ! -x "$f" ]; then noexec=1; fi
+        done
+        if [ "$noexec" -eq 1 ]; then
+            log "runtime: cannot execute files in $1. Is $(df -P "$1" 2>/dev/null | awk 'NR == 2 {print $6}') mounted noexec?"
+        else
+            log "runtime: the packages hold no wpa_supplicant or no wpa_cli"
+        fi
+        return 1
+    fi
+    libs_inside "$1" || { log "runtime: no usable library directory in the packages ('$rt_libs')"; return 1; }
+    # runtime_paths joins the library directories line by line, so a name
+    # must not hold white space. If find fails, the check fails: it never
+    # passes a tree it could not read.
+    if ! bad=$(find "$1" \( -name '*[[:space:][:cntrl:]]*' -o -lname '*[[:space:][:cntrl:]]*' \) -print -quit 2>/dev/null); then
+        log "runtime: cannot read the tree $1"
+        return 1
+    fi
+    if [ -n "$bad" ]; then
+        log "runtime: a name in the packages has white space: $bad"
+        return 1
+    fi
+    if ! bad=$(find "$1" ! -type l \( -perm /022 -o ! -user "$OWNER_UID" \) -print -quit 2>/dev/null); then
+        log "runtime: cannot read the tree $1"
+        return 1
+    fi
+    if [ -n "$bad" ]; then
+        log "runtime: $bad is writable by group or other, or not owned by uid $OWNER_UID"
+        return 1
+    fi
+}
+
+# The load check of the unpacked tree $1: the tree check, then
+# wpa_supplicant -v and -h and wpa_cli -v, each with a time limit. The
+# Debian binaries are linked with BIND_NOW, so a missing library or symbol
+# fails here, before main. Reads only. Sets rt_version.
+runtime_check() {
+    local out rc
+    rt_version=''
+    command -v timeout >/dev/null 2>&1 || { log "runtime: timeout(1) not found (coreutils)"; return 1; }
+    runtime_tree_ok "$1" || return 1
+    rc=0
+    out=$(LD_LIBRARY_PATH=$rt_libs limited "$rt_bin" -v 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "runtime: wpa_supplicant does not start: $(loader_line "$out")"
+        return 1
+    fi
+    rt_version=$(printf '%s\n' "$out" | head -n 1)
+    # The text of -h counts, and its exit status only when timeout(1)
+    # reports a problem (wpa_supplicant -h exits 0 on Debian, 255 on some
+    # builds).
+    rc=0
+    out=$(LD_LIBRARY_PATH=$rt_libs limited "$rt_bin" -h 2>&1) || rc=$?
+    case "$rc" in
+        0 | 255)
+            # A normal exit. No wired line: a build without the driver.
+            if ! printf '%s\n' "$out" | grep -Eq '^[[:space:]]+wired[[:space:]]'; then
+                log "runtime: wpa_supplicant has no wired driver"
+                return 1
+            fi
+            ;;
+        *)
+            # A time-out, a crash, or a loader error, even after it printed
+            # the drivers.
+            log "runtime: wpa_supplicant -h failed (exit $rc): $(loader_line "$out")"
+            return 1
+            ;;
+    esac
+    rc=0
+    out=$(LD_LIBRARY_PATH=$rt_libs limited "$rt_cli" -v 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "runtime: wpa_cli does not start: $(loader_line "$out")"
+        return 1
+    fi
+}
+
+# Unpack the runtime packages of bundle $1 into the new directory $2. $3 is
+# the bundle name (codename-arch). Then check the tree. For this gateway's
+# release, run the load check too. A bundle for another release cannot run
+# here: precheck checks it after a firmware update. Returns 1 on any
+# failure; the caller deletes $2 (a temp directory, or .root.new).
+bundle_unpack() {
+    local p f a
+    mkdir -m 0700 "$2" || { log "bundle $3: cannot create $2"; return 1; }
+    for p in $RUNTIME_PKGS; do
+        f=$(bundle_debs "$1" "$p")
+        a=$(dpkg-deb -f "$f" Architecture) || a=unknown
+        case "$a" in
+            "${3##*-}" | all) ;;
+            *) log "bundle $3: $p is for $a, not ${3##*-}"; return 1 ;;
+        esac
+        dpkg-deb -x "$f" "$2" || { log "bundle $3: cannot unpack $p"; return 1; }
+    done
+    if [ "$3" = "$(codename)-$(arch)" ]; then
+        runtime_check "$2"
+    else
+        runtime_tree_ok "$2"
+    fi
+}
+
+# Choose the runtime for this release: <bundle>/root if it passes the load
+# check, else <bundle>.prev/root. Reads only. Holds the bundle lock shared
+# during the checks, so that no swap renames or deletes a tree under them.
+# Sets rt_from (the bundle name), rt_slot (cur or prev), and rt_version.
+# Returns 1 if no runtime passes.
+runtime_select() {
+    local b cand
+    b=$(bundle_dir)
+    rt_from=''
+    rt_slot=''
+    if ! lock_take -s; then
+        log "runtime: fetch, import-bundle, or install holds the bundle lock (waited ${LOCK_WAIT}s)"
+        lock_drop
+        return 1
+    fi
+    for cand in "$b" "$b.prev"; do
+        [ -d "$cand" ] || continue
+        if [ ! -d "$cand/root" ]; then
+            log "runtime: bundle ${cand##*/} has no unpacked runtime. Run fetch or import-bundle"
+            continue
+        fi
+        runtime_check "$cand/root" || continue
+        lock_drop
+        rt_from=${cand##*/}
+        if [ "$cand" = "$b" ]; then
+            rt_slot=cur
+        else
+            rt_slot=prev
+            if [ -d "$b" ]; then
+                log "WARN runtime: using the previous bundle $rt_from, because ${b##*/} failed (above)"
+            else
+                log "WARN runtime: using the previous bundle $rt_from, because ${b##*/} is missing (a swap that did not finish)"
+            fi
+        fi
+        return 0
+    done
+    lock_drop
+    [ -d "$b" ] || [ -d "$b.prev" ] || log "runtime: no bundle at $b (run fetch or import-bundle)"
+    return 1
+}
+
+# The packages in the MANIFEST of bundle $1, with versions, on one line.
+manifest_pkgs() { sed -n 's/^pkg=//p' "$1/MANIFEST" 2>/dev/null | paste -sd, - | sed 's/,/, /g'; }
+
+# The packages in the pkgs= line of the start snapshot $1.
+snapshot_pkgs() { sed -n 's/^pkgs=//p' "$1" 2>/dev/null; }
+
+# The bundle directory that precheck chose for instance $1, from
+# $R/run/$PROG/$1/selected-runtime (in the unit's RuntimeDirectory, next to
+# the control socket; the name is longer than an interface name). Prints
+# nothing if precheck did not pass since the unit started.
+chosen_bundle() {
+    case "$(head -n 1 "$R/run/$PROG/$1/selected-runtime" 2>/dev/null || true)" in
+        cur) bundle_dir ;;
+        prev) printf '%s.prev' "$(bundle_dir)" ;;
+    esac
+}
+
+# ---------- unit helpers ----------
+
+# ExecStartPre of the unit. Checks the runtime last, so a missing interface
+# costs no load check. Writes only to /run: the choice for run.
+cmd_precheck() {
+    local i
+    need_iface "${1:-}"
+    i=$1
+    validate_instance "$i" >/dev/null 2>&1 || {
+        validate_instance "$i" || true
+        die "$i: instance invalid"
+    }
+    [ -e "$SYSNET/$i" ] || die "$i: interface not present yet"
+    runtime_select || die "$i: supplicant runtime not usable (above)"
+    { mkdir -p "$R/run/$PROG/$i" &&
+        printf '%s\nbundle=%s\nversion=%s\npkgs=%s\n' "$rt_slot" "$rt_from" "$rt_version" "$(manifest_pkgs "$(bundle_dir)$([ "$rt_slot" = cur ] || echo .prev)")" \
+            >"$R/run/$PROG/$i/selected-runtime"; } ||
+        die "$i: cannot write $R/run/$PROG/$i/selected-runtime"
+    log "$i: runtime ready: $rt_version from bundle $rt_from"
+}
+
+# ExecStart of the unit. Runs the runtime that precheck chose.
+# LD_LIBRARY_PATH holds only the runtime's library directories. exec keeps
+# argv[0] the supplicant's path, which the owner detection relies on.
+cmd_run() {
+    local i b
+    need_iface "${1:-}"
+    i=$1
+    b=$(chosen_bundle "$i")
+    [ -n "$b" ] || die "$i: no runtime chosen in $R/run/$PROG/$i/selected-runtime (precheck chooses it)"
+    runtime_paths "$b/root" || die "$i: no runtime at $b/root, or it cannot be read"
+    libs_inside "$b/root" || die "$i: no usable library directory in $b/root ('$rt_libs')"
+    LD_LIBRARY_PATH=$rt_libs
+    export LD_LIBRARY_PATH
+    exec "$rt_bin" -D wired -i "$i" -c "$INST/$i/wpa_supplicant.conf"
+}
+
+install_units() {
+    mkdir -p "$UNITS"
+    put 0644 "$DATA/systemd/$INSTANCE_UNIT" "$UNITS/$INSTANCE_UNIT"
+    systemctl daemon-reload
+}
+
+cmd_boot() {
+    local i
+    install_units
+    link_command
+    for i in $(instances); do
+        if is_active_flag "$i"; then
+            systemctl enable --quiet "$(unit_of "$i")" || log "boot: cannot enable $(unit_of "$i")"
+            systemctl start --no-block "$(unit_of "$i")" || log "boot: cannot start $(unit_of "$i")"
+        else
+            systemctl disable --quiet "$(unit_of "$i")" 2>/dev/null || true
+        fi
+    done
+}
+
+# ---------- check ----------
+
+check_one() {
+    local i quiet rc d st pae port cert key a b end y rb t found f
+    i=$1
+    quiet=${2:-0}
+    rc=0
+    say() { [ "$quiet" -eq 1 ] || printf '%s %s: %s\n' "$1" "$i" "$2"; }
+    d=$(inst_dir "$i")
+    if systemctl is-active --quiet "$(unit_of "$i")"; then
+        say OK "unit $(unit_of "$i") active"
+    else
+        say FAIL "unit $(unit_of "$i") not active"
+        rc=1
+    fi
+    rb=$(chosen_bundle "$i")
+    if [ -z "$rb" ]; then
+        say FAIL "no runtime chosen: precheck did not pass since the unit started. Restart the unit: systemctl restart $(unit_of "$i")"
+        rc=1
+    else
+        # wpa_cli from the chosen runtime. A swap since the start can have
+        # replaced that tree: if it gives no status, try the other one.
+        st=''
+        found=0
+        for t in "$rb" "$(bundle_dir)" "$(bundle_dir).prev"; do
+            runtime_paths "$t/root" || continue
+            found=1
+            st=$(LD_LIBRARY_PATH=$rt_libs "$rt_cli" -p "/run/$PROG/$i" -i "$i" status 2>/dev/null || true)
+            [ -z "$st" ] || break
+        done
+        pae=$(printf '%s\n' "$st" | sed -n 's/^Supplicant PAE state=//p')
+        port=$(printf '%s\n' "$st" | sed -n 's/^suppPortStatus=//p')
+        if [ "$found" -eq 0 ]; then
+            say FAIL "no runtime at $rb/root, or it cannot be read. Run import-bundle"
+            rc=1
+        elif [ "$pae" = AUTHENTICATED ] && [ "$port" = Authorized ]; then
+            say OK "802.1X authorized"
+        else
+            say FAIL "802.1X not authorized (PAE=${pae:-?}, port=${port:-?})"
+            rc=1
+        fi
+    fi
+    [ "$quiet" -eq 1 ] && return "$rc"
+    # What precheck checked at the start, as it recorded it: the bundle
+    # can have changed since.
+    f="$R/run/$PROG/$i/selected-runtime"
+    if [ -n "$rb" ]; then
+        say INFO "runtime at start: $(sed -n 's/^version=//p' "$f") from bundle $(sed -n 's/^bundle=//p' "$f") ($(snapshot_pkgs "$f"))"
+        [ "$(snapshot_pkgs "$f")" = "$(manifest_pkgs "$rb")" ] ||
+            say INFO "bundle ${rb##*/} changed since the start (fetch or import-bundle). The next start uses the bundle as it is now"
+    fi
+    cert="$d/certs/Client.pem"
+    key="$d/certs/PrivateKey.pem"
+    if [ -f "$cert" ] && [ -f "$key" ]; then
+        a=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null || true)
+        b=$(openssl pkey -in "$key" -pubout 2>/dev/null || true)
+        case "$a" in "-----BEGIN PUBLIC KEY-----"*) ;; *) a='' ;; esac
+        if [ -n "$a" ] && [ "$a" = "$b" ]; then
+            say OK "client certificate matches private key"
+        else
+            say FAIL "client certificate does not match private key"
+            rc=1
+        fi
+        end=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+        if openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1; then
+            say OK "client certificate valid until $end"
+        else
+            say WARN "client certificate expired $end (AT&T may still accept it)"
+        fi
+    fi
+    y=$(date +%Y)
+    if [ "$y" -lt 2024 ]; then
+        say WARN "system clock looks wrong ($(date -u))"
+    fi
+    # 802.1X authorization does not prove internet access. Show the address
+    # and the route as information. They send no traffic and never change
+    # the exit status. The address itself is not printed.
+    if command -v ip >/dev/null 2>&1; then
+        if ip -4 -o addr show dev "$i" 2>/dev/null | grep -q 'inet '; then
+            say INFO "interface has an IPv4 address"
+        else
+            say INFO "interface has no IPv4 address (DHCP not done, or the WAN address is on another interface)"
+        fi
+        a=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
+        if [ -n "$a" ]; then
+            say INFO "IPv4 route to the internet goes out on $a"
+        else
+            say INFO "no IPv4 route to the internet"
+        fi
+    fi
+    return "$rc"
+}
+
+# One informational line per check run: the bundles on the gateway. A
+# .prev directory or a dot-directory is not a bundle. Never changes the
+# exit status.
+check_bundles() {
+    local d list want
+    want="$(codename)-$(arch)"
+    list=''
+    for d in "$BUNDLES"/*/; do
+        [ -d "$d" ] || continue
+        d=${d%/}
+        d=${d##*/}
+        case "$d" in *.prev) continue ;; esac
+        list="${list:+$list, }$d"
+    done
+    if [ -d "$BUNDLES/$want" ]; then
+        echo "INFO bundles: $list (this release: $want)"
+    elif [ -n "$list" ]; then
+        echo "WARN bundles: $list. None for this release ($want). Run fetch or import-bundle"
+    else
+        echo "WARN bundles: none for this release ($want). Run fetch or import-bundle"
+    fi
+}
+
+cmd_check() {
+    local rc n i
+    rc=0
+    if [ $# -ge 1 ]; then
+        need_iface "$1"
+        check_one "$1" || rc=1
+    else
+        n=0
+        for i in $(instances); do
+            is_active_flag "$i" || continue
+            n=$((n + 1))
+            check_one "$i" || rc=1
+        done
+        if [ "$n" -eq 0 ]; then
+            echo "no activated instances"
+            return 1
+        fi
+    fi
+    check_bundles
+    return "$rc"
+}
+
+# ---------- supplicant processes, activate, deactivate ----------
+
+# Legacy detection, takeover, and restore are in legacy.sh. Only the
+# commands that use them load it, so precheck and run (the unit) do not
+# depend on it.
+legacy_loaded=0
+need_legacy() {
+    [ "$legacy_loaded" -eq 0 ] || return 0
+    [ -r "$SELF_DIR/legacy.sh" ] || die "missing or unreadable $SELF_DIR/legacy.sh. Reinstall the addon"
+    # shellcheck source=legacy.sh
+    . "$SELF_DIR/legacy.sh"
+    legacy_loaded=1
+}
+
+# PIDs of wpa_supplicant processes that use interface $1.
+supplicant_pids() {
+    local i p args first
+    i=$1
+    for p in "$PROC"/[0-9]*; do
+        [ -r "$p/cmdline" ] || continue
+        args=$(tr '\0' '\n' <"$p/cmdline" 2>/dev/null) || continue
+        first=$(printf '%s\n' "$args" | head -n 1)
+        case "${first##*/}" in wpa_supplicant*) ;; *) continue ;; esac
+        printf '%s\n' "$args" | awk -v i="$i" '
+            $0 == "-i" i { f = 1 }
+            prev == "-i" && $0 == i { f = 1 }
+            { prev = $0 }
+            END { exit !f }' || continue
+        printf '%s\n' "${p##*/}"
+    done
+}
+pid_unit() { sed -n 's#.*/\([^/]*\.service\)$#\1#p' "$PROC/$1/cgroup" 2>/dev/null | head -n 1; }
+
+# Stop a unit. Confirm that the unit and its supplicant processes stopped.
+stop_verified() {
+    local u i n p alive stopped
+    u=$1
+    i=$2
+    systemctl stop "$u" 2>/dev/null || true
+    n=0
+    while :; do
+        case "$(active_state "$u")" in
+            inactive | failed) stopped=1 ;;
+            *) stopped=0 ;;
+        esac
+        if [ "$stopped" -eq 1 ]; then
+            alive=0
+            for p in $(supplicant_pids "$i"); do
+                [ "$(pid_unit "$p")" = "$u" ] && alive=1
+            done
+            [ "$alive" -eq 0 ] && return 0
+        fi
+        n=$((n + 1))
+        [ "$n" -le "$STOP_WAIT" ] || return 1
+        sleep 1
+    done
+}
+
+# --- activate transaction ---
+# cmd_activate sets these and arms an EXIT trap that calls
+# activate_rollback. If activate exits before the unit is authorized (an
+# error, a timeout, or a signal), the rollback deactivates the interface
+# and, after --takeover, restores the legacy setup.
+act_iface=''
+act_armed=0
+
+activate_rollback() {
+    [ "$act_armed" -eq 1 ] || return 0
+    act_armed=0
+    log "$act_iface: rolling back"
+    rm -f -- "${INST:?}/${act_iface:?}/active"
+    systemctl disable --quiet "$(unit_of "$act_iface")" 2>/dev/null || true
+    if ! stop_verified "$(unit_of "$act_iface")" "$act_iface"; then
+        log "$act_iface: ERROR $(unit_of "$act_iface") did not stop. Legacy NOT restored"
+        return 0
+    fi
+    if ! restore_legacy "$act_iface"; then
+        log "$act_iface: ROLLBACK INCOMPLETE. See $(inst_dir "$act_iface")/takeover.state"
+        return 0
+    fi
+    log "$act_iface: rollback done; legacy start was requested. Verify: ps -eo pid,args | grep [w]pa_supplicant; ping -c 3 1.1.1.1"
+}
+
+cmd_activate() {
+    local i takeover d owners t0 now
+    [ $# -ge 1 ] || die "usage: activate <iface> [--takeover]"
+    need_legacy
+    i=$1
+    takeover=0
+    [ "${2:-}" = --takeover ] && takeover=1
+    need_iface "$i"
+    d=$(inst_dir "$i")
+    [ -d "$d" ] || die "$i: no instance (run add-instance first)"
+    is_active_flag "$i" && die "$i: already activated (use check, or deactivate first)"
+    [ ! -e "$d/takeover.state" ] || die "$i: $d/takeover.state exists from an earlier takeover. Inspect it first"
+
+    # 1. Do every slow step, and every step that can fail, before the
+    #    working owner stops.
+    validate_instance "$i" || die "$i: validation failed. Nothing changed"
+    [ -e "$SYSNET/$i" ] || die "$i: interface not present. Nothing changed"
+    runtime_select || die "$i: the supplicant runtime failed its check (above). Nothing changed"
+    log "$i: runtime check passed: $rt_version from bundle $rt_from"
+    systemctl daemon-reload
+    if [ "$(systemctl is-enabled "$(unit_of "$i")" 2>/dev/null || true)" = masked ]; then
+        die "$i: $(unit_of "$i") is masked. Unmask it first. Nothing changed."
+    fi
+
+    # 2. Find the legacy owners.
+    owners=$(find_owners "$i")
+    if printf '%s\n' "$owners" | grep -Eq '^(unknown|ambiguous) '; then
+        printf '%s\n' "$owners" | grep -E '^(unknown|ambiguous) ' | sed 's/^/  /' >&2
+        die "$i: cannot tell who owns $i (above). Resolve by hand. Nothing changed."
+    fi
+    if [ -n "$owners" ] && [ "$takeover" -eq 0 ]; then
+        printf '%s\n' "$owners" | sed 's/^/  /' >&2
+        die "$i: legacy setup found (above). Re-run with --takeover. Nothing changed."
+    fi
+
+    # From here, any exit before authorization rolls back.
+    act_iface=$i
+    act_armed=1
+    trap 'activate_rollback' EXIT
+    trap 'exit 1' INT TERM HUP
+
+    # 3. Take over. Record everything first, then quarantine and stop.
+    [ -z "$owners" ] || takeover_owners "$i" "$d" "$owners"
+    if [ -n "$(supplicant_pids "$i")" ]; then
+        die "$i: a supplicant still runs on $i after takeover"
+    fi
+    t0=$(date +%s)
+
+    # 4. Start our unit.
+    : >"$d/active"
+    chmod 0600 "$d/active"
+    systemctl enable --quiet "$(unit_of "$i")" || die "$i: cannot enable $(unit_of "$i")"
+    systemctl start --no-block "$(unit_of "$i")" || die "$i: cannot start $(unit_of "$i")"
+
+    # 5. Wait for authorization until the deadline.
+    while :; do
+        if check_one "$i" 1; then
+            act_armed=0
+            trap - EXIT INT TERM HUP
+            log "$i: authorized. Activation complete"
+            check_one "$i" || true
+            return 0
+        fi
+        now=$(date +%s)
+        [ $((now - t0)) -lt "$TAKEOVER_TIMEOUT" ] || break
+        sleep "$POLL"
+    done
+    die "$i: not authorized within ${TAKEOVER_TIMEOUT}s. Rolling back. See: journalctl -u $(unit_of "$i")"
+}
+
+# Read-only. Reports what activate would do and what would stop it.
+cmd_plan() {
+    local i d owners blocked
+    [ $# -eq 1 ] || die "usage: plan <iface>"
+    need_legacy
+    i=$1
+    need_iface "$i"
+    d=$(inst_dir "$i")
+    [ -d "$d" ] || die "$i: no instance (run add-instance first)"
+    blocked=0
+    echo "plan for $i. This command changes nothing. It tests that the runtime loads."
+    if is_active_flag "$i"; then
+        echo "  blocked: $i is already activated (use check)"
+        return 1
+    fi
+    if [ -e "$d/takeover.state" ]; then
+        echo "  blocked: $d/takeover.state exists from an earlier takeover. Inspect it first"
+        blocked=1
+    fi
+    if validate_instance "$i"; then
+        echo "  files: OK"
+    else
+        echo "  blocked: the instance files failed validation (above)"
+        blocked=1
+    fi
+    # The same choice and load check as the unit.
+    if runtime_select; then
+        echo "  supplicant: $rt_version from bundle $rt_from loads on this firmware"
+    else
+        echo "  blocked: the supplicant runtime failed its check (above). Run fetch or import-bundle"
+        blocked=1
+    fi
+    if [ ! -e "$SYSNET/$i" ]; then
+        echo "  blocked: interface $i is not present"
+        blocked=1
+    fi
+    if [ "$(systemctl is-enabled "$(unit_of "$i")" 2>/dev/null || true)" = masked ]; then
+        echo "  blocked: $(unit_of "$i") is masked. Unmask it first"
+        blocked=1
+    fi
+    owners=$(find_owners "$i")
+    if printf '%s\n' "$owners" | grep -Eq '^(unknown|ambiguous) '; then
+        echo "  blocked: cannot tell who owns $i. Resolve these by hand:"
+        printf '%s\n' "$owners" | grep -E '^(unknown|ambiguous) ' | sed 's/^/    /'
+        blocked=1
+    elif [ -n "$owners" ]; then
+        echo "  legacy setup found. A takeover stops and quarantines these:"
+        printf '%s\n' "$owners" | sed 's/^/    /'
+        [ "$blocked" -eq 1 ] || echo "  next: $PROG activate $i --takeover"
+    else
+        echo "  no legacy setup found"
+        [ "$blocked" -eq 1 ] || echo "  next: $PROG activate $i"
+    fi
+    return "$blocked"
+}
+
+cmd_deactivate() {
+    [ $# -ge 1 ] || die "usage: deactivate <iface> [--restore-legacy]"
+    need_iface "$1"
+    # Load legacy.sh before anything stops: a missing file must not leave
+    # the interface with no supplicant.
+    [ "${2:-}" != --restore-legacy ] || need_legacy
+    rm -f -- "${INST:?}/${1:?}/active"
+    systemctl disable --quiet "$(unit_of "$1")" 2>/dev/null || true
+    stop_verified "$(unit_of "$1")" "$1" || die "$1: $(unit_of "$1") did not stop"
+    log "$1: deactivated"
+    if [ "${2:-}" = --restore-legacy ]; then
+        restore_legacy "$1" || die "$1: legacy restore failed"
+    fi
+}
+
+# ---------- install / uninstall ----------
+
+link_command() {
+    mkdir -p "$R/usr/local/sbin"
+    ln -sfn "$PROD_DATA/$PROG" "$R/usr/local/sbin/$PROG"
+}
+
+# Finish a bundle swap of this release that a power loss cut short
+# (recover_bundle), under the bundle lock.
+install_recover() {
+    lock_take -x || die "a unit start, fetch, or import-bundle holds the bundle lock (waited ${LOCK_WAIT}s). Nothing changed"
+    recover_bundle "$BUNDLES/$(codename)-$(arch)"
+    lock_drop
+}
+
+# Install $2 as $3 with mode $1: a copy under a temp name, sync, then a
+# rename. A copy cut short never leaves $3 missing or partial.
+put() {
+    install -m "$1" "$2" "$3.new"
+    sync 2>/dev/null || true
+    mv -f "$3.new" "$3"
+}
+
+cmd_install() {
+    local self i act idle
+    self=$(cd "$SELF_DIR" && pwd)
+    # /data/unifi-common-addons is shared with other addons: make it 0755
+    # if it is missing, and never change it. /data exists on a gateway, so
+    # mkdir makes only the shared directory.
+    [ -d "${DATA%/*}" ] || { mkdir -p "${DATA%/*}" && chmod 0755 "${DATA%/*}"; }
+    umask 077
+    mkdir -p "$DATA" "$INST" "$BUNDLES" "$DATA/systemd"
+    chmod 0700 "$DATA" "$INST" "$BUNDLES" "$DATA/systemd"
+    install_recover
+    # An activated interface restarts on the new code (at the next restart
+    # or reboot). It needs a runtime that loads, from the bundle or .prev.
+    for i in $(instances); do
+        is_active_flag "$i" || continue
+        runtime_select || die "install: $i is activated, and no runtime for this release loads (above). Nothing changed. Run fetch or import-bundle, then install again"
+        break
+    done
+    if [ "$self" != "$DATA" ]; then
+        put 0700 "$self/$PROG" "$DATA/$PROG"
+        put 0600 "$self/legacy.sh" "$DATA/legacy.sh"
+        put 0600 "$self/systemd/$INSTANCE_UNIT" "$DATA/systemd/$INSTANCE_UNIT"
+        mkdir -p "$DATA/on_boot.d"
+        put 0700 "$self/on_boot.d/$ONBOOT_NAME" "$DATA/on_boot.d/$ONBOOT_NAME"
+        [ ! -f "$self/README.md" ] || put 0600 "$self/README.md" "$DATA/README.md"
+    fi
+    mkdir -p "$ONBOOT"
+    put 0755 "$DATA/on_boot.d/$ONBOOT_NAME" "$ONBOOT/$ONBOOT_NAME"
+    link_command
+    install_units
+    act=''
+    idle=''
+    for i in $(instances); do
+        validate_instance "$i" || true
+        if is_active_flag "$i"; then act="$act $i"; else idle="$idle $i"; fi
+    done
+    if [ -n "$act" ]; then
+        log "install: done. Activated interfaces were not restarted:$act. Command: /usr/local/sbin/$PROG"
+        log "next: $PROG check"
+    elif [ -n "$idle" ]; then
+        log "install: done. Nothing is running yet. Command: /usr/local/sbin/$PROG"
+        log "next: plan <iface>, then activate <iface> [--takeover]. Instances:$idle"
+    else
+        log "install: done. Nothing is running yet. Command: /usr/local/sbin/$PROG"
+        log "next: add-instance <iface> <dir>, then activate <iface> [--takeover]"
+    fi
+}
+
+cmd_uninstall() {
+    local i restore
+    restore=0
+    [ "${1:-}" = --restore-legacy ] && restore=1
+    [ "$restore" -eq 0 ] || need_legacy
+    for i in $(instances); do
+        if [ -f "$(inst_dir "$i")/takeover.state" ] && [ "$restore" -eq 0 ]; then
+            die "$i: this addon replaced a legacy setup. Uninstall would leave $i with no supplicant. Re-run with --restore-legacy, or remove $(inst_dir "$i")/takeover.state if you replaced it yourself."
+        fi
+    done
+    for i in $(instances); do
+        rm -f -- "${INST:?}/${i:?}/active"
+        systemctl disable --quiet "$(unit_of "$i")" 2>/dev/null || true
+        stop_verified "$(unit_of "$i")" "$i" || die "$i: $(unit_of "$i") did not stop. Uninstall stopped"
+    done
+    rm -f -- "${UNITS:?}/${INSTANCE_UNIT:?}" \
+        "${ONBOOT:?}/${ONBOOT_NAME:?}" "$R/usr/local/sbin/${PROG:?}"
+    systemctl daemon-reload
+    if [ "$restore" -eq 1 ]; then
+        for i in $(instances); do
+            [ ! -f "$(inst_dir "$i")/takeover.state" ] || restore_legacy "$i" || log "$i: legacy restore failed"
+        done
+    fi
+    log "uninstall: units and boot entry removed. $DATA kept"
+}
+
+# ---------- main ----------
+
+# The directory of the real script. $0 can be the /usr/local/sbin link.
+SELF_DIR=$(dirname "$(readlink -f "$0")")
+
+cmd=${1:-help}
+[ $# -eq 0 ] || shift
+case "$cmd" in
+    install) cmd_install "$@" ;;
+    add-instance) cmd_add_instance "$@" ;;
+    validate) cmd_validate "$@" ;;
+    fetch) cmd_fetch "$@" ;;
+    import-bundle) cmd_import_bundle "$@" ;;
+    activate) cmd_activate "$@" ;;
+    deactivate) cmd_deactivate "$@" ;;
+    plan) cmd_plan "$@" ;;
+    check) cmd_check "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    boot) cmd_boot "$@" ;;
+    precheck) cmd_precheck "$@" ;;
+    run) cmd_run "$@" ;;
+    help | -h | --help) usage ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

@@ -37,6 +37,10 @@ Enables local ONT management access and fixes console-level IPv6 routing in bypa
 
 Enables emulation of a Cascaded Router setup and allows full use of your CIDR on AT&T connections.
 
+### [att-wpa-supplicant](att-wpa-supplicant)
+
+Physically bypass the AT&T Fiber Residential Gateway by running 802.1X authentication on the UniFi gateway and connecting it directly to the ONT. Runs `wpa_supplicant` from Debian packages kept in `/data` without installing them, so it persists across firmware updates. Includes guided takeover from legacy `wpa_supplicant` bypass methods, plus new commands, checks, and guards to improve resilience and stability.
+
 ### centurylink-ipv6
 
 Enables 6RD on CenturyLink connections. This allows you to use IPv6 on your LAN and have it routed over the 6RD tunnel to the internet.
