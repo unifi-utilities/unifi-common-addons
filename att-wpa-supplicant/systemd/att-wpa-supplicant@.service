@@ -1,0 +1,21 @@
+[Unit]
+Description=AT&T 802.1X supplicant on %i
+Before=network.target
+StartLimitIntervalSec=0
+ConditionPathExists=/data/unifi-common-addons/att-wpa-supplicant/instances/%i/active
+
+[Service]
+# precheck tests that the runtime of the bundle loads (it was unpacked in
+# /data/unifi-common-addons/att-wpa-supplicant/bundles/<release>/root
+# when the bundle arrived) and writes nothing on /data. The RuntimeDirectory holds the control
+# socket and precheck's choice (selected-runtime: cur or prev), which run
+# reads. The name is longer than an interface name, so no socket has it.
+ExecStartPre=/data/unifi-common-addons/att-wpa-supplicant/att-wpa-supplicant precheck %i
+ExecStart=/data/unifi-common-addons/att-wpa-supplicant/att-wpa-supplicant run %i
+Restart=always
+RestartSec=30
+RuntimeDirectory=att-wpa-supplicant/%i
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
