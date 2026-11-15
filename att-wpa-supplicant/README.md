@@ -39,10 +39,11 @@ Two more words:
 
 - **Supplicant:** the program (`wpa_supplicant`) that answers the 802.1X
   request from AT&T.
-- **Bundle:** the two Debian packages of the supplicant, stored in `/data`
-  on the gateway. UniFi OS is built on Debian. Each Debian major version
-  (11 "bullseye", 12 "bookworm", 13 "trixie") needs its own bundle. The
-  addon runs the supplicant from the bundle and installs no package.
+- **Bundle:** the Debian packages of the supplicant and of most of the
+  libraries that it needs, stored in `/data` on the gateway. UniFi OS is
+  built on Debian. Each Debian major version (11 "bullseye", 12
+  "bookworm", 13 "trixie") needs its own bundle. The addon runs the
+  supplicant from the bundle and installs no package.
 
 ## Requirements
 
@@ -281,6 +282,14 @@ The takeover does not change MAC address settings, for example the
 Keep them if your setup needs them. To go back to your old setup later, run
 `att-wpa-supplicant deactivate <iface> --restore-legacy`.
 
+To stop the supplicant for a time, run
+`att-wpa-supplicant deactivate <iface>`. Your old setup stays stopped, so
+`<iface>` has no supplicant until you run
+`att-wpa-supplicant activate <iface>`. `activate` needs no `--takeover`
+then. It keeps `takeover.state`, the record that `--restore-legacy` uses.
+If a part of the old setup was enabled or started again in the meantime,
+`activate` stops and names it.
+
 ## Check the connection
 
 On the gateway, run:
@@ -331,12 +340,16 @@ Do this at a quiet time, with the RG nearby as a fallback. On the gateway:
    `./att-wpa-supplicant install`. If the supplicant from the bundle does
    not load, `install` stops and says that nothing changed. `install` does
    not restart the supplicant.
-2. Run `att-wpa-supplicant validate <iface>`. It must print
+2. Run `att-wpa-supplicant fetch`, or import a bundle that you built with
+   the new version. An older bundle holds only `wpasupplicant` and
+   `libpcsclite1`. It still works, because the firmware supplies the
+   other libraries.
+3. Run `att-wpa-supplicant validate <iface>`. It must print
    `att-wpa-supplicant: validate: OK`.
-3. **Caution:** internet access stops for a short time. Run
+4. **Caution:** internet access stops for a short time. Run
    `systemctl restart att-wpa-supplicant@<iface>`. The new version runs
    from now on.
-4. Run `att-wpa-supplicant check`.
+5. Run `att-wpa-supplicant check`.
 
 Your certificates, instances, and bundles stay in place.
 
@@ -429,7 +442,7 @@ If internet access is down, first [go back to the RG](#go-back-to-the-rg).
 |---|---|
 | `scp` prints an error that names `sftp` | Run the `scp` command again with `-O` after `scp`. |
 | `ca md too weak`, then a request for a key passphrase | The config file needs the line `openssl_ciphers=DEFAULT@SECLEVEL=0` before the `network={` block. `add-instance` writes it there. Keep it there if you edit `instances/<iface>/wpa_supplicant.conf`. Then run `validate <iface>`. |
-| `runtime: wpa_supplicant does not start: error while loading shared libraries: <library>` | The firmware does not supply a library that the supplicant needs. Go back to the RG. Report the firmware version and the library name. |
+| `runtime: wpa_supplicant does not start: error while loading shared libraries: <library>` | The firmware does not supply a library that the supplicant needs. Go back to the RG. If the bundle holds only `wpasupplicant` and `libpcsclite1` (see its `MANIFEST`), run `fetch` (it needs the internet), then `validate`. Otherwise, report the firmware version and the library name. |
 | `runtime: cannot execute files in <directory>. Is <mount> mounted noexec?` | The addon must run programs from `/data`. Check the mount options with `mount`. Report the model and the firmware version. |
 | `runtime: bundle <bundle> has no unpacked runtime` | Run `fetch`, or import the bundle again. |
 | `fetch` or `import-bundle` ends with `Existing bundle kept` | The download, the bundle check, or the runtime test failed. The lines above name the cause. The bundle in use did not change. |
@@ -511,18 +524,22 @@ nearby.
 - `att-wpa-supplicant@<iface>.service` runs `wpa_supplicant -D wired`
   with `instances/<iface>/wpa_supplicant.conf`, only if
   `instances/<iface>/active` exists.
-- `fetch` and `import-bundle` check a bundle and unpack its two packages
+- `fetch` and `import-bundle` check a bundle and unpack its packages
   into `bundles/<codename>-<arch>/root`. They install nothing. Before each
   start, the unit tests that runtime. If the test fails, the unit tries
   the previous bundle (`.prev`) once. A start writes nothing on `/data`.
-- The firmware supplies all other libraries (`libc`, OpenSSL, `libnl`,
-  `libdbus-1`, `libreadline`). OpenSSL security fixes come with the
-  firmware. Fixes for `wpasupplicant` come from Debian in a new bundle.
+- A bundle holds `wpasupplicant`, `libpcsclite1`, `libnl` (3 packages),
+  `libdbus-1`, and `libreadline`. The firmware supplies the rest: `libc`,
+  OpenSSL, `libsystemd`, and `libtinfo`. OpenSSL security fixes come with
+  the firmware. Fixes for the packages in the bundle come from Debian in a
+  new bundle.
 - `activate --takeover` checks everything before it stops the old setup.
   It records the old units in `instances/<iface>/takeover.state` and moves
-  the old boot scripts to `instances/<iface>/quarantine/`. It never starts
-  a second supplicant on an interface. The takeover code is in
-  `legacy.sh`. Keep it next to the main script.
+  the old boot scripts to `instances/<iface>/quarantine/`. The addon
+  never starts a second supplicant on an interface. The stock
+  `wpa_supplicant.service` of Debian names no interface. It counts as an
+  old setup only if it runs a supplicant on `<iface>`. The takeover code
+  is in `legacy.sh`. Keep it next to the main script.
 
 ### Files on the gateway
 
@@ -531,7 +548,7 @@ nearby.
 /data/unifi-common-addons/att-wpa-supplicant/
   att-wpa-supplicant  legacy.sh  systemd/  on_boot.d/
   bundles/<codename>-<arch>/        *.deb, SHA256SUMS, MANIFEST
-    root/                           the two packages, unpacked
+    root/                           the packages, unpacked
   bundles/<codename>-<arch>.prev/   the previous bundle, kept as a fallback
   instances/<iface>/
     wpa_supplicant.conf             0600

@@ -125,8 +125,22 @@ pid=$(mainpid)
 exe=$(readlink "/proc/$pid/exe")
 case "$exe" in "$B"/root/*) ok "process runs from the bundle's runtime ($exe)" ;; *) bad "process runs from the bundle's runtime" "exe=$exe" ;; esac
 libdir=$(dirname "$(find "$B/root" -name 'libpcsclite.so.1' | head -n 1)")
-tr '\0' '\n' <"/proc/$pid/environ" | grep -qx "LD_LIBRARY_PATH=$libdir" &&
-    ok "process LD_LIBRARY_PATH is the runtime library directory" || bad "process LD_LIBRARY_PATH" "$(tr '\0' '\n' <"/proc/$pid/environ" | grep LD_)"
+llp=$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^LD_LIBRARY_PATH=//p')
+llp_ok=1
+case ":$llp:" in *":$libdir:"*) ;; *) llp_ok=0 ;; esac
+for e in $(printf '%s\n' "$llp" | tr ':' ' '); do
+    case "$e" in "$B"/root/*) ;; *) llp_ok=0 ;; esac
+done
+[ "$llp_ok" -eq 1 ] && ok "process LD_LIBRARY_PATH holds only runtime library directories" || bad "process LD_LIBRARY_PATH" "$llp"
+# The bundle holds libnl and libdbus. The firmware has them too (hostapd
+# needs libnl), so these show that the runtime's copies win.
+for l in libnl-3.so.200 libnl-genl-3.so.200 libnl-route-3.so.200 libdbus-1.so.3; do
+    grep "$l" "/proc/$pid/maps" | grep -q "$B/root/" &&
+        ok "$l is mapped from the runtime" || bad "$l is mapped from the runtime" "$(grep "$l" "/proc/$pid/maps" | head -n 1)"
+done
+cli=$(find "$B/root" -name wpa_cli -type f | head -n 1)
+LD_TRACE_LOADED_OBJECTS=1 LD_LIBRARY_PATH=$llp "$cli" 2>&1 | grep 'libreadline.so.8' | grep -q "$B/root/" &&
+    ok "wpa_cli loads libreadline from the runtime" || bad "wpa_cli loads libreadline from the runtime" "$(LD_TRACE_LOADED_OBJECTS=1 LD_LIBRARY_PATH=$llp "$cli" 2>&1 | grep readline)"
 [ -e "/proc/$pid/fd/9" ] && bad "fd 9 is open in the supplicant" "$(readlink "/proc/$pid/fd/9")" || ok "fd 9 is not open in the supplicant"
 grep -q "libpcsclite.so.1" "/proc/$pid/maps" && grep "libpcsclite" "/proc/$pid/maps" | grep -q "$B/root/" &&
     ok "libpcsclite is mapped from the runtime" || bad "libpcsclite is mapped from the runtime"

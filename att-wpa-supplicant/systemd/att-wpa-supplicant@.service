@@ -1,5 +1,6 @@
 [Unit]
 Description=AT&T 802.1X supplicant on %i
+RequiresMountsFor=/data
 Before=network.target
 StartLimitIntervalSec=0
 ConditionPathExists=/data/unifi-common-addons/att-wpa-supplicant/instances/%i/active

@@ -20,13 +20,21 @@ PROC="$R/proc"
 SYSNET="$R/sys/class/net"
 OS_RELEASE="$R/etc/os-release"
 INSTANCE_UNIT="$PROG@.service"
-# The runtime: these packages from the bundle, unpacked. The firmware
-# supplies every other library that they need.
+# The runtime: these packages from the bundle, unpacked. A bundle must
+# hold each of them.
 RUNTIME_PKGS="wpasupplicant libpcsclite1"
+# Libraries that the runtime also unpacks when the bundle holds them. With
+# them, the firmware needs to supply only libc, libssl, libsystemd, and
+# libtinfo. fetch takes the names from the Depends field of wpasupplicant,
+# because they change between releases (libreadline8t64 in trixie).
+# A bundle that holds only the runtime packages still works: the firmware
+# then supplies these libraries. tools/build-bundle.sh has the same list.
+RUNTIME_LIBS="libnl-3-200 libnl-genl-3-200 libnl-route-3-200 libdbus-1-3 libreadline8 libreadline8t64"
 # The runtime of a bundle is <bundle>/root. fetch, import-bundle, and
 # install unpack it when the bundle arrives. A unit start only reads it.
 # It is on /data because UniFi OS mounts /run noexec.
 LOCKFILE="$R/run/$PROG.bundle.lock"
+SETUP_LOCKFILE="$R/run/$PROG.setup.lock"
 OWNER_UID="${ATT_WPA_OWNER_UID:-0}"
 TAKEOVER_TIMEOUT="${ATT_WPA_TAKEOVER_TIMEOUT:-120}"
 POLL="${ATT_WPA_POLL:-5}"
@@ -346,6 +354,63 @@ bundle_ok() {
         c=$(bundle_debs "$b" "$p" | wc -l | tr -d ' ')
         [ "$c" -eq 1 ] || { log "bundle $b: needs one $p package, has $c"; return 1; }
     done
+    for p in $RUNTIME_LIBS; do
+        c=$(bundle_debs "$b" "$p" | wc -l | tr -d ' ')
+        [ "$c" -le 1 ] || { log "bundle $b: needs at most one $p package, has $c"; return 1; }
+    done
+    # The three libnl libraries come from one source package. A bundle with
+    # some of them would mix Debian's libnl with the firmware's build.
+    c=0
+    for p in libnl-3-200 libnl-genl-3-200 libnl-route-3-200; do
+        [ -z "$(bundle_debs "$b" "$p")" ] || c=$((c + 1))
+    done
+    [ "$c" -eq 0 ] || [ "$c" -eq 3 ] || { log "bundle $b: needs all three libnl packages or none, has $c"; return 1; }
+}
+
+# "<name>=<version>" for each package named in $@, from apt-cache policy:
+# apt's candidate if a repository serves it. Else (UniFi OS installs its
+# own builds, such as libnl-3-200 3.7.0-2+ubnt, which no repository serves,
+# and the installed build is the candidate) the repository version with the
+# highest priority; of equal priorities, the newest. A version pinned below
+# 0 is never chosen. Returns 1 if a repository serves no usable version.
+repo_specs() {
+    local p v
+    for p; do
+        v=$(LC_ALL=C apt-cache policy "$p" 2>/dev/null | awk '
+            $1 == "Candidate:" { cand = $2; next }
+            $1 == "Version" && $2 == "table:" { tbl = 1; next }
+            !tbl { next }
+            # A version line: "     <ver> <prio>" or " *** <ver> <prio>".
+            /^ (\*\*\*| {3}) [^ ]/ {
+                ver = ($1 == "***") ? $2 : $1
+                prio[ver] = ($1 == "***") ? $3 : $2
+                order[++n] = ver
+                next
+            }
+            # A source line: "        <prio> <source>".
+            NF >= 2 && $2 != "/var/lib/dpkg/status" { repo[ver] = 1 }
+            END {
+                if (cand != "" && cand != "(none)" && repo[cand] && prio[cand] + 0 >= 0) { print cand; exit }
+                for (k = 1; k <= n; k++) {
+                    v = order[k]
+                    if (!repo[v] || prio[v] + 0 < 0) continue
+                    if (best == "" || prio[v] + 0 > prio[best] + 0) best = v
+                }
+                if (best != "") print best
+            }')
+        [ -n "$v" ] || { log "fetch: no repository serves $p"; return 1; }
+        printf '%s=%s\n' "$p" "$v"
+    done
+}
+
+# The packages of $RUNTIME_LIBS that the wpasupplicant package $1 depends
+# on, one per line. Reads the Depends field only.
+runtime_lib_deps() {
+    local d p
+    d=$(dpkg-deb -f "$1" Depends 2>/dev/null) || return 1
+    for p in $(printf '%s\n' "$d" | tr ',|' '\n\n' | sed 's/(.*//; s/:.*//; s/[[:space:]]//g'); do
+        case " $RUNTIME_LIBS " in *" $p "*) printf '%s\n' "$p" ;; esac
+    done | sort -u
 }
 
 # Write SHA256SUMS and MANIFEST for the .debs in $1.
@@ -412,7 +477,7 @@ in_use_fails() {
 }
 
 cmd_fetch() {
-    local c a
+    local c a libs specs
     c=$(codename)
     a=$(arch)
     [ -n "$c" ] || die "cannot read VERSION_CODENAME from $OS_RELEASE"
@@ -421,8 +486,19 @@ cmd_fetch() {
     tmp=$(mktemp -d "$BUNDLES/.fetch.XXXXXX")
     trap 'rm -rf -- "${tmp:?}"' EXIT
     apt-get update -qq || die "apt-get update failed (no internet?). Existing bundle kept"
-    # shellcheck disable=SC2086 # package names are single words
-    (cd "$tmp" && apt-get download -qq $RUNTIME_PKGS) || die "download failed. Existing bundle kept"
+    # The fetch directory is 0700 root, so APT's _apt user cannot write to
+    # it. Download as root, which APT would also do, with a warning.
+    # shellcheck disable=SC2086 # RUNTIME_PKGS holds single words
+    specs=$(repo_specs $RUNTIME_PKGS) || die "download failed. Existing bundle kept"
+    # shellcheck disable=SC2086 # each spec is one word
+    (cd "$tmp" && apt-get download -qq -o APT::Sandbox::User=root $specs) || die "download failed. Existing bundle kept"
+    libs=$(runtime_lib_deps "$(bundle_debs "$tmp" wpasupplicant)") || die "cannot read the dependencies of wpasupplicant. Existing bundle kept"
+    if [ -n "$libs" ]; then
+        # shellcheck disable=SC2086 # package names are single words
+        specs=$(repo_specs $libs) || die "download of the libraries failed. Existing bundle kept"
+        # shellcheck disable=SC2086 # each spec is one word
+        (cd "$tmp" && apt-get download -qq -o APT::Sandbox::User=root $specs) || die "download of the libraries failed. Existing bundle kept"
+    fi
     seal_bundle "$tmp" "$c" "$a" "apt-get download on $(hostname 2>/dev/null || echo gateway)"
     bundle_ok "$tmp" "$c-$a" || die "the new bundle failed its check. Existing bundle kept"
     bundle_unpack "$tmp" "$tmp/root" "$c-$a" || die "the runtime of the new bundle failed its check (above). Existing bundle kept"
@@ -489,6 +565,17 @@ lock_take() {
 }
 lock_drop() { exec 9>&-; }
 
+# Take the setup lock on fd 8, exclusive, for boot and install. Two boot
+# entries can run at the same time (unifi-common and an older on_boot.d
+# launcher). The lock makes the second one wait. The kernel releases it
+# when the process exits.
+setup_lock() {
+    mkdir -p "${SETUP_LOCKFILE%/*}"
+    command -v flock >/dev/null 2>&1 || die "flock(1) not found (util-linux)"
+    command exec 8>>"$SETUP_LOCKFILE" || die "cannot open $SETUP_LOCKFILE"
+    flock -x -w "$LOCK_WAIT" 8 || die "another boot or install holds $SETUP_LOCKFILE (waited ${LOCK_WAIT}s)"
+}
+
 # Set rt_bin, rt_cli, and rt_libs (for LD_LIBRARY_PATH) for the unpacked
 # tree $1. bullseye and bookworm use sbin/, trixie uses usr/sbin/.
 # Returns 1 if a binary is missing or the library search failed
@@ -534,17 +621,12 @@ libs_inside() {
     done
 }
 
-# Run a load-check command with a time limit, if timeout(1) exists.
+# Run a load-check command with a time limit. runtime_check makes sure
+# that timeout(1) exists.
 limited() {
     # timeout(1) is in coreutils, which every Debian system has. -k sends
     # KILL 5 s after TERM, for a process that ignores TERM.
     timeout -k 5 "$LOAD_TIMEOUT" "$@"
-}
-
-# First line of the version output of the runtime in $1.
-runtime_version() {
-    runtime_paths "$1" || return 1
-    LD_LIBRARY_PATH=$rt_libs limited "$rt_bin" -v 2>/dev/null | head -n 1
 }
 
 # The loader's error line from output $1, else its last line.
@@ -640,7 +722,8 @@ runtime_check() {
     fi
 }
 
-# Unpack the runtime packages of bundle $1 into the new directory $2. $3 is
+# Unpack the runtime packages of bundle $1, and the libraries that it
+# holds, into the new directory $2. $3 is
 # the bundle name (codename-arch). Then check the tree. For this gateway's
 # release, run the load check too. A bundle for another release cannot run
 # here: precheck checks it after a firmware update. Returns 1 on any
@@ -648,8 +731,9 @@ runtime_check() {
 bundle_unpack() {
     local p f a
     mkdir -m 0700 "$2" || { log "bundle $3: cannot create $2"; return 1; }
-    for p in $RUNTIME_PKGS; do
+    for p in $RUNTIME_PKGS $RUNTIME_LIBS; do
         f=$(bundle_debs "$1" "$p")
+        [ -n "$f" ] || continue
         a=$(dpkg-deb -f "$f" Architecture) || a=unknown
         case "$a" in
             "${3##*-}" | all) ;;
@@ -767,6 +851,8 @@ install_units() {
 
 cmd_boot() {
     local i
+    [ $# -eq 0 ] || die "usage: boot"
+    setup_lock
     install_units
     link_command
     for i in $(instances); do
@@ -979,9 +1065,12 @@ stop_verified() {
 # cmd_activate sets these and arms an EXIT trap that calls
 # activate_rollback. If activate exits before the unit is authorized (an
 # error, a timeout, or a signal), the rollback deactivates the interface
-# and, after --takeover, restores the legacy setup.
+# and, if this run took over a legacy setup, restores it. A run that
+# reuses the ledger of an earlier takeover took nothing over: its
+# rollback keeps the legacy setup stopped and keeps the ledger.
 act_iface=''
 act_armed=0
+act_took_over=0
 
 activate_rollback() {
     [ "$act_armed" -eq 1 ] || return 0
@@ -993,6 +1082,10 @@ activate_rollback() {
         log "$act_iface: ERROR $(unit_of "$act_iface") did not stop. Legacy NOT restored"
         return 0
     fi
+    if [ "$act_took_over" -eq 0 ]; then
+        log "$act_iface: rollback done. $act_iface has no supplicant now"
+        return 0
+    fi
     if ! restore_legacy "$act_iface"; then
         log "$act_iface: ROLLBACK INCOMPLETE. See $(inst_dir "$act_iface")/takeover.state"
         return 0
@@ -1001,17 +1094,28 @@ activate_rollback() {
 }
 
 cmd_activate() {
-    local i takeover d owners t0 now
-    [ $# -ge 1 ] || die "usage: activate <iface> [--takeover]"
+    local i takeover d owners t0 now kept_ledger
+    [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: activate <iface> [--takeover]"
+    takeover=0
+    case "${2:-}" in
+        '') ;;
+        --takeover) takeover=1 ;;
+        *) die "activate: unknown option '$2'. Usage: activate <iface> [--takeover]" ;;
+    esac
     need_legacy
     i=$1
-    takeover=0
-    [ "${2:-}" = --takeover ] && takeover=1
     need_iface "$i"
     d=$(inst_dir "$i")
     [ -d "$d" ] || die "$i: no instance (run add-instance first)"
     is_active_flag "$i" && die "$i: already activated (use check, or deactivate first)"
-    [ ! -e "$d/takeover.state" ] || die "$i: $d/takeover.state exists from an earlier takeover. Inspect it first"
+    # After deactivate, the ledger of an earlier takeover stays. Keep it,
+    # and start again only if the legacy setup that it records is still
+    # stopped and disabled.
+    kept_ledger=0
+    if [ -e "$d/takeover.state" ]; then
+        ledger_dormant "$i" || die "$i: $d/takeover.state records a legacy setup, and part of it is live again (above). Run deactivate $i --restore-legacy, or stop it by hand. Nothing changed"
+        kept_ledger=1
+    fi
 
     # 1. Do every slow step, and every step that can fail, before the
     #    working owner stops.
@@ -1030,6 +1134,10 @@ cmd_activate() {
         printf '%s\n' "$owners" | grep -E '^(unknown|ambiguous) ' | sed 's/^/  /' >&2
         die "$i: cannot tell who owns $i (above). Resolve by hand. Nothing changed."
     fi
+    if [ -n "$owners" ] && [ "$kept_ledger" -eq 1 ]; then
+        printf '%s\n' "$owners" | sed 's/^/  /' >&2
+        die "$i: legacy setup found (above), and $d/takeover.state records an earlier takeover. Run deactivate $i --restore-legacy first. Nothing changed."
+    fi
     if [ -n "$owners" ] && [ "$takeover" -eq 0 ]; then
         printf '%s\n' "$owners" | sed 's/^/  /' >&2
         die "$i: legacy setup found (above). Re-run with --takeover. Nothing changed."
@@ -1042,7 +1150,10 @@ cmd_activate() {
     trap 'exit 1' INT TERM HUP
 
     # 3. Take over. Record everything first, then quarantine and stop.
-    [ -z "$owners" ] || takeover_owners "$i" "$d" "$owners"
+    if [ -n "$owners" ]; then
+        act_took_over=1
+        takeover_owners "$i" "$d" "$owners"
+    fi
     if [ -n "$(supplicant_pids "$i")" ]; then
         die "$i: a supplicant still runs on $i after takeover"
     fi
@@ -1086,8 +1197,12 @@ cmd_plan() {
         return 1
     fi
     if [ -e "$d/takeover.state" ]; then
-        echo "  blocked: $d/takeover.state exists from an earlier takeover. Inspect it first"
-        blocked=1
+        if ledger_dormant "$i"; then
+            echo "  takeover.state: the legacy setup that an earlier takeover replaced is still stopped. activate keeps the record"
+        else
+            echo "  blocked: $d/takeover.state records a legacy setup, and part of it is live again (above). Run deactivate $i --restore-legacy"
+            blocked=1
+        fi
     fi
     if validate_instance "$i"; then
         echo "  files: OK"
@@ -1115,6 +1230,10 @@ cmd_plan() {
         echo "  blocked: cannot tell who owns $i. Resolve these by hand:"
         printf '%s\n' "$owners" | grep -E '^(unknown|ambiguous) ' | sed 's/^/    /'
         blocked=1
+    elif [ -n "$owners" ] && [ -e "$d/takeover.state" ]; then
+        echo "  blocked: legacy setup found, and $d/takeover.state records an earlier takeover. Run deactivate $i --restore-legacy first:"
+        printf '%s\n' "$owners" | sed 's/^/    /'
+        blocked=1
     elif [ -n "$owners" ]; then
         echo "  legacy setup found. A takeover stops and quarantines these:"
         printf '%s\n' "$owners" | sed 's/^/    /'
@@ -1127,7 +1246,11 @@ cmd_plan() {
 }
 
 cmd_deactivate() {
-    [ $# -ge 1 ] || die "usage: deactivate <iface> [--restore-legacy]"
+    [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: deactivate <iface> [--restore-legacy]"
+    case "${2:-}" in
+        '' | --restore-legacy) ;;
+        *) die "deactivate: unknown option '$2'. Usage: deactivate <iface> [--restore-legacy]" ;;
+    esac
     need_iface "$1"
     # Load legacy.sh before anything stops: a missing file must not leave
     # the interface with no supplicant.
@@ -1157,11 +1280,12 @@ install_recover() {
 }
 
 # Install $2 as $3 with mode $1: a copy under a temp name, sync, then a
-# rename. A copy cut short never leaves $3 missing or partial.
+# rename. A copy cut short never leaves $3 missing or partial. The temp
+# name holds the process ID, so two runs at the same time do not share it.
 put() {
-    install -m "$1" "$2" "$3.new"
+    install -m "$1" "$2" "$3.new.$$" || { rm -f -- "$3.new.$$"; return 1; }
     sync 2>/dev/null || true
-    mv -f "$3.new" "$3"
+    mv -f "$3.new.$$" "$3"
 }
 
 cmd_install() {
@@ -1170,8 +1294,10 @@ cmd_install() {
     # /data/unifi-common-addons is shared with other addons: make it 0755
     # if it is missing, and never change it. /data exists on a gateway, so
     # mkdir makes only the shared directory.
+    [ $# -eq 0 ] || die "usage: install"
     [ -d "${DATA%/*}" ] || { mkdir -p "${DATA%/*}" && chmod 0755 "${DATA%/*}"; }
     umask 077
+    setup_lock
     mkdir -p "$DATA" "$INST" "$BUNDLES" "$DATA/systemd"
     chmod 0700 "$DATA" "$INST" "$BUNDLES" "$DATA/systemd"
     install_recover
@@ -1215,7 +1341,12 @@ cmd_install() {
 cmd_uninstall() {
     local i restore
     restore=0
-    [ "${1:-}" = --restore-legacy ] && restore=1
+    [ $# -le 1 ] || die "usage: uninstall [--restore-legacy]"
+    case "${1:-}" in
+        '') ;;
+        --restore-legacy) restore=1 ;;
+        *) die "uninstall: unknown option '$1'. Usage: uninstall [--restore-legacy]" ;;
+    esac
     [ "$restore" -eq 0 ] || need_legacy
     for i in $(instances); do
         if [ -f "$(inst_dir "$i")/takeover.state" ] && [ "$restore" -eq 0 ]; then

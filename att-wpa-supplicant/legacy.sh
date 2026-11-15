@@ -42,8 +42,16 @@ unit_cmds() {
     systemctl show "$1" -p ExecStartPre -p ExecStart -p ExecStartPost \
         -p ExecReload -p Environment --value 2>/dev/null || true
 }
-# A script without its comment lines.
-script_cmds() { sed '/^[[:space:]]*#/d' "$1"; }
+# A script without its comment lines, and without the model probe of
+# 0-att-bypass.sh, a line of exactly this form:
+#   if /sbin/ethtool eth8 | grep -q "Link detected: yes"; then
+# The probe tells a UDM Pro from a base UDM. It starts nothing, so its
+# interface does not name the interface of the setup. Every other line
+# stays, so any other text that names an interface counts.
+script_cmds() {
+    sed -E '/^[[:space:]]*#/d
+        /^[[:space:]]*if[[:space:]]+(\/s?bin\/|\/usr\/s?bin\/)?ethtool[[:space:]]+[A-Za-z0-9._-]+[[:space:]]*\|[[:space:]]*grep[[:space:]]+-q[[:space:]]+"[^"$`\\]*"[[:space:]]*;[[:space:]]*then[[:space:]]*$/d' "$1"
+}
 
 # Classify text that starts a supplicant: ours, other, or none.
 iface_scope() {
@@ -63,6 +71,40 @@ scope_join() {
         *ours*) echo ours ;;
         *) echo none ;;
     esac
+}
+
+# True if the running wpa_supplicant.service may manage <iface> ($1). Its
+# command line names no interface: a D-Bus client adds interfaces. Ask
+# the supplicant on D-Bus for the name of each interface. If the answer
+# cannot be read, count the unit as an owner: a takeover asks the user
+# first, and a second supplicant on <iface> is worse.
+dbus_manages() {
+    local out paths p n
+    systemctl is-active --quiet wpa_supplicant.service || return 1
+    command -v busctl >/dev/null 2>&1 || return 0
+    # --auto-start=no: a query must not start the service.
+    out=$(busctl --auto-start=no --timeout=5 get-property fi.w1.wpa_supplicant1 /fi/w1/wpa_supplicant1 \
+        fi.w1.wpa_supplicant1 Interfaces 2>/dev/null) || return 0
+    # One line, "ao <n>" and then exactly <n> object paths. Anything else
+    # is an answer that this code does not know.
+    paths=$(printf '%s\n' "$out" | awk '
+        NR > 1 { bad = 1 }
+        NR == 1 && $1 == "ao" && $2 ~ /^[0-9]+$/ && NF == $2 + 2 {
+            for (k = 3; k <= NF; k++) {
+                if ($k !~ /^"\/fi\/w1\/wpa_supplicant1\/[A-Za-z0-9_\/]+"$/) exit 1
+                gsub(/"/, "", $k)
+                print $k
+            }
+            ok = 1
+        }
+        END { exit (!ok || bad) }') || return 0
+    for p in $paths; do
+        n=$(busctl --auto-start=no --timeout=5 get-property fi.w1.wpa_supplicant1 "$p" \
+            fi.w1.wpa_supplicant1.Interface Ifname 2>/dev/null) || return 0
+        case "$n" in 's "'*'"') ;; *) return 0 ;; esac
+        [ "$n" != "s \"$1\"" ] || return 0
+    done
+    return 1
 }
 
 # Prints owners of <iface>, one per line:
@@ -102,7 +144,17 @@ find_owners() {
             sc=$(scope_join "$sc" "$(iface_scope "$i" "$(script_cmds "$ONBOOT/0-att-bypass.sh")")")
         fi
         case "$sc" in
-            ours | none) add "unit $u" ;;
+            ours) add "unit $u" ;;
+            # The stock wpa_supplicant.service (the D-Bus service of the
+            # Debian package) names no interface. The firmware can use it,
+            # so it counts only when it runs a supplicant on <iface>: a
+            # process with -i <iface> (the process loop above), or an
+            # interface that a D-Bus client added (dbus_manages).
+            none)
+                if [ "$u" != wpa_supplicant.service ] || dbus_manages "$i"; then
+                    add "unit $u"
+                fi
+                ;;
             other) add "ambiguous $u names another interface" ;;
         esac
     done
@@ -163,6 +215,32 @@ restore_legacy() {
         return 1
     fi
     mv "$d/takeover.state" "$d/takeover.state.restored.$(date +%s)"
+}
+
+# True if the legacy setup that takeover.state of <iface> ($1) records is
+# still out of the way: every unit stopped and disabled, and no boot
+# trigger back in on_boot.d. Logs each item that is live again.
+ledger_dormant() {
+    local d kind a _b _c rc
+    d=$(inst_dir "$1")
+    rc=0
+    while read -r kind a _b _c; do
+        case "$kind" in
+            unit)
+                if unit_live "$a"; then
+                    log "$1: $a (in takeover.state) is enabled or running"
+                    rc=1
+                fi
+                ;;
+            trigger)
+                if [ -f "$ONBOOT/$a" ]; then
+                    log "$1: boot trigger $a (in takeover.state) is back in $ONBOOT"
+                    rc=1
+                fi
+                ;;
+        esac
+    done <"$d/takeover.state"
+    return "$rc"
 }
 
 # Take over <iface> ($1) in instance dir $2 from the owners in $3 (the

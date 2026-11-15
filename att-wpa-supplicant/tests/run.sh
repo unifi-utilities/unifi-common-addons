@@ -126,6 +126,31 @@ fake_proc() { # pid cgroup-unit args...
 }
 
 write_stubs() {
+    # busctl: the D-Bus interfaces of wpa_supplicant.service, one name per
+    # line in $STUB_STATE/dbus. No file: the bus cannot be read.
+    cat >"$B/busctl" <<'EOF'
+#!/bin/sh
+S=$STUB_STATE
+[ -f "$S/dbus" ] || { echo "Failed to get property: no such name" >&2; exit 1; }
+# Options come first; this stub needs both, so that no query starts the
+# service or waits without a limit.
+[ "$1" = --auto-start=no ] && [ "$2" = --timeout=5 ] || { echo "busctl stub: missing options: $*" >&2; exit 1; }
+shift 2
+[ "$1" = get-property ] || exit 1
+# $STUB_STATE/dbus-raw-list and dbus-raw-name: a reply in a form that the
+# addon does not know.
+if [ "$3" = /fi/w1/wpa_supplicant1 ] && [ -f "$S/dbus-raw-list" ]; then cat "$S/dbus-raw-list"; exit 0; fi
+if [ "$3" != /fi/w1/wpa_supplicant1 ] && [ -f "$S/dbus-raw-name" ]; then cat "$S/dbus-raw-name"; exit 0; fi
+if [ "$3" = /fi/w1/wpa_supplicant1 ]; then
+  printf 'ao %d' "$(grep -c . "$S/dbus")"
+  k=0; while read -r n; do printf ' "/fi/w1/wpa_supplicant1/Interfaces/%d"' "$k"; k=$((k + 1)); done <"$S/dbus"
+  echo
+else
+  k=${3##*/}
+  printf 's "%s"\n' "$(sed -n "$((k + 1))p" "$S/dbus")"
+fi
+EOF
+    chmod +x "$B/busctl"
     cat >"$B/logger" <<'EOF'
 #!/bin/sh
 echo "$*" >>"$STUB_STATE/logger.log"
@@ -259,23 +284,59 @@ exit "$rc"
 EOF
     # apt-get: update and download serve fetch. Every other call is logged
     # and fails, so a test sees any attempt to install a package.
+    # apt-cache policy, in apt's format. $STUB_STATE/policy/<name>: the
+    # whole reply, for pinning cases. Else from $STUB_STATE/repo (one
+    # version, priority 500) and an installed vendor build in
+    # $STUB_STATE/firmware-build/<name> (the candidate, served by no
+    # repository, as libnl-3-200 3.7.0-2+ubnt on UniFi OS).
+    cat >"$B/apt-cache" <<'EOF'
+#!/bin/sh
+S=$STUB_STATE
+echo "apt-cache $*" >>"$S/apt.log"
+[ "$1" = policy ] || { echo "E: stub refuses apt-cache $*"; exit 100; }
+shift
+for n; do
+  if [ -f "$S/policy/$n" ]; then cat "$S/policy/$n"; continue; fi
+  rv=''; [ ! -f "$S/repo/$n.deb" ] || rv=$("$STUB_REAL_DPKG" -f "$S/repo/$n.deb" Version)
+  fv=''; [ ! -f "$S/firmware-build/$n" ] || fv=$(cat "$S/firmware-build/$n")
+  printf '%s:\n  Installed: %s\n  Candidate: %s\n  Version table:\n' "$n" "${fv:-(none)}" "${fv:-${rv:-(none)}}"
+  [ -z "$fv" ] || printf ' *** %s 100\n        100 /var/lib/dpkg/status\n' "$fv"
+  [ -z "$rv" ] || printf '     %s 500\n        500 http://deb.debian.org/debian bullseye/main arm64 Packages\n' "$rv"
+done
+EOF
+    chmod +x "$B/apt-cache"
     cat >"$B/apt-get" <<'EOF'
 #!/bin/sh
 S=$STUB_STATE
 echo "apt-get $*" >>"$S/apt.log"
+# -o takes a value.
+skip=0
 for a in "$@"; do
+  [ "$skip" = 0 ] || { skip=0; continue; }
   case "$a" in
     update) [ ! -f "$S/fail/apt-update" ] || exit 100; exit 0 ;;
     download) break ;;
+    -o) skip=1 ;;
     -*) ;;
     *) echo "E: stub refuses apt-get $*"; exit 100 ;;
   esac
 done
-shift
+skip=0
 for a; do
-  case "$a" in -*|download) continue ;; esac
-  [ -f "$S/repo/$a.deb" ] || { echo "E: Can't find a source to download '$a'"; exit 100; }
-  cp "$S/repo/$a.deb" .
+  [ "$skip" = 0 ] || { skip=0; continue; }
+  case "$a" in -o) skip=1; continue ;; -*|download) continue ;; esac
+  n=${a%%=*}
+  # A bare name asks for apt's candidate. $STUB_STATE/firmware-build/<name>
+  # holds an installed vendor version, which is the candidate, and which
+  # no repository serves (as libnl-3-200 3.7.0-2+ubnt on UniFi OS).
+  if [ "$n" = "$a" ] && [ -f "$S/firmware-build/$n" ]; then
+    echo "E: Can't find a source to download version '$(cat "$S/firmware-build/$n")' of '$n:arm64'"; exit 100
+  fi
+  [ -f "$S/repo/$n.deb" ] || { echo "E: Can't find a source to download '$a'"; exit 100; }
+  if [ "$n" != "$a" ] && [ "${a#*=}" != "$("$STUB_REAL_DPKG" -f "$S/repo/$n.deb" Version)" ]; then
+    echo "E: Version '${a#*=}' for '$n' was not found"; exit 100
+  fi
+  cp "$S/repo/$n.deb" .
 done
 EOF
     cat >"$B/fake-wpa_supplicant" <<'EOF'
@@ -409,9 +470,9 @@ t_fetch() {
     expect_grep '^pkg=wpasupplicant 2:2.9.0-21+deb11u3$' "$m" "fetch: bundles wpasupplicant"
     expect_grep '^pkg=libpcsclite1 1.9.1-1$' "$m" "fetch: bundles libpcsclite1"
     expect_eq "$(grep -c '^pkg=' "$m")" 2 "fetch: bundles the two runtime packages only"
-    expect_grep 'download -qq wpasupplicant libpcsclite1$' "$S/apt.log" "fetch: downloads the packages by name"
-    other=$(grep -v '^apt-get \(update\|download\) ' "$S/apt.log")
-    expect_eq "$other" "" "fetch: no apt-get call other than update and download"
+    expect_grep 'download -qq -o APT::Sandbox::User=root wpasupplicant=2:2.9.0-21+deb11u3 libpcsclite1=1.9.1-1$' "$S/apt.log" "fetch: downloads the repository version of each package, as root (no sandbox warning)"
+    other=$(grep -v '^apt-get \(update\|download\) \|^apt-cache policy ' "$S/apt.log")
+    expect_eq "$other" "" "fetch: no apt call other than update, download, and policy"
     expect_out 'ready: .*wpasupplicant 2:2.9.0-21+deb11u3' "fetch: names the wpasupplicant version"
     expect_out 'ready: .*libpcsclite1 1.9.1-1' "fetch: names the libpcsclite1 version"
     # A failed download keeps the bundle.
@@ -425,6 +486,91 @@ t_fetch() {
     expect_rc 1 "fetch: fails when apt-get update fails"
     expect_out 'Existing bundle kept' "fetch: says that it kept the bundle"
     [ -z "$(find "$R/data/unifi-common-addons/att-wpa-supplicant/bundles" -name '.fetch.*')" ] && ok "fetch: no temp dir left" || bad "fetch: no temp dir left"
+}
+
+# wpasupplicant names its libraries in Depends. fetch bundles those in
+# RUNTIME_LIBS, and the runtime holds them.
+t_fetch_libs() {
+    setup fetch-libs
+    mkdir -p "$S/repo"
+    cp "$(mkdeb wpasupplicant 2:2.9.0-21+deb11u3 'Depends: libc6 (>= 2.29), libnl-3-200 (>= 3.2.21), libnl-genl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.4.0), libpcsclite1 (>= 1.0.0), libreadline8 (>= 6.0), libssl1.1 (>= 1.1.1)
+')" "$S/repo/wpasupplicant.deb"
+    repo libpcsclite1 1.9.1-1
+    repo libnl-3-200 3.4.0-1+b1
+    repo libnl-genl-3-200 3.4.0-1+b1
+    repo libnl-route-3-200 3.4.0-1+b1
+    repo libreadline8 8.1-1
+    run fetch
+    expect_rc 0 "fetch libs: succeeds"
+    b="$R/data/unifi-common-addons/att-wpa-supplicant/bundles/bullseye-arm64"
+    expect_grep 'download -qq -o APT::Sandbox::User=root libnl-3-200=3.4.0-1+b1 libnl-genl-3-200=3.4.0-1+b1 libnl-route-3-200=3.4.0-1+b1 libreadline8=8.1-1$' "$S/apt.log" "fetch libs: downloads the libraries in Depends, and no other package"
+    expect_grep '^pkg=libnl-3-200 3.4.0-1+b1$' "$b/MANIFEST" "fetch libs: MANIFEST lists libnl-3-200"
+    expect_eq "$(grep -c '^pkg=' "$b/MANIFEST")" 6 "fetch libs: bundles the runtime packages and four libraries"
+    expect_file "$b/root/usr/lib/aarch64-linux-gnu/libreadline8.so" "fetch libs: the runtime holds the library"
+    # The firmware has its own libnl builds installed (UniFi OS: +ubnt). No
+    # repository serves them, so a download by bare name fails. fetch asks
+    # for the repository version.
+    mkdir -p "$S/firmware-build"
+    for p in libnl-3-200 libnl-genl-3-200 libnl-route-3-200; do printf '3.4.0-8+ubnt' >"$S/firmware-build/$p"; done
+    run fetch
+    expect_rc 0 "fetch libs: succeeds when the firmware has its own libnl builds"
+    expect_grep '^pkg=libnl-genl-3-200 3.4.0-1+b1$' "$b/MANIFEST" "fetch libs: bundles the repository libnl, not the firmware build"
+    # Pinning: apt's candidate is served by a repository, and a newer
+    # version sits in a suite at lower priority. fetch keeps the candidate.
+    mkdir -p "$S/policy"
+    printf '%s\n' 'libreadline8:' '  Installed: (none)' '  Candidate: 8.1-1' '  Version table:' \
+        '     8.2-6 100' '        100 http://deb.debian.org/debian sid/main arm64 Packages' \
+        '     8.1-1 500' '        500 http://deb.debian.org/debian bullseye/main arm64 Packages' >"$S/policy/libreadline8"
+    run fetch
+    expect_rc 0 "fetch libs: succeeds with a newer version at lower priority"
+    expect_grep ' libreadline8=8.1-1$' "$S/apt.log" "fetch libs: keeps apt's candidate, not the newer pinned-down version"
+    # The installed build is the candidate; of two repository versions,
+    # the higher priority wins, not the newer one; a negative pin never.
+    printf '%s\n' 'libreadline8:' '  Installed: 8.1-1+vendor' '  Candidate: 8.1-1+vendor' '  Version table:' \
+        '     8.3-1 -1' '        -1 http://deb.debian.org/debian experimental/main arm64 Packages' \
+        '     8.2-6 100' '        100 http://deb.debian.org/debian sid/main arm64 Packages' \
+        ' *** 8.1-1+vendor 100' '        100 /var/lib/dpkg/status' \
+        '     8.1-1 500' '        500 http://deb.debian.org/debian bullseye/main arm64 Packages' >"$S/policy/libreadline8"
+    : >"$S/apt.log"
+    run fetch
+    expect_grep ' libreadline8=8.1-1$' "$S/apt.log" "fetch libs: with a vendor build installed, takes the repository version of highest priority"
+    # The only repository version is pinned below 0: no usable version.
+    printf '%s\n' 'libreadline8:' '  Installed: 8.1-1+vendor' '  Candidate: 8.1-1+vendor' '  Version table:' \
+        ' *** 8.1-1+vendor 100' '        100 /var/lib/dpkg/status' \
+        '     8.1-1 -1' '        -1 http://deb.debian.org/debian bullseye/main arm64 Packages' >"$S/policy/libreadline8"
+    run fetch
+    expect_rc 1 "fetch libs: a version pinned below 0 is never downloaded"
+    expect_out 'no repository serves libreadline8' "fetch libs: says which package"
+    rm -r "$S/policy"
+    # A library that no repository serves fails the fetch. The bundle stays.
+    rm "$S/repo/libreadline8.deb"
+    run fetch
+    expect_rc 1 "fetch libs: fails when a library cannot be downloaded"
+    expect_out 'Existing bundle kept' "fetch libs: keeps the bundle"
+    expect_file "$b/root/usr/lib/aarch64-linux-gnu/libreadline8.so" "fetch libs: the old runtime stays"
+}
+
+# A bundle with two packages of one library is refused.
+t_bundle_lib_twice() {
+    setup lib-twice
+    mkdir -p "$T/arc/bullseye-arm64"
+    cp "$(mkdeb wpasupplicant 2:2.9.0-21)" "$(mkdeb libpcsclite1 1.9.1-1)" "$T/arc/bullseye-arm64/"
+    cp "$(mkdeb libnl-3-200 3.4.0-1)" "$T/arc/bullseye-arm64/a.deb"
+    cp "$(mkdeb libnl-3-200 3.4.0-2)" "$T/arc/bullseye-arm64/b.deb"
+    (cd "$T/arc/bullseye-arm64" && sha256sum -- *.deb >SHA256SUMS && printf 'codename=bullseye\narch=arm64\n' >MANIFEST)
+    tar -czf "$T/lib-twice.tgz" -C "$T/arc" bullseye-arm64
+    run import-bundle "$T/lib-twice.tgz"
+    expect_rc 1 "bundle: two packages of one library are refused"
+    expect_out 'at most one libnl-3-200' "bundle: names the library"
+    # Some of the libnl packages, not all three: refused.
+    rm -rf "$T/arc"
+    mkdir -p "$T/arc/bullseye-arm64"
+    cp "$(mkdeb wpasupplicant 2:2.9.0-21)" "$(mkdeb libpcsclite1 1.9.1-1)" "$(mkdeb libnl-3-200 3.4.0-1)" "$T/arc/bullseye-arm64/"
+    (cd "$T/arc/bullseye-arm64" && sha256sum -- *.deb >SHA256SUMS && printf 'codename=bullseye\narch=arm64\n' >MANIFEST)
+    tar -czf "$T/lib-part.tgz" -C "$T/arc" bullseye-arm64
+    run import-bundle "$T/lib-part.tgz"
+    expect_rc 1 "bundle: some of the libnl packages are refused"
+    expect_out 'all three libnl packages or none' "bundle: says why"
 }
 
 t_install_inert() {
@@ -982,7 +1128,7 @@ t_install_upgrade() {
     expect_eq "$(old_sig)" "$before" "install: a failed copy leaves the installed script whole"
     run install
     expect_rc 0 "install: the next install succeeds"
-    expect_nofile "$R/data/unifi-common-addons/att-wpa-supplicant/att-wpa-supplicant.new" "install: no temp copy left"
+    expect_eq "$(find "$R/data/unifi-common-addons/att-wpa-supplicant" "$R/etc/systemd/system" -name '*.new*' | wc -l | tr -d ' ')" 0 "install: no temp copy left"
     # The same for the unit in /etc/systemd/system.
     echo 'old unit' >"$R/etc/systemd/system/att-wpa-supplicant@.service"
     # shellcheck disable=SC2016 # expands in the stub
@@ -1139,6 +1285,204 @@ t_plan() {
     expect_rc 1 "plan: blocked by an unknown owner"
     expect_out 'unknown 4242' "plan: names the unknown process"
     if printf '%s' "$OUT" | grep -q 'next:'; then bad "plan: no next step when blocked"; else ok "plan: no next step when blocked"; fi
+}
+
+# The setup of 0-att-bypass.sh on another WAN port. Its "ethtool eth8"
+# model probe names eth8, but the override of wpa_supplicant.service names
+# the port. The probe does not block the takeover.
+t_takeover_0att_other_port() {
+    for port in eth4 eth9; do
+        setup "0att-$port"
+        system_supplicant
+        bundle_ready
+        mkdir -p "$R/sys/class/net/$port"
+        "$SCRIPT" add-instance "$port" "$T/src" >/dev/null 2>&1
+        cp "$HERE/fixtures/legacy-0-att-bypass.sh" "$R/data/on_boot.d/0-att-bypass.sh"
+        unit wpa_supplicant.service enabled active
+        printf 'ExecStart=/sbin/wpa_supplicant -u -s -Dwired -i%s -c/etc/x.conf\n' "$port" >"$S/units/wpa_supplicant.service.cat"
+        unit setup-att-bypass.service enabled failed
+        printf 'ExecStart=/data/on_boot.d/0-att-bypass.sh\n' >"$S/units/setup-att-bypass.service.cat"
+        fake_proc 900 wpa_supplicant.service /sbin/wpa_supplicant -u -s -Dwired "-i$port" -c/etc/x.conf
+        authorized
+        run activate "$port" --takeover
+        expect_rc 0 "0-att-bypass on $port: takeover succeeds"
+        expect_grep '^trigger 0-att-bypass.sh$' "$(INSTD "$port")/takeover.state" "0-att-bypass on $port: trigger recorded"
+        expect_eq "$(state_of wpa_supplicant.service enabled)" disabled "0-att-bypass on $port: legacy unit disabled"
+    done
+    # The override names eth9, the instance is eth8: still ambiguous.
+    setup 0att-mismatch
+    system_supplicant
+    bundle_ready
+    "$SCRIPT" add-instance eth8 "$T/src" >/dev/null 2>&1
+    cp "$HERE/fixtures/legacy-0-att-bypass.sh" "$R/data/on_boot.d/0-att-bypass.sh"
+    unit wpa_supplicant.service enabled active
+    printf 'ExecStart=/sbin/wpa_supplicant -u -s -Dwired -ieth9 -c/etc/x.conf\n' >"$S/units/wpa_supplicant.service.cat"
+    authorized
+    run activate eth8 --takeover
+    expect_rc 1 "0-att-bypass on eth9, instance eth8: refused"
+    expect_out 'ambiguous wpa_supplicant.service' "0-att-bypass on eth9, instance eth8: names the unit"
+    # A probe and a supplicant start on one line: the probe goes, eth9
+    # stays.
+    setup probe-line
+    bundle_ready
+    "$SCRIPT" add-instance eth8 "$T/src" >/dev/null 2>&1
+    printf '#!/bin/sh\nif /sbin/ethtool eth9 | grep -q yes; then wpa_supplicant -Dwired -i eth9 -c /x; fi\n' >"$R/data/on_boot.d/0-att-bypass.sh"
+    run activate eth8 --takeover
+    expect_rc 1 "probe line: a supplicant start after the probe still counts"
+    expect_out 'ambiguous 0-att-bypass.sh' "probe line: names the script"
+    expect_file "$R/data/on_boot.d/0-att-bypass.sh" "probe line: script untouched"
+    # A probe in another form is not the model probe: its interface counts.
+    printf '#!/bin/sh\ncase "$(ethtool eth9 | grep Speed)" in *1000*) wpa_supplicant -i eth9 -c /x ;; esac\n' >"$R/data/on_boot.d/0-att-bypass.sh"
+    run activate eth8 --takeover
+    expect_rc 1 "probe in a case statement: refused"
+    expect_out 'ambiguous 0-att-bypass.sh' "probe in a case statement: names the script"
+}
+
+# The stock wpa_supplicant.service (D-Bus, no interface) is not a legacy
+# owner. Activate leaves it alone.
+t_stock_wpa_service_ignored() {
+    setup stock-wpa
+    system_supplicant
+    bundle_ready
+    "$SCRIPT" add-instance eth8 "$T/src" >/dev/null 2>&1
+    unit wpa_supplicant.service enabled active
+    printf 'ExecStart=/sbin/wpa_supplicant -u -s -O "DIR=/run/wpa_supplicant GROUP=netdev"\n' >"$S/units/wpa_supplicant.service.cat"
+    : >"$S/dbus"
+    authorized
+    run activate eth8
+    expect_rc 0 "stock wpa_supplicant.service: plain activate succeeds"
+    expect_eq "$(state_of wpa_supplicant.service enabled)" enabled "stock wpa_supplicant.service: still enabled"
+    expect_eq "$(state_of wpa_supplicant.service active)" active "stock wpa_supplicant.service: still running"
+    # The same unit with a supplicant on eth8 is an owner.
+    setup stock-wpa-running
+    system_supplicant
+    bundle_ready
+    "$SCRIPT" add-instance eth8 "$T/src" >/dev/null 2>&1
+    unit wpa_supplicant.service enabled active
+    printf 'ExecStart=/sbin/wpa_supplicant -u -s -O "DIR=/run/wpa_supplicant GROUP=netdev"\n' >"$S/units/wpa_supplicant.service.cat"
+    fake_proc 905 wpa_supplicant.service /sbin/wpa_supplicant -Dwired -ieth8 -c/x.conf
+    run activate eth8
+    expect_rc 1 "stock wpa_supplicant.service with a supplicant on eth8: needs --takeover"
+    expect_out 'unit wpa_supplicant.service' "stock wpa_supplicant.service with a supplicant on eth8: listed"
+    # A D-Bus client added eth8: the process has no -i, but the supplicant
+    # lists eth8 on D-Bus. It is an owner.
+    setup stock-wpa-dbus
+    system_supplicant
+    bundle_ready
+    "$SCRIPT" add-instance eth8 "$T/src" >/dev/null 2>&1
+    unit wpa_supplicant.service enabled active
+    printf 'ExecStart=/sbin/wpa_supplicant -u -s -O "DIR=/run/wpa_supplicant GROUP=netdev"\n' >"$S/units/wpa_supplicant.service.cat"
+    fake_proc 906 wpa_supplicant.service /sbin/wpa_supplicant -u -s -O "DIR=/run/wpa_supplicant GROUP=netdev"
+    printf 'wlan0\neth8\n' >"$S/dbus"
+    authorized
+    run activate eth8
+    expect_rc 1 "stock wpa_supplicant.service managing eth8 over D-Bus: needs --takeover"
+    expect_out 'unit wpa_supplicant.service' "stock wpa_supplicant.service managing eth8 over D-Bus: listed"
+    # The bus cannot be read: count it.
+    rm "$S/dbus"
+    run activate eth8
+    expect_rc 1 "stock wpa_supplicant.service, D-Bus unreadable: needs --takeover"
+    # Replies in an unknown form: count it.
+    printf 'wlan0\n' >"$S/dbus"
+    for raw in 'ao 1' 'ao 2 "/fi/w1/wpa_supplicant1/Interfaces/0"' 'as 1 "eth8"' 'ao 1 "/x/y"'; do
+        printf '%s\n' "$raw" >"$S/dbus-raw-list"
+        "$SCRIPT" deactivate eth8 >/dev/null 2>&1
+        run activate eth8
+        expect_rc 1 "stock wpa_supplicant.service, Interfaces reply '$raw': needs --takeover"
+        expect_out 'unit wpa_supplicant.service' "stock wpa_supplicant.service, Interfaces reply '$raw': listed"
+    done
+    rm "$S/dbus-raw-list"
+    printf 'u 0\n' >"$S/dbus-raw-name"
+    "$SCRIPT" deactivate eth8 >/dev/null 2>&1
+    run activate eth8
+    expect_rc 1 "stock wpa_supplicant.service, Ifname reply 'u 0': needs --takeover"
+    expect_out 'unit wpa_supplicant.service' "stock wpa_supplicant.service, Ifname reply 'u 0': listed"
+    rm "$S/dbus-raw-name"
+    "$SCRIPT" deactivate eth8 >/dev/null 2>&1
+    # Another interface only: not an owner.
+    run activate eth8
+    expect_rc 0 "stock wpa_supplicant.service managing another interface: plain activate succeeds"
+}
+
+# deactivate, then activate, after a takeover: the ledger stays, and
+# activate starts again while the legacy setup stays stopped.
+t_reactivate_after_takeover() {
+    setup reactivate
+    legacy_box
+    authorized
+    "$SCRIPT" activate eth8 --takeover >/dev/null 2>&1
+    ledger=$(cat "$(INSTD eth8)/takeover.state")
+    run deactivate eth8
+    expect_rc 0 "reactivate: deactivate succeeds"
+    run plan eth8
+    expect_rc 0 "reactivate: plan is not blocked by the ledger"
+    run activate eth8
+    expect_rc 0 "reactivate: activate succeeds with the legacy setup still stopped"
+    expect_eq "$(cat "$(INSTD eth8)/takeover.state" 2>/dev/null)" "$ledger" "reactivate: ledger kept unchanged"
+    run uninstall
+    expect_rc 1 "reactivate: uninstall still needs --restore-legacy"
+    # A failed re-activation took nothing over. Its rollback stops our
+    # unit and keeps the legacy setup stopped and the ledger.
+    "$SCRIPT" deactivate eth8 >/dev/null 2>&1
+    unauthorized
+    run activate eth8
+    expect_rc 1 "reactivate: fails when unauthorized"
+    expect_eq "$(state_of wpa_supplicant.service enabled)" disabled "reactivate: rollback keeps the legacy unit disabled"
+    expect_nofile "$R/data/on_boot.d/0-att-bypass.sh" "reactivate: rollback keeps the trigger in quarantine"
+    expect_eq "$(cat "$(INSTD eth8)/takeover.state" 2>/dev/null)" "$ledger" "reactivate: rollback keeps the ledger"
+    expect_nofile "$(INSTD eth8)/active" "reactivate: rollback removes the flag"
+    authorized
+    # A recorded unit is enabled again: refuse.
+    "$SCRIPT" deactivate eth8 >/dev/null 2>&1
+    unit wpa_supplicant.service enabled inactive
+    : >"$S/systemctl.log"
+    run activate eth8
+    expect_rc 1 "reactivate: refused when a recorded unit is enabled again"
+    expect_out 'wpa_supplicant.service (in takeover.state) is enabled or running' "reactivate: names the unit"
+    expect_nofile "$(INSTD eth8)/active" "reactivate: no flag after refusal"
+    expect_nogrep '^\(stop\|disable\)' "$S/systemctl.log" "reactivate: nothing stopped or disabled"
+    run plan eth8
+    expect_rc 1 "reactivate: plan is blocked"
+    # A recorded trigger is back: refuse.
+    unit wpa_supplicant.service disabled inactive
+    cp "$HERE/fixtures/legacy-0-att-bypass.sh" "$R/data/on_boot.d/0-att-bypass.sh"
+    run activate eth8
+    expect_rc 1 "reactivate: refused when a recorded trigger is back"
+    expect_out 'boot trigger 0-att-bypass.sh (in takeover.state) is back' "reactivate: names the trigger"
+}
+
+# Unknown options are errors, not ignored.
+t_unknown_options() {
+    setup options
+    legacy_box
+    authorized
+    run activate eth8 --takover
+    expect_rc 1 "options: activate rejects --takover"
+    expect_out "unknown option '--takover'" "options: activate names the option"
+    expect_nofile "$(INSTD eth8)/takeover.state" "options: activate changed nothing"
+    run deactivate eth8 --restore-legacyy
+    expect_rc 1 "options: deactivate rejects an unknown option"
+    run uninstall --restore
+    expect_rc 1 "options: uninstall rejects an unknown option"
+    expect_file "$R/etc/systemd/system/att-wpa-supplicant@.service" "options: uninstall changed nothing"
+    run boot extra
+    expect_rc 1 "options: boot rejects an argument"
+}
+
+# boot holds the setup lock. A second boot waits for it, then gives up.
+t_boot_lock() {
+    setup boot-lock
+    bundle_ready
+    "$SCRIPT" add-instance eth8 "$T/src" >/dev/null 2>&1
+    flock -x "$R/run/att-wpa-supplicant.setup.lock" sleep 4 &
+    hold=$!
+    sleep 1
+    OUT=$(ATT_WPA_LOCK_WAIT=1 "$SCRIPT" boot 2>&1) && RC=0 || RC=$?
+    expect_rc 1 "boot lock: a second boot gives up while another holds the lock"
+    expect_out 'holds' "boot lock: says why"
+    wait "$hold"
+    run boot
+    expect_rc 0 "boot lock: boot succeeds once the lock is free"
 }
 
 t_activate_takeover_success() {
@@ -1331,9 +1675,13 @@ t_restore_failure_keeps_ledger() {
     legacy_box
     authorized
     "$SCRIPT" activate eth8 --takeover >/dev/null 2>&1
-    chmod 555 "$R/data/on_boot.d"
+    # on_boot.d is a file, so the trigger cannot move back. This works
+    # as root too, unlike a read-only directory.
+    mv "$R/data/on_boot.d" "$T/on_boot.d.real"
+    : >"$R/data/on_boot.d"
     run deactivate eth8 --restore-legacy
-    chmod 755 "$R/data/on_boot.d"
+    rm "$R/data/on_boot.d"
+    mv "$T/on_boot.d.real" "$R/data/on_boot.d"
     expect_rc 1 "restore: fails when a trigger cannot be moved back"
     expect_file "$(INSTD eth8)/takeover.state" "restore: ledger kept after a failed restore"
     expect_file "$(INSTD eth8)/quarantine/0-att-bypass.sh" "restore: quarantined trigger kept"
@@ -1613,13 +1961,15 @@ t_units_static() {
     grep -q 'ExecCondition' "$u" && bad "unit: no ExecCondition" || ok "unit: no ExecCondition"
     grep -q '^RuntimeDirectory=att-wpa-supplicant/%i$' "$u" && ok "unit: RuntimeDirectory is only the control socket directory (/run is noexec on UniFi OS)" || bad "unit: RuntimeDirectory is only the control socket directory (/run is noexec on UniFi OS)"
     grep -q 'BindsTo' "$u" && bad "unit: no BindsTo" || ok "unit: no BindsTo"
+    grep -q '^RequiresMountsFor=/data$' "$u" && ok "unit: waits for /data (a skipped start is not retried)" || bad "unit: waits for /data (a skipped start is not retried)"
 }
 
-for t in t_install_inert t_fetch t_add_instance t_validate_rejects \
+for t in t_install_inert t_fetch t_fetch_libs t_bundle_lib_twice t_add_instance t_validate_rejects \
     t_runtime_start t_runtime_refusals t_runtime_prev t_import_unpacks t_swap_while_running t_install_upgrade \
     t_bundle_swap_keeps_previous t_bundle_lock \
     t_activate_refuses_unknown t_activate_dormant_launchers t_activate_needs_takeover t_plan \
-    t_activate_takeover_success t_takeover_evie_lau t_takeover_launcher_first t_activate_setup_dropin_other t_activate_rollback_unauthorized t_activate_rollback_enable_fails \
+    t_activate_takeover_success t_takeover_0att_other_port t_stock_wpa_service_ignored t_reactivate_after_takeover \
+    t_unknown_options t_boot_lock t_takeover_evie_lau t_takeover_launcher_first t_activate_setup_dropin_other t_activate_rollback_unauthorized t_activate_rollback_enable_fails \
     t_activate_rollback_start_fails t_activate_legacy_stop_fails t_activate_masked_instance \
     t_deactivate_refuses_restore_if_ours_runs t_takeover_records_disabled_running_unit \
     t_restore_failure_keeps_ledger t_rollback_without_legacy_stops_ours \

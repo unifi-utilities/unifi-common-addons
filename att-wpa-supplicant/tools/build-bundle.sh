@@ -1,7 +1,9 @@
 #!/bin/sh
 # Builds a bundle for each named Debian release, for one architecture. A
-# bundle holds the two packages that the addon unpacks into its runtime:
-# wpasupplicant and libpcsclite1. Runs on any machine with Docker. It needs
+# bundle holds the packages that the addon unpacks into its runtime:
+# wpasupplicant, libpcsclite1, and the libnl, libdbus, and libreadline
+# packages that wpasupplicant depends on (the names come from its Depends
+# field). Runs on any machine with Docker. It needs
 # no emulation: the container runs on the host architecture, and APT is told
 # the target architecture, so it only downloads the packages.
 # Usage: tools/build-bundle.sh <codename>[,<codename>...] <arch> [outdir]
@@ -11,6 +13,8 @@
 # builds the rest and exits non-zero at the end.
 set -eu
 PKGS="wpasupplicant libpcsclite1"
+# The same list as RUNTIME_LIBS in att-wpa-supplicant.
+LIBS="libnl-3-200 libnl-genl-3-200 libnl-route-3-200 libdbus-1-3 libreadline8 libreadline8t64"
 [ $# -ge 2 ] || { echo "usage: $0 <codename>[,<codename>...] <arch> [outdir]" >&2; exit 2; }
 codename=$1
 arch=$2
@@ -51,7 +55,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/$name"
 
-docker run --rm -e "TARGET_ARCH=$arch" -e "PKGS=$PKGS" -e "ARCHIVED=$archived" -e "CODENAME=$codename" \
+docker run --rm -e "TARGET_ARCH=$arch" -e "PKGS=$PKGS" -e "LIBS=$LIBS" -e "ARCHIVED=$archived" -e "CODENAME=$codename" \
     -v "$work/$name:/out" "debian:$codename" sh -euc '
     if [ "$ARCHIVED" = 1 ]; then
         rm -f /etc/apt/sources.list.d/*
@@ -61,8 +65,14 @@ docker run --rm -e "TARGET_ARCH=$arch" -e "PKGS=$PKGS" -e "ARCHIVED=$archived" -
     printf "APT::Architecture \"%s\";\nAPT::Architectures \"%s\";\n" "$TARGET_ARCH" "$TARGET_ARCH" \
         > /etc/apt/apt.conf.d/00target-arch
     apt-get update -qq
-    cd /out && apt-get download -qq $PKGS
-    for p in $PKGS; do
+    cd /out && apt-get download -qq -o APT::Sandbox::User=root $PKGS
+    deps=$(dpkg-deb -f wpasupplicant_*.deb Depends | tr ",|" "\n\n" | sed "s/(.*//; s/:.*//; s/[[:space:]]//g")
+    libs=""
+    for p in $deps; do
+        case " $LIBS " in *" $p "*) libs="$libs $p" ;; esac
+    done
+    [ -z "$libs" ] || apt-get download -qq -o APT::Sandbox::User=root $libs
+    for p in $PKGS $libs; do
         n=0
         for f in *.deb; do [ "$(dpkg-deb -f "$f" Package)" = "$p" ] && n=$((n + 1)); done
         [ "$n" -eq 1 ] || { echo "expected one $p package, got $n" >&2; exit 1; }
