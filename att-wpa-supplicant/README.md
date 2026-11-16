@@ -577,10 +577,15 @@ nearby.
 
 ## Tested configurations
 
-| Model | UniFi OS | Debian |
-|---|---|---|
-| UDM Pro | 6.0.17 | 13 (trixie) |
-| UDM Pro | 5.1.34 and 5.1.35 | 11 (bullseye) |
+| Model | UniFi OS | Debian | Libraries |
+|---|---|---|---|
+| UDM Pro | 6.0.17 | 13 (trixie) | bundled |
+| UDM Pro | 5.1.34 and 5.1.35 | 11 (bullseye) | firmware's |
+
+"Libraries" tells where `libnl`, `libdbus-1`, and `libreadline` came
+from on the gateway. The 5.1.x tests ran before the bundle held these
+libraries. `tests/eap-tls.sh` tests the bundled libraries on Debian 11,
+12, and 13 in a container.
 
 ## Credits
 
