@@ -67,6 +67,10 @@ usage() {
     cat <<'EOF'
 Usage: att-wpa-supplicant <command> [args]
 
+Start here
+  setup [iface]                   Guided setup. Asks questions and runs the steps
+                                  below in order. Asks before it changes the WAN.
+
 Setup
   install                         Copy the addon to /data. Unpack the runtime of
                                   bundles that have none. Install the boot entry
@@ -1558,6 +1562,470 @@ cmd_uninstall() {
     log "uninstall: units and boot entry removed. $DATA kept"
 }
 
+# ---------- setup (v0.3) ----------
+
+# Guided setup. It talks to the user on stdout and reads the answers on
+# stdin. It runs each step as a new process of the installed script, so
+# that each step keeps its own checks, EXIT trap, and rollback. User
+# guide: README.md, "Set up". Each message says what happened, what it
+# means for the WAN, and the next step.
+
+SETUP_STEPS=6
+CERTS_HOME="$R/data/att-certs"
+# st_phase: where setup is, for the message after an interruption or the
+# end of input. safe: nothing on the WAN changed. cable: the user may
+# have moved the cable. connect: activate runs or ran.
+st_phase=safe
+
+st_step() { printf '\nStep %s of %s: %s\n' "$1" "$SETUP_STEPS" "$2"; }
+st_say() {
+    local l
+    for l; do
+        if [ -n "$l" ]; then printf '  %s\n' "$l"; else printf '\n'; fi
+    done
+}
+# Stop setup. Each argument is one line. Exit status 1.
+st_stop() {
+    printf '\n'
+    st_say "$@"
+    exit 1
+}
+# The lines that tell the user where the WAN is, for each phase.
+st_where() {
+    case "$st_phase" in
+        safe) st_say "Nothing changed on the WAN." ;;
+        cable) st_say "The addon changed nothing. If you moved the cable, put it back" \
+            "on the RG to get internet access again ('Go back to the RG' in the README)." ;;
+        connect) st_say "The addon was connecting to AT&T. The lines above show what it did." \
+            "Run: $PROG check" \
+            "If internet access is down, follow 'Go back to the RG' in the README." ;;
+    esac
+}
+st_eof() {
+    printf '\n'
+    st_say "Setup stopped: no answer (end of input)."
+    st_where
+    st_say "Run setup again in a terminal: $PROG setup"
+    exit 1
+}
+# INT, TERM, HUP. dash runs a trap after the foreground command ends, so
+# a running step (and its own rollback) finishes first. Ctrl-C reaches
+# the step too: activate then rolls back. Its output went to a file, so
+# no closed pipe can stop the rollback. Show that output now.
+st_interrupted() {
+    trap - INT TERM HUP
+    printf '\n'
+    [ "$st_phase" != connect ] || [ ! -s "$st_tmp/out" ] || st_mask <"$st_tmp/out"
+    st_say "" "Setup stopped: interrupted."
+    st_where
+    st_say "Run setup again when you are ready: $PROG setup"
+    exit 1
+}
+# Ask a question. Sets st_ans. Stops setup at the end of input.
+st_read() {
+    printf '  %s ' "$1"
+    IFS= read -r st_ans || st_eof
+}
+# Yes or no. $2 is the default for an empty answer (y or n).
+st_yes() {
+    local hint
+    if [ "$2" = y ]; then hint='[Y/n]'; else hint='[y/N]'; fi
+    while :; do
+        st_read "$1 $hint"
+        case "$st_ans" in
+            '') [ "$2" = y ]; return ;;
+            y | Y | yes | Yes | YES) return 0 ;;
+            n | N | no | No | NO) return 1 ;;
+        esac
+        st_say "Type y for yes or n for no."
+    done
+}
+# Hide addresses in text: APT's "[IP: ...]", IPv6 addresses (with "::",
+# a leading "::", or at least four colons, with a zone), MAC addresses
+# (colon, hyphen, dot, and compact forms), and IPv4 addresses, but
+# 1.1.1.1, which the messages name as the test address. IPv6 goes before
+# MAC, so that no part of an address stays. "_" counts as a separator
+# (GNU sed's \b treats it as a letter): names like cert_aabbccddeeff.
+# A four-part version or a 12-digit hex number is hidden too: safe, not
+# exact. The input is the output of a step, or names that the user chose.
+st_mask_text() {
+    sed -E 's/_/\x01/g
+        s/\[IP: [^]]*\]/[IP: hidden]/g
+        s/(^|[^0-9A-Za-z:])::[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*(%[A-Za-z0-9.-]+)?/\1<address>/g
+        s/\b[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{0,4})*::([0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*)?(%[A-Za-z0-9.-]+)?/<address>/g
+        s/\b([0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}\b(%[A-Za-z0-9.-]+)?/<address>/g
+        s/\b([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b/<MAC>/g
+        s/\b[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\b/<MAC>/g
+        s/\b[0-9A-Fa-f]{12}\b/<MAC>/g
+        s/\b1\.1\.1\.1\b/@ONE@/g
+        s/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/<address>/g
+        s/@ONE@/1.1.1.1/g
+        s/\x01/_/g'
+}
+# The output of a step, as setup shows it: masked, without the program
+# name, indented, and with no space at the end of a line.
+st_mask() {
+    sed "s/^$PROG: //" | st_mask_text | sed 's/^/    /; s/ *$//'
+}
+# Run a step: the installed script with these arguments. Its output goes
+# to a file, not to a pipe: a pipe reader that Ctrl-C ends could stop the
+# step (for example the rollback of activate) with SIGPIPE. Then setup
+# shows the output, indented, with addresses hidden. Sets st_out and
+# st_rc (the exit status of the step itself). A step reads nothing from
+# stdin: the answers of the user are for setup only.
+st_run() {
+    st_run_quiet "$@"
+    [ "$st_rc" -ne 0 ] || [ -z "$st_out" ] || printf '%s\n' "$st_out" | st_mask
+}
+# The same, but shows the output only if the step fails.
+st_run_quiet() {
+    logger -t "$PROG" -- "setup: run $*" 2>/dev/null || true
+    st_rc=0
+    # "true", not ":": in dash a failed redirection of the special
+    # builtin ":" ends the shell.
+    if ! true >"$st_tmp/out" 2>/dev/null; then
+        st_stop "Setup stopped: cannot write in $st_tmp. Check the free space: df -h /tmp" \
+            "Setup changed nothing on the WAN in this step. Then run setup again."
+    fi
+    "$st_bin" "$@" </dev/null >"$st_tmp/out" 2>&1 || st_rc=$?
+    st_out=$(cat "$st_tmp/out" 2>/dev/null) || st_out=
+    [ "$st_rc" -eq 0 ] || [ -z "$st_out" ] || printf '%s\n' "$st_out" | st_mask
+}
+
+# True if the addon is installed and deployed: the installed copy has the
+# files of this copy, and the boot entry, the unit, and the command link
+# are in place.
+st_installed() {
+    local f
+    [ -x "$DATA/$PROG" ] || return 1
+    if [ "$(cd "$SELF_DIR" && pwd)" != "$DATA" ]; then
+        for f in "$PROG" legacy.sh "$KEYS_FILE" "systemd/$INSTANCE_UNIT" "on_boot.d/$ONBOOT_NAME"; do
+            cmp -s "$SELF_DIR/$f" "$DATA/$f" || return 1
+        done
+    fi
+    cmp -s "$DATA/on_boot.d/$ONBOOT_NAME" "$ONBOOT/$ONBOOT_NAME" &&
+        cmp -s "$DATA/systemd/$INSTANCE_UNIT" "$UNITS/$INSTANCE_UNIT" &&
+        [ "$(readlink "$R/usr/local/sbin/$PROG" 2>/dev/null)" = "$PROD_DATA/$PROG" ]
+}
+
+# The interface of the IPv4 route to the internet, if it is a valid name
+# that exists. Prints nothing else. Never prints an address.
+st_route_iface() {
+    local d
+    command -v ip >/dev/null 2>&1 || return 0
+    d=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
+    if valid_iface "$d" && [ -e "$SYSNET/$d" ]; then printf '%s' "$d"; fi
+}
+
+# The Ethernet ports, by name: eth followed by digits.
+st_ports() {
+    local d n list
+    list=''
+    for d in "$SYSNET"/eth*; do
+        n=${d##*/}
+        case "$n" in eth | *[!a-z0-9]* | eth*[!0-9]*) continue ;; esac
+        [ -e "$d" ] && list="$list $n"
+    done
+    printf '%s' "${list# }"
+}
+
+# Ask for the WAN port by name. Sets st_iface. Never repeats the answer:
+# a user can type an address or the identity by mistake.
+st_ask_iface() {
+    local n
+    st_say "Type the name of the WAN port: the gateway port that the AT&T cable" \
+        "goes into. The README lists the usual names, in 'WAN port names'."
+    [ -z "$(st_ports)" ] || st_say "Ports on this gateway: $(st_ports)"
+    n=0
+    while [ "$n" -lt 3 ]; do
+        n=$((n + 1))
+        st_read "WAN port name (for example eth8):"
+        if valid_iface "$st_ans" && [ -e "$SYSNET/$st_ans" ]; then
+            st_iface=$st_ans
+            return 0
+        fi
+        st_say "This gateway has no port with that name."
+    done
+    st_stop "Setup stopped: no valid port name." \
+        "Nothing changed. The README lists the usual names, in 'WAN port names'." \
+        "Then run: $PROG setup <port-name>"
+}
+
+# Folders under CERTS_HOME (depth 0 and 1) that hold a wpa_supplicant.conf,
+# one per line.
+st_cert_dirs() {
+    local d
+    for d in "$CERTS_HOME" "$CERTS_HOME"/*; do
+        if [ -d "$d" ] && [ -f "$d/wpa_supplicant.conf" ]; then printf '%s\n' "$d"; fi
+    done
+}
+
+# Choose the certificate folder. Sets st_certs.
+st_find_certs() {
+    local dirs n k
+    dirs=$(st_cert_dirs)
+    if [ -z "$dirs" ]; then
+        if [ ! -d "$CERTS_HOME" ] && ! install -d -m 700 "$CERTS_HOME"; then
+            st_stop "Setup stopped: cannot make the folder /data/att-certs." \
+                "Nothing changed on the WAN. Check the free space: df -h /data" \
+                "Then run setup again."
+        fi
+        st_say "Copy your certificate folder to the gateway. The folder must hold the" \
+            "files CA_*.pem, Client_*.pem, PrivateKey*.pem, and wpa_supplicant.conf." \
+            "On your computer, open a second terminal and run:" \
+            "" \
+            "    scp -r <your-certificate-folder> root@<gateway-ip>:/data/att-certs/" \
+            "" \
+            "If scp shows an error about sftp, add -O after scp and try again."
+        st_read "Press Enter when the copy is done."
+        dirs=$(st_cert_dirs)
+        [ -n "$dirs" ] || st_stop "Setup stopped: no certificate folder in /data/att-certs." \
+            "Setup looks for a folder that holds wpa_supplicant.conf." \
+            "Nothing changed on the WAN. Copy the folder, then run setup again."
+    fi
+    n=$(printf '%s\n' "$dirs" | wc -l | tr -d ' ')
+    if [ "$n" -eq 1 ]; then
+        st_certs=$dirs
+        st_say "Found one certificate folder in /data/att-certs."
+        return 0
+    fi
+    # The user must choose, so this list shows the folder names, with
+    # addresses hidden.
+    st_say "Found more than one certificate folder in /data/att-certs:"
+    printf '%s\n' "$dirs" | sed "s#^$CERTS_HOME/*##; s#^\$#(the folder itself)#" | st_mask_text |
+        awk '{ printf "    %d. %s\n", NR, $0 }'
+    while :; do
+        st_read "Type the number of the folder to use:"
+        case "$st_ans" in '' | *[!0-9]*) k=0 ;; *) k=$st_ans ;; esac
+        if [ "$k" -ge 1 ] && [ "$k" -le "$n" ]; then
+            st_certs=$(printf '%s\n' "$dirs" | sed -n "${k}p")
+            return 0
+        fi
+        st_say "Type a number from 1 to $n."
+    done
+}
+
+# Tell the user to move the ONT cable, and wait for "yes".
+st_move_cable() {
+    st_phase=cable
+    st_say "Now move the cable. Internet access stops until AT&T accepts the gateway." \
+        "  1. Disconnect the cable between the RG and the WAN port ($1) of the gateway." \
+        "  2. At the RG, disconnect the cable that comes from the ONT (the AT&T fiber box)." \
+        "  3. Connect that ONT cable to the WAN port ($1) of the gateway."
+    st_read "Type yes when the ONT cable is in the WAN port:"
+    [ "$st_ans" = yes ] || st_stop "Setup stopped before it started the supplicant. Nothing changed on the WAN." \
+        "If you moved the cable, put it back on the RG to get internet access again." \
+        "Run setup again when you are ready."
+}
+
+# After a failed activate: say what happened, from its output. $2 is 1
+# for a takeover.
+st_activate_failed() {
+    local i
+    i=$1
+    st_has() { printf '%s\n' "$st_out" | grep -q -- "$1"; }
+    # Only rollback lines. "did not stop" alone can come from a takeover
+    # whose rollback then finished.
+    if st_has 'ROLLBACK INCOMPLETE' || st_has 'Legacy NOT restored'; then
+        st_stop "Setup stopped: the addon could not undo all of its changes (see the lines above)." \
+            "Run: $PROG deactivate $i --restore-legacy" \
+            "Then check internet access: ping -c 3 1.1.1.1" \
+            "If that fails, follow 'Go back to the RG' in the README."
+    fi
+    if st_has 'Nothing changed'; then
+        st_stop "Setup stopped: activate did not start (see the lines above). It changed nothing." \
+            "If you moved the cable, put it back on the RG to get internet access again." \
+            "Fix the problem that the lines above name. Then run setup again."
+    fi
+    if [ "$2" -eq 1 ] && st_has 'legacy start was requested'; then
+        st_stop "AT&T did not accept the addon, or the addon could not start (see the lines above)." \
+            "The addon stopped and asked your old setup to start again." \
+            "Check internet access: ping -c 3 1.1.1.1" \
+            "If that fails, follow 'Go back to the RG' in the README." \
+            "To see why: journalctl -u $(unit_of "$i") -b"
+    fi
+    if ! st_has 'not authorized within'; then
+        st_stop "Setup stopped: the addon could not start the supplicant (see the lines above)." \
+            "The lines above show what the addon undid. Run: $PROG check" \
+            "To get internet access back, follow 'Go back to the RG' in the README." \
+            "Fix the problem that the lines above name. Then run setup again."
+    fi
+    st_stop "AT&T did not accept the gateway in time. The addon stopped the" \
+        "supplicant, so $i probably has no internet access now." \
+        "" \
+        "To get internet access back now:" \
+        "  1. Connect the ONT cable to the ONT port of the RG again." \
+        "  2. Connect a LAN port of the RG to the WAN port ($i) of the gateway." \
+        "" \
+        "Then look at these causes:" \
+        "  - Is the ONT cable in $i? Setup used $i." \
+        "  - Some gateways must use the MAC address of the RG on the WAN. In UniFi" \
+        "    Network, set the WAN MAC address to the value of the identity= line" \
+        "    in your wpa_supplicant.conf." \
+        "  - Some gateways need VLAN ID 0 on the WAN, also in UniFi Network." \
+        "  - Wrong certificates? Remove the imported copy, then setup imports again:" \
+        "    rm -r $PROD_DATA/instances/$i/certs $PROD_DATA/instances/$i/wpa_supplicant.conf" \
+        "  - The log of the attempt: journalctl -u $(unit_of "$i") -b" \
+        "" \
+        "Then run setup again."
+}
+
+cmd_setup() {
+    local i c a others next takeover
+    [ $# -le 1 ] || die "usage: setup [iface]"
+    st_tmp=$(mktemp -d) || die "setup: cannot make a temp directory"
+    trap 'rm -rf -- "${st_tmp:?}"' EXIT
+    trap 'st_interrupted' INT TERM HUP
+    printf 'AT&T fiber bypass: guided setup\n\n'
+    st_say "This sets up the addon in $SETUP_STEPS steps. It asks before it changes the WAN." \
+        "If the gateway gets internet access through the AT&T box (the RG)," \
+        "keep the RG connected until step 6 tells you to move the cable."
+
+    # An activated interface: change nothing.
+    for i in $(instances); do
+        is_active_flag "$i" || continue
+        st_say "" "The addon already runs on $i. Setup changes nothing." \
+            "Here is the state of the connection:"
+        st_bin="$DATA/$PROG"
+        [ -x "$st_bin" ] || st_bin="$SELF_DIR/$PROG"
+        st_run check
+        [ "$st_rc" -eq 0 ] || st_stop "The check found a problem (FAIL lines above)." \
+            "See 'Troubleshooting' in the README."
+        return 0
+    done
+
+    st_step 1 "Install the addon"
+    if st_installed; then
+        st_say "The addon is already installed. Nothing to do."
+    else
+        st_bin="$SELF_DIR/$PROG"
+        st_run_quiet install
+        [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the install did not finish (see the lines above)." \
+            "Nothing runs yet, and the WAN did not change." \
+            "Fix the problem that the lines above name. Then run setup again."
+        st_say "Installed. Nothing runs yet. The command $PROG now works in any directory."
+    fi
+    st_bin="$DATA/$PROG"
+
+    st_step 2 "Find the WAN port"
+    st_iface=''
+    if [ $# -eq 1 ]; then
+        if ! valid_iface "$1" || [ ! -e "$SYSNET/$1" ]; then
+            st_stop "Setup stopped: this gateway has no port with the name that you gave." \
+                "Nothing changed. Run setup again with the right name, or with no name."
+        fi
+        st_iface=$1
+        st_say "Using $st_iface, as you asked."
+    elif [ "$(instances | wc -l | tr -d ' ')" -eq 1 ]; then
+        st_iface=$(instances)
+        st_say "Using $st_iface, from an earlier run of setup or add-instance."
+    else
+        i=$(st_route_iface)
+        if [ -n "$i" ]; then
+            st_say "The gateway reaches the internet through the port $i."
+            if st_yes "Is $i the WAN port (the port for the AT&T connection)?" y; then
+                st_iface=$i
+            fi
+        else
+            st_say "The gateway has no internet route now, so setup cannot suggest a port."
+        fi
+        [ -n "$st_iface" ] || st_ask_iface
+    fi
+    i=$st_iface
+
+    st_step 3 "Import the certificates"
+    if [ -e "$(inst_dir "$i")/wpa_supplicant.conf" ]; then
+        st_say "The certificates for $i are already imported. Nothing to do." \
+            "To import other ones, remove the imported copy, then run setup again:" \
+            "  rm -r $PROD_DATA/instances/$i/certs $PROD_DATA/instances/$i/wpa_supplicant.conf"
+    else
+        st_find_certs
+        st_run add-instance "$i" "$st_certs"
+        [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the certificates were not imported (see the lines above)." \
+            "Nothing changed on the WAN." \
+            "Check the four files that the README lists in 'What you need'. Then run setup again."
+    fi
+
+    st_step 4 "Download the supplicant"
+    c=$(codename)
+    a=$(arch)
+    if [ -d "$BUNDLES/$c-$a/root" ]; then
+        st_say "A bundle for this Debian release ($c) is already here. Nothing to download."
+    else
+        st_say "Downloading the supplicant for this Debian release ($c)."
+        if debian_mirror "$c" >/dev/null; then st_run fetch "$c"; else st_run fetch; fi
+        [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the download failed (see the lines above)." \
+            "Nothing changed on the WAN. This step needs internet access." \
+            "Check that the RG is connected and that this works: ping -c 3 1.1.1.1" \
+            "Then run setup again."
+    fi
+    others=''
+    for c in $FETCH_CODENAMES; do
+        [ -d "$BUNDLES/$c-$a" ] || others="$others $c"
+    done
+    if [ -n "$others" ]; then
+        st_say "A later firmware update can move the gateway to a newer Debian release." \
+            "The supplicant then needs a bundle for that release."
+        if st_yes "Download the bundles for$others now (about 2 MB each)?" y; then
+            # shellcheck disable=SC2086 # codenames are single words
+            st_run fetch $others
+            [ "$st_rc" -eq 0 ] || st_say "Some bundles were not downloaded (see above). Setup continues." \
+                "Before a firmware update, run: $PROG fetch --all"
+        else
+            st_say "Skipped. Before a firmware update, run: $PROG fetch --all"
+        fi
+    fi
+
+    st_step 5 "Check the setup"
+    st_run_quiet validate "$i"
+    [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the check found a problem (see the lines above)." \
+        "Nothing changed on the WAN. Fix the problem, then run setup again."
+    st_run plan "$i"
+    [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the addon cannot start on $i yet (see the 'blocked' lines above)." \
+        "Nothing changed on the WAN. Fix what those lines name. Then run setup again."
+    next=$(printf '%s\n' "$st_out" | sed -n 's/^  next: //p')
+    case "$next" in
+        *" activate $i --takeover") takeover=1 ;;
+        *" activate $i") takeover=0 ;;
+        *) st_stop "Setup stopped: plan did not say what to do next." \
+            "Nothing changed on the WAN. Please report this, with the lines above." ;;
+    esac
+
+    st_step 6 "Connect to AT&T"
+    if [ "$takeover" -eq 1 ]; then
+        # plan also names an old setup that does not run now, for example
+        # a boot script that is left, while the RG still gives internet
+        # access. So ask where the cable is.
+        st_say "Step 5 found another bypass setup for $i (listed above). The addon will" \
+            "stop it and take its place. If AT&T does not accept the addon, the" \
+            "addon tries to start the old setup again."
+        if st_yes "Is the ONT cable already in the WAN port ($i)?" n; then
+            :
+        else
+            st_move_cable "$i"
+        fi
+        st_read "Type yes to replace the old setup now:"
+        [ "$st_ans" = yes ] || st_stop "Setup stopped before it changed the old setup." \
+            "If you moved the cable, put it back on the RG to get internet access again." \
+            "Run setup again when you are ready."
+        st_phase=connect
+        st_say "Waiting for AT&T to accept the addon. This can take a few minutes."
+        st_run activate "$i" --takeover
+    else
+        st_move_cable "$i"
+        st_phase=connect
+        st_say "Waiting for AT&T to accept the gateway. This can take a few minutes."
+        st_run activate "$i"
+    fi
+    [ "$st_rc" -eq 0 ] || st_activate_failed "$i" "$takeover"
+    printf '\nDone. The gateway now connects to AT&T directly on %s.\n' "$i"
+    st_say "- To check the connection later, run: $PROG check" \
+        "- Keep a copy of your certificate folder on your computer."
+    [ ! -d "$CERTS_HOME" ] || st_say "- The addon keeps its own copy. You can remove the one that you sent:" \
+        "  rm -r /data/att-certs"
+    st_say "- Before a firmware update, read 'Before a firmware update' in the README."
+}
+
 # ---------- main ----------
 
 # The directory of the real script. $0 can be the /usr/local/sbin link.
@@ -1566,6 +2034,7 @@ SELF_DIR=$(dirname "$(readlink -f "$0")")
 cmd=${1:-help}
 [ $# -eq 0 ] || shift
 case "$cmd" in
+    setup) cmd_setup "$@" ;;
     install) cmd_install "$@" ;;
     add-instance) cmd_add_instance "$@" ;;
     validate) cmd_validate "$@" ;;

@@ -1,10 +1,11 @@
 #!/bin/sh
 # shellcheck disable=SC2015,SC2155 # ok/bad never fail; test-only exports
 # Off-box tests for att-wpa-supplicant. Needs: sh, coreutils, dpkg-deb,
-# flock, openssl. Stubs systemctl, apt-get, dpkg, and dpkg-query. The bundle
+# flock, openssl, setsid, and kill(1) (procps). Stubs systemctl, apt-get,
+# dpkg, and dpkg-query. The bundle
 # packages hold fake wpa_supplicant and wpa_cli scripts that act like the
 # loader: they fail unless LD_LIBRARY_PATH finds libpcsclite.so.1.
-# Usage: tests/run.sh
+# Usage: tests/run.sh   (ONLY="t_x t_y" runs only those tests)
 # No set -e, so that a failing command under test does not stop the suite.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -151,9 +152,11 @@ else
 fi
 EOF
     chmod +x "$B/busctl"
+    # logger: $STUB_STATE/hook/logger runs with the message as $1.
     cat >"$B/logger" <<'EOF'
 #!/bin/sh
 echo "$*" >>"$STUB_STATE/logger.log"
+[ ! -f "$STUB_STATE/hook/logger" ] || sh "$STUB_STATE/hook/logger" "$*"
 EOF
     cat >"$B/dpkg-query" <<'EOF'
 #!/bin/sh
@@ -314,6 +317,8 @@ EOF
     cat >"$B/apt-get" <<'EOF'
 #!/bin/sh
 S=$STUB_STATE
+# $STUB_STATE/apt-reads-stdin: read all of stdin, as a prompt would.
+[ ! -f "$S/apt-reads-stdin" ] || cat >/dev/null
 repo=$S/repo
 c=''
 if [ -n "${APT_CONFIG:-}" ]; then
@@ -334,7 +339,7 @@ for a in "$@"; do
     update)
       [ ! -f "$S/hang-apt-update" ] || sleep 3
       [ ! -f "$S/fail/apt-update" ] || exit 100
-      [ -z "$c" ] || [ ! -f "$S/fail/apt-update-$c" ] || { echo "E: The repository for $c is not signed." >&2; exit 100; }
+      [ -z "$c" ] || [ ! -f "$S/fail/apt-update-$c" ] || { echo "Err:1 http://deb.debian.org/debian $c InRelease [IP: 192.0.2.5 80]" >&2; echo "  Could not connect to 192.0.2.6:80 198.51.100.7 2001:db8::5 2001:db8:0:0:1:2:3:4 fe80::1%eth8 [::abcd:1234] aa:bb:cc:00:11:22 192.0.2.9_x cert_aabbcc001122, connection timed out" >&2; echo "E: The repository for $c is not signed." >&2; exit 100; }
       exit 0 ;;
     download) break ;;
     -o) skip=1 ;;
@@ -1895,6 +1900,305 @@ t_validate_exact_modes() {
     expect_rc 1 "validate: rejects an executable key file (mode 700)"
 }
 
+# ---------- tests: setup ----------
+
+# run_in answers args...: run the script with these answers on stdin
+# (printf %b: "\n" ends an answer).
+run_in() { a=$1; shift; OUT=$(printf '%b' "$a" | "$SCRIPT" "$@" 2>&1) && RC=0 || RC=$?; }
+
+# A gateway ready for setup: the RG gives eth8 its address, the
+# certificates are in /data/att-certs/mycerts, and Debian's mirror serves
+# bullseye.
+setup_ready() {
+    setup "$1"
+    mkdir -p "$R/data/att-certs/mycerts"
+    cp "$T/src"/* "$R/data/att-certs/mycerts/"
+    repo_c bullseye wpasupplicant 2:2.9.0-21+deb11u3
+    repo_c bullseye libpcsclite1 1.9.1-1
+    printf '#!/bin/sh\necho "1.1.1.1 via 192.0.2.1 dev eth8 table 201.eth8 src 192.0.2.77 uid 0"\n' >"$B/ip"
+    chmod +x "$B/ip"
+    D="$R/data/unifi-common-addons/att-wpa-supplicant"
+}
+
+# Each setup stop must end with a next step for the user.
+expect_next_step() {
+    if printf '%s' "$OUT" | tail -n 4 | grep -Eiq 'run setup again|run: att-wpa-supplicant|readme|ping -c 3|journalctl'; then
+        ok "$1"
+    else
+        bad "$1" "no next step in: $(printf '%s' "$OUT" | tail -n 4 | tr '\n' '|')"
+    fi
+}
+# Setup must never print an address or the identity.
+expect_private() {
+    printf '%s\n' "$OUT" >"$T/setup.out"
+    expect_nogrep '192\.0\.2\.\|198\.51\.100\.\|2001:db8\|fe80::\|abcd:1234' "$T/setup.out" "$1: prints no address"
+    expect_nogrep '[Aa][Aa]:[Bb][Bb]:[Cc][Cc]\|[Aa][Aa][Bb][Bb][Cc][Cc]' "$T/setup.out" "$1: prints no identity or MAC address"
+}
+
+t_setup_fresh() {
+    setup_ready setup-fresh
+    rm -f "$D/att-wpa-supplicant"
+    # A step that reads stdin must not take the answers of the user.
+    : >"$S/apt-reads-stdin"
+    authorized
+    : >"$S/systemctl.log"
+    # Accept eth8, skip the other bundles, confirm the cable.
+    run_in '\nn\nyes\n' setup
+    expect_rc 0 "setup: a fresh setup succeeds"
+    expect_out 'Step 1 of 6: Install the addon' "setup: step 1 installs"
+    expect_file "$D/att-wpa-supplicant" "setup: installs the addon when it is missing"
+    expect_out 'Installed. Nothing runs yet. The command att-wpa-supplicant now works in any directory' "setup: says that the install is done"
+    printf '%s\n' "$OUT" >"$T/setup.out"
+    expect_nogrep 'next: add-instance' "$T/setup.out" "setup: hides the hint of install, which does not apply in setup"
+    expect_eq "$(grep -c 'loads on this firmware' "$T/setup.out")" 1 "setup: shows the load check once (plan), not twice"
+    # A prompt line has no newline here (the answers come from a pipe).
+    grep -v '\[Y/n\]\|\[y/N\]\|Type yes\|Press Enter\|number of the\|port name' "$T/setup.out" >"$T/setup.noprompt"
+    expect_nogrep ' $' "$T/setup.noprompt" "setup: no line ends with a space"
+    expect_out 'The gateway reaches the internet through the port eth8' "setup: suggests the port of the internet route"
+    expect_out 'Found one certificate folder in /data/att-certs' "setup: finds the certificate folder"
+    expect_grep 'setup: run activate eth8$' "$S/logger.log" "setup: runs activate without --takeover when there is no old setup"
+    expect_file "$(INSTD eth8)/wpa_supplicant.conf" "setup: imports the certificates"
+    expect_file "$D/bundles/bullseye-arm64/root" "setup: fetches the bundle of this release"
+    expect_out 'Skipped. Before a firmware update, run: att-wpa-supplicant fetch --all' "setup: names fetch --all when the user skips the other bundles"
+    expect_nofile "$D/bundles/trixie-arm64" "setup: no other bundle when the user says no"
+    expect_out 'Type yes when the ONT cable is in the WAN port' "setup: asks the user to move the cable"
+    expect_file "$(INSTD eth8)/active" "setup: activates eth8"
+    expect_out 'Done. The gateway now connects to AT&T directly on eth8' "setup: says that it is done"
+    expect_out 'rm -r /data/att-certs' "setup: tells how to remove the copy of the certificates"
+    expect_nogrep 'takeover' "$S/systemctl.log" "setup: no takeover without an old setup"
+    printf '%s\n' "$OUT" >"$T/setup.out"
+    expect_nogrep '^ *att-wpa-supplicant: ' "$T/setup.out" "setup: step output has no program-name prefix"
+    expect_private "setup fresh"
+    # Run again: the addon runs, so setup changes nothing.
+    : >"$S/apt.log"
+    cp "$(INSTD eth8)/wpa_supplicant.conf" "$T/conf.before"
+    run_in '' setup
+    expect_rc 0 "setup again: succeeds"
+    expect_out 'The addon already runs on eth8. Setup changes nothing' "setup again: says that it changes nothing"
+    expect_out 'OK eth8: 802.1X authorized' "setup again: shows the check"
+    expect_eq "$(cat "$S/apt.log")" "" "setup again: downloads nothing"
+    cmp -s "$T/conf.before" "$(INSTD eth8)/wpa_supplicant.conf" && ok "setup again: the instance is unchanged" || bad "setup again: the instance is unchanged"
+}
+
+t_setup_other_bundles() {
+    setup_ready setup-bundles
+    repo_c bookworm wpasupplicant 2:2.10-12+deb12u3
+    repo_c bookworm libpcsclite1 1.9.9-2
+    repo_c trixie wpasupplicant 2:2.10-24
+    repo_c trixie libpcsclite1 2.3.3-1
+    authorized
+    # The default answer (Enter) downloads the other bundles.
+    run_in '\n\nyes\n' setup
+    expect_rc 0 "setup bundles: succeeds"
+    expect_out 'Download the bundles for bookworm trixie now' "setup bundles: offers the releases that have no bundle"
+    expect_file "$D/bundles/bookworm-arm64/MANIFEST" "setup bundles: fetches bookworm"
+    expect_file "$D/bundles/trixie-arm64/MANIFEST" "setup bundles: fetches trixie"
+}
+
+t_setup_stops() {
+    # End of input before the cable step: nothing activated.
+    setup_ready setup-eof
+    : >"$S/systemctl.log"
+    run_in '\nn\n' setup
+    expect_rc 1 "setup eof: stops"
+    expect_out 'Setup stopped: no answer (end of input)' "setup eof: says why it stopped"
+    expect_out 'The addon changed nothing' "setup eof: says that the addon changed nothing"
+    expect_next_step "setup eof: names the next step"
+    expect_nofile "$(INSTD eth8)/active" "setup eof: does not activate"
+    expect_nogrep 'start' "$S/systemctl.log" "setup eof: starts no unit"
+    # End of input at the cable step: the user may have moved the cable.
+    run_in '\nn\n' setup
+    expect_out 'If you moved the cable, put it back' "setup eof at the cable step: tells how to get internet access back"
+    # Any answer but yes at the cable step stops.
+    run_in '\nn\nok\n' setup
+    expect_rc 1 "setup no: stops"
+    expect_out 'Setup stopped before it started the supplicant. Nothing changed on the WAN' "setup no: says that the WAN did not change"
+    expect_out 'If you moved the cable, put it back on the RG' "setup no: tells how to get internet access back"
+    expect_nofile "$(INSTD eth8)/active" "setup no: does not activate"
+    expect_out 'The certificates for eth8 are already imported. Nothing to do' "setup no: a second run skips the import"
+    expect_out 'A bundle for this Debian release (bullseye) is already here' "setup no: a second run skips the download"
+    # No internet route: setup asks for the name and checks it.
+    setup_ready setup-noroute
+    printf '#!/bin/sh\nexit 2\n' >"$B/ip"
+    run_in '192.0.2.99\neth5\neth8\nn\n' setup
+    expect_out 'The gateway has no internet route now, so setup cannot suggest a port' "setup noroute: says why it asks"
+    expect_out 'Ports on this gateway: eth8' "setup noroute: lists the ports"
+    expect_out "This gateway has no port with that name" "setup noroute: refuses a port that does not exist"
+    expect_file "$(INSTD eth8)/wpa_supplicant.conf" "setup noroute: continues with a valid answer"
+    expect_private "setup noroute (an address as the answer)"
+    # The user says no to the suggestion.
+    setup_ready setup-notsugg
+    run_in 'n\neth8\nn\n' setup
+    expect_out 'WAN port name' "setup not suggested: asks for the name"
+    # A port name on the command line that does not exist.
+    setup_ready setup-badarg
+    run_in '' setup eth7
+    expect_rc 1 "setup bad arg: stops"
+    expect_out "this gateway has no port with the name that you gave" "setup bad arg: says what is wrong"
+    expect_next_step "setup bad arg: names the next step"
+    # No certificate folder: setup makes it, shows scp, and stops after Enter.
+    setup_ready setup-nocerts
+    rm -rf "$R/data/att-certs"
+    run_in '\n\n' setup
+    expect_rc 1 "setup no certs: stops"
+    expect_eq "$(stat -c %a "$R/data/att-certs")" 700 "setup no certs: makes /data/att-certs, 0700"
+    expect_out 'scp -r <your-certificate-folder> root@<gateway-ip>:/data/att-certs/' "setup no certs: shows the scp command"
+    expect_out 'Setup stopped: no certificate folder in' "setup no certs: says why it stopped"
+    expect_next_step "setup no certs: names the next step"
+    # Two certificate folders: setup asks which.
+    setup_ready setup-twocerts
+    mkdir -p "$R/data/att-certs/192.0.2.50" "$R/data/att-certs/cert_aabbccddeeff"
+    cp "$T/src"/* "$R/data/att-certs/192.0.2.50/"
+    cp "$T/src"/* "$R/data/att-certs/cert_aabbccddeeff/"
+    run_in '\n4\n3\nn\n' setup
+    expect_out 'Type a number from 1 to 3' "setup two certs: refuses a number out of range"
+    expect_out '    3. mycerts' "setup two certs: lists the folder names to choose from"
+    expect_out '    1. <address>' "setup two certs: hides an address in a folder name"
+    expect_out '    2. cert_<MAC>' "setup two certs: hides a MAC address after an underscore"
+    expect_private "setup two certs"
+    expect_file "$(INSTD eth8)/wpa_supplicant.conf" "setup two certs: imports the chosen folder"
+    # Bad certificates: add-instance fails.
+    setup_ready setup-badcerts
+    rm "$R/data/att-certs/mycerts"/CA_*.pem
+    run_in '\n' setup
+    expect_rc 1 "setup bad certs: stops"
+    expect_out 'need exactly one CA_\*.pem or CA.pem' "setup bad certs: shows the cause from add-instance"
+    expect_out 'Setup stopped: the certificates were not imported' "setup bad certs: says which step failed"
+    expect_next_step "setup bad certs: names the next step"
+    # The download fails.
+    setup_ready setup-nonet
+    : >"$S/fail/apt-update-bullseye"
+    run_in '\n' setup
+    expect_rc 1 "setup no internet: stops"
+    expect_out 'Setup stopped: the download failed' "setup no internet: says which step failed"
+    expect_out 'ping -c 3 1.1.1.1' "setup no internet: tells how to test the internet access"
+    expect_out '\[IP: hidden\]' "setup no internet: hides the address in an APT error"
+    expect_out 'Could not connect to <address>:80' "setup no internet: hides an IPv4 address in step output"
+    expect_private "setup no internet"
+    expect_next_step "setup no internet: names the next step"
+    # AT&T does not accept the gateway: activate rolls back.
+    setup_ready setup-unauth
+    unauthorized
+    run_in '\nn\nyes\n' setup
+    expect_rc 1 "setup unauthorized: fails"
+    expect_out 'AT&T did not accept the gateway in time' "setup unauthorized: says what happened"
+    expect_out "rm -r /data/unifi-common-addons/att-wpa-supplicant/instances/eth8/certs /data/unifi-common-addons/att-wpa-supplicant/instances/eth8/wpa_supplicant.conf" "setup unauthorized: tells how to import other certificates, and keeps the takeover record"
+    expect_out 'Connect the ONT cable to the ONT port of the RG again' "setup unauthorized: tells how to get internet access back"
+    expect_out 'value of the identity= line' "setup unauthorized: names the identity line for the MAC clone"
+    expect_out 'journalctl -u att-wpa-supplicant@eth8.service -b' "setup unauthorized: names the log"
+    expect_nofile "$(INSTD eth8)/active" "setup unauthorized: the rollback deactivated eth8"
+    expect_next_step "setup unauthorized: names the next step"
+    expect_private "setup unauthorized"
+}
+
+t_setup_takeover() {
+    setup_ready setup-takeover
+    evie_box wpa_supplicant-wired
+    authorized
+    : >"$S/systemctl.log"
+    # evie_box made the instance, so there is no port question. The old
+    # bypass runs (y), but the user does not type yes.
+    run_in 'n\ny\nno\n' setup
+    expect_rc 1 "setup takeover: stops without yes"
+    expect_out 'Step 5 found another bypass setup for eth8' "setup takeover: explains the takeover"
+    expect_out 'Setup stopped before it changed the old setup' "setup takeover: says that the old setup did not change"
+    printf '%s\n' "$OUT" >"$T/tk.out"
+    expect_nogrep 'Now move the cable' "$T/tk.out" "setup takeover: no cable step when the old bypass runs"
+    expect_nogrep 'stop\|disable' "$S/systemctl.log" "setup takeover: stops nothing without yes"
+    expect_eq "$(state_of wpa_supplicant-wired@eth8.service active)" active "setup takeover: the old setup still runs"
+    run_in 'n\ny\nyes\n' setup
+    expect_rc 0 "setup takeover: succeeds with yes"
+    expect_grep 'setup: run activate eth8 --takeover$' "$S/logger.log" "setup takeover: runs activate --takeover"
+    expect_grep '^unit wpa_supplicant-wired@eth8.service' "$(INSTD eth8)/takeover.state" "setup takeover: activate --takeover recorded the old unit"
+    expect_out 'Done. The gateway now connects to AT&T directly on eth8' "setup takeover: says that it is done"
+}
+
+t_setup_dormant() {
+    # Only a dormant launcher is left, and the RG still gives internet
+    # access: setup must ask for the cable move, even with --takeover.
+    setup_ready setup-dormant
+    unit setup-att-bypass.service enabled inactive
+    printf 'ExecStart=/data/wpa_supplicant/install.sh\n' >"$S/units/setup-att-bypass.service.cat"
+    authorized
+    run_in '\nn\n\nyes\nyes\n' setup
+    expect_rc 0 "setup dormant: succeeds"
+    expect_out 'Now move the cable' "setup dormant: asks for the cable move when the old bypass gives no internet access"
+    expect_grep 'setup: run activate eth8 --takeover$' "$S/logger.log" "setup dormant: then runs activate --takeover"
+}
+
+t_setup_more() {
+    # A half-finished install: the unit is missing. Setup installs again.
+    setup_ready setup-partial
+    rm "$R/etc/systemd/system/att-wpa-supplicant@.service"
+    run_in '' setup
+    expect_out 'Installed. Nothing runs yet' "setup partial install: installs again when the unit is missing"
+    expect_file "$R/etc/systemd/system/att-wpa-supplicant@.service" "setup partial install: the unit is back"
+    setup_ready setup-partial2
+    rm "$R/usr/local/sbin/att-wpa-supplicant"
+    run_in '' setup
+    expect_out 'Installed. Nothing runs yet' "setup partial install: installs again when the command link is missing"
+    # The unit does not start: not an AT&T problem.
+    setup_ready setup-nostart
+    authorized
+    fail_next start att-wpa-supplicant@eth8.service
+    run_in '\nn\nyes\n' setup
+    expect_rc 1 "setup no start: fails"
+    expect_out 'the addon could not start the supplicant' "setup no start: does not blame AT&T"
+    expect_next_step "setup no start: names the next step"
+    # Ctrl-C while activate waits: the terminal signals the whole process
+    # group. TERM to the group stands in for INT, which a background job
+    # of this shell ignores. activate must finish its rollback, and setup
+    # must show it.
+    setup_ready setup-ctrlc
+    unauthorized
+    printf '\nn\nyes\n' >"$T/answers"
+    # setsid can fork, so the new group leader writes its own PID.
+    ATT_WPA_TAKEOVER_TIMEOUT=30 setsid sh -c 'echo $$ >"$1"; shift; exec "$@"' sh "$T/pgid" \
+        "$SCRIPT" setup <"$T/answers" >"$T/ctrlc.out" 2>&1 &
+    n=0
+    until grep -q 'setup: run activate' "$S/logger.log" 2>/dev/null || [ "$n" -ge 40 ]; do sleep 0.25; n=$((n + 1)); done
+    sleep 2
+    t0=$(date +%s)
+    # dash's kill cannot signal a process group: use kill(1) of procps.
+    /bin/kill -TERM -- "-$(cat "$T/pgid")"
+    n=0
+    while /bin/kill -0 -- "-$(cat "$T/pgid")" 2>/dev/null && [ "$n" -lt 60 ]; do sleep 0.25; n=$((n + 1)); done
+    /bin/kill -KILL -- "-$(cat "$T/pgid")" 2>/dev/null
+    [ $(($(date +%s) - t0)) -lt 15 ] && ok "setup Ctrl-C during activate: stops at once, not at the 30 s deadline" ||
+        bad "setup Ctrl-C during activate: stops at once, not at the 30 s deadline"
+    OUT=$(cat "$T/ctrlc.out")
+    expect_out 'rollback done' "setup Ctrl-C during activate: the rollback of activate finishes"
+    expect_out 'Setup stopped: interrupted' "setup Ctrl-C during activate: says that it was interrupted"
+    expect_out 'Run: att-wpa-supplicant check' "setup Ctrl-C during activate: names the next step"
+    expect_nofile "$(INSTD eth8)/active" "setup Ctrl-C during activate: eth8 is not left activated"
+    expect_eq "$(state_of att-wpa-supplicant@eth8.service active)" inactive "setup Ctrl-C during activate: the unit is stopped"
+    # activate fails its own checks after plan passed (here: eth8 goes
+    # away when setup starts activate). Setup must say that it changed
+    # nothing, and must not blame AT&T.
+    setup_ready setup-preflight
+    mkdir -p "$S/hook"
+    printf 'case "$1" in *"setup: run activate eth8") rm -rf "%s/sys/class/net/eth8" ;; esac\n' "$R" >"$S/hook/logger"
+    run_in '\nn\nyes\n' setup
+    expect_rc 1 "setup preflight: fails"
+    expect_out 'activate did not start (see the lines above). It changed nothing' "setup preflight: says that activate changed nothing"
+    printf '%s\n' "$OUT" >"$T/pre.out"
+    expect_nogrep 'AT&T did not accept' "$T/pre.out" "setup preflight: does not blame AT&T"
+    expect_next_step "setup preflight: names the next step"
+    # TERM at the cable prompt: the user may have moved the cable.
+    setup_ready setup-term
+    # The input stays open with no answer, so setup waits at the prompt.
+    { printf '\nn\n'; sleep 30; } | "$SCRIPT" setup >"$T/term.out" 2>&1 &
+    pid=$!
+    n=0
+    until grep -q 'Type yes when' "$T/term.out" 2>/dev/null || [ "$n" -ge 80 ]; do sleep 0.25; n=$((n + 1)); done
+    kill -TERM "$pid"
+    wait "$pid"
+    OUT=$(cat "$T/term.out")
+    expect_out 'Setup stopped: interrupted' "setup TERM: says that it was interrupted"
+    expect_out 'If you moved the cable, put it back' "setup TERM at the cable step: tells how to get internet access back"
+    expect_nofile "$(INSTD eth8)/active" "setup TERM: does not activate"
+}
+
 # ---------- tests: boot, uninstall, check, units ----------
 
 t_boot() {
@@ -2152,7 +2456,10 @@ for t in t_install_inert t_fetch t_fetch_codename t_hardening t_fetch_libs t_bun
     t_activate_rollback_start_fails t_activate_legacy_stop_fails t_activate_masked_instance \
     t_deactivate_refuses_restore_if_ours_runs t_takeover_records_disabled_running_unit \
     t_restore_failure_keeps_ledger t_rollback_without_legacy_stops_ours \
-    t_stop_query_error_is_not_stopped t_validate_exact_modes t_boot t_uninstall t_check t_import_bundle_several t_check_bundles t_legacy_file t_journal_once t_units_static; do
+    t_stop_query_error_is_not_stopped t_validate_exact_modes t_boot t_uninstall t_check t_import_bundle_several t_check_bundles t_legacy_file t_journal_once t_units_static \
+    t_setup_fresh t_setup_other_bundles t_setup_stops t_setup_takeover t_setup_dormant t_setup_more; do
+    # ONLY="t_a t_b" runs only those tests.
+    case " ${ONLY:-$t} " in *" $t "*) ;; *) continue ;; esac
     $t
 done
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

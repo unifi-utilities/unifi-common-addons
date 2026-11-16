@@ -39,7 +39,7 @@ Enables emulation of a Cascaded Router setup and allows full use of your CIDR on
 
 ### [att-wpa-supplicant](att-wpa-supplicant)
 
-Physically bypass the AT&T Fiber Residential Gateway by running 802.1X authentication on the UniFi gateway and connecting it directly to the ONT. Runs `wpa_supplicant` from Debian packages kept in `/data` without installing them, so it persists across firmware updates. Includes guided takeover from legacy `wpa_supplicant` bypass methods, plus new commands, checks, and guards to improve resilience and stability.
+Physically bypass the AT&T Fiber Residential Gateway by running 802.1X authentication on the UniFi gateway and connecting it directly to the ONT. Runs `wpa_supplicant` from Debian packages kept in `/data` without installing them, so it persists across firmware updates. Includes a guided `setup` command and guided takeover from legacy `wpa_supplicant` bypass methods, plus new commands, checks, and guards to improve resilience and stability.
 
 ### centurylink-ipv6
 
