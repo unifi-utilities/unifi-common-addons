@@ -41,6 +41,12 @@ POLL="${ATT_WPA_POLL:-5}"
 STOP_WAIT="${ATT_WPA_STOP_WAIT:-10}"
 LOCK_WAIT="${ATT_WPA_LOCK_WAIT:-60}"
 LOAD_TIMEOUT="${ATT_WPA_LOAD_TIMEOUT:-10}"
+# fetch <codename> (v0.3): the Debian releases that it can fetch from
+# Debian's mirrors, and the keys that it trusts for them
+# (keys/debian-archive.asc, made by tools/update-keys.sh).
+FETCH_CODENAMES="bullseye bookworm trixie"
+KEYS_FILE="keys/debian-archive.asc"
+SCRATCH="$R/tmp"
 
 log() {
     [ "${log_quiet:-0}" -eq 0 ] || return 0
@@ -70,6 +76,9 @@ Setup
                                   for one WAN interface.
   fetch                           Download the bundle (the supplicant packages)
                                   for this release. Needs internet access.
+  fetch <codename>... | --all     Download a bundle for each named Debian release
+                                  (bullseye, bookworm, trixie) from Debian's
+                                  mirrors. Use it before a firmware update.
   import-bundle <file.tgz>...     Install one or more bundles built with
                                   tools/build-bundle.sh. Stops at the first failure.
   activate <iface> [--takeover]   Start the supplicant on <iface>. --takeover
@@ -221,6 +230,7 @@ validate_platform() {
 cmd_validate() {
     local rc n i
     rc=0
+    [ $# -le 1 ] || die "usage: validate [iface]"
     if [ -d "$DATA" ]; then
         if [ "$(uid_of "$DATA")" != "$OWNER_UID" ] || [ -n "$(find "$DATA" -maxdepth 0 -perm /022)" ]; then
             log "$DATA must be owned by uid $OWNER_UID and not writable by group/other"
@@ -476,7 +486,9 @@ in_use_fails() {
     return "$rc"
 }
 
-cmd_fetch() {
+# fetch with no argument: the running release, from the firmware's APT
+# sources. Unchanged since v0.2.3.
+fetch_firmware() {
     local c a libs specs
     c=$(codename)
     a=$(arch)
@@ -485,6 +497,7 @@ cmd_fetch() {
     chmod 0700 "$DATA" "$BUNDLES" 2>/dev/null || true
     tmp=$(mktemp -d "$BUNDLES/.fetch.XXXXXX")
     trap 'rm -rf -- "${tmp:?}"' EXIT
+    trap 'exit 1' INT TERM HUP
     apt-get update -qq || die "apt-get update failed (no internet?). Existing bundle kept"
     # The fetch directory is 0700 root, so APT's _apt user cannot write to
     # it. Download as root, which APT would also do, with a warning.
@@ -507,11 +520,165 @@ cmd_fetch() {
     log "fetch: bundle $c-$a ready: $(sed -n 's/^pkg=//p' "$BUNDLES/$c-$a/MANIFEST" | tr '\n' ' ')"
 }
 
+# Prints the Debian mirror of codename $1, or returns 1 if fetch does not
+# support it. bullseye moved to archive.debian.org (security support
+# ended); tools/build-bundle.sh uses the same mirrors.
+debian_mirror() {
+    case "$1" in
+        bullseye) echo http://archive.debian.org ;;
+        bookworm | trixie) echo http://deb.debian.org ;;
+        *) return 1 ;;
+    esac
+}
+
+# Write the scratch APT configuration in $apt_dir/apt.conf. APT reads the
+# file in APT_CONFIG first, before apt.conf.d and apt.conf, so these
+# settings send it to empty files instead: APT then reads no setting,
+# hook, source, pin, key, credential, list, or status file of the
+# firmware, and writes only in $apt_dir. It still uses the proxy
+# variables (http_proxy and others) of the environment, on purpose: a
+# gateway behind a proxy needs them, and the signature check does not
+# depend on them. A firmware setting cannot allow an unsigned
+# repository or run a hook. Error-Mode "any": a source that fails (for
+# example only -security) fails the update, so that a bundle never loses
+# its security updates. The package caches are off; the indexes stay
+# compressed.
+scratch_apt_conf() {
+    local d
+    d=$apt_dir
+    mkdir -p "$d/lists/partial" "$d/cache/archives/partial" "$d/apt.conf.d" \
+        "$d/sources.list.d" "$d/preferences.d" "$d/trusted.gpg.d" "$d/auth.conf.d"
+    : >"$d/status"
+    : >"$d/empty.conf"
+    cat >"$d/apt.conf" <<EOF
+Dir::Etc::Main "$d/empty.conf";
+Dir::Etc::Parts "$d/apt.conf.d";
+Dir::Etc::SourceList "$d/sources.list";
+Dir::Etc::SourceParts "$d/sources.list.d";
+Dir::Etc::Preferences "$d/preferences";
+Dir::Etc::PreferencesParts "$d/preferences.d";
+Dir::Etc::Trusted "$d/trusted.gpg";
+Dir::Etc::TrustedParts "$d/trusted.gpg.d";
+Dir::Etc::netrc "$d/auth.conf";
+Dir::Etc::netrcparts "$d/auth.conf.d";
+Dir::State::Lists "$d/lists";
+Dir::State::status "$d/status";
+Dir::Cache "$d/cache";
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
+Acquire::GzipIndexes "true";
+APT::Sandbox::User "root";
+APT::Update::Error-Mode "any";
+Acquire::AllowInsecureRepositories "false";
+Acquire::AllowDowngradeToInsecureRepositories "false";
+APT::Get::AllowUnauthenticated "false";
+EOF
+}
+scratch_apt() { APT_CONFIG="$apt_dir/apt.conf" apt-get "$@"; }
+
+# fetch <codename>: one bundle for Debian release $1, from Debian's
+# mirrors, with the keys that the addon ships. The checks are those of
+# fetch. Only the running release gets the load check.
+fetch_debian() {
+    local c a m keys libs this
+    c=$1
+    a=$(arch)
+    this="$(codename)-$a"
+    m=$(debian_mirror "$c") || die "fetch: cannot fetch '$c'. Supported: $FETCH_CODENAMES"
+    keys="$SELF_DIR/$KEYS_FILE"
+    [ -r "$keys" ] || die "fetch $c: the Debian keys file is missing ($keys). Run install again from a full download of the addon. Existing bundle kept"
+    mkdir -p "$BUNDLES" "$SCRATCH"
+    chmod 0700 "$DATA" "$BUNDLES" 2>/dev/null || true
+    tmp=$(mktemp -d "$BUNDLES/.fetch.XXXXXX")
+    apt_dir=''
+    trap 'rm -rf -- "${tmp:?}" ${apt_dir:+"$apt_dir"}' EXIT
+    # dash runs no EXIT trap when a signal ends it. "exit" runs it.
+    trap 'exit 1' INT TERM HUP
+    apt_dir=$(mktemp -d "$SCRATCH/$PROG-apt.XXXXXX") || die "fetch $c: cannot make a temp directory in $SCRATCH. Existing bundle kept"
+    scratch_apt_conf
+    printf 'deb [signed-by=%s] %s/debian %s main\ndeb [signed-by=%s] %s/debian %s-updates main\ndeb [signed-by=%s] %s/debian-security %s-security main\n' \
+        "$keys" "$m" "$c" "$keys" "$m" "$c" "$keys" "$m" "$c" >"$apt_dir/sources.list"
+    log "fetch $c: downloading the package lists from $m"
+    scratch_apt update -qq ||
+        die "fetch $c: cannot download or verify the package lists (above). Check the internet access of the gateway, then run fetch $c again. Existing bundle kept"
+    # shellcheck disable=SC2086 # RUNTIME_PKGS holds single words
+    (cd "$tmp" && scratch_apt download -qq $RUNTIME_PKGS) ||
+        die "fetch $c: the download failed (above). Run fetch $c again later. Existing bundle kept"
+    libs=$(runtime_lib_deps "$(bundle_debs "$tmp" wpasupplicant)") ||
+        die "fetch $c: cannot read the dependencies of wpasupplicant. Existing bundle kept. Run fetch $c again. If it fails again, report it with the lines above"
+    if [ -n "$libs" ]; then
+        # shellcheck disable=SC2086 # package names are single words
+        (cd "$tmp" && scratch_apt download -qq $libs) ||
+            die "fetch $c: the download of the libraries failed (above). Run fetch $c again later. Existing bundle kept"
+    fi
+    seal_bundle "$tmp" "$c" "$a" "Debian mirrors (fetch $c) on $(hostname 2>/dev/null || echo gateway)"
+    bundle_ok "$tmp" "$c-$a" || die "fetch $c: the new bundle failed its check (above). Existing bundle kept. Run fetch $c again. If it fails again, report it with the lines above"
+    bundle_unpack "$tmp" "$tmp/root" "$c-$a" || die "fetch $c: the runtime of the new bundle failed its check (above). Existing bundle kept. Report it with the lines above"
+    swap_bundle "$tmp" "$BUNDLES/$c-$a"
+    trap - EXIT
+    rm -rf -- "${apt_dir:?}"
+    log "fetch: bundle $c-$a ready: $(sed -n 's/^pkg=//p' "$BUNDLES/$c-$a/MANIFEST" | tr '\n' ' ')"
+    [ "$c-$a" = "$this" ] ||
+        log "note: $c-$a is for another Debian release. This gateway cannot test it. After a firmware update to $c, each start tests it"
+}
+
+# Stop the running child of fetch --all, wait for it, and exit.
+fetch_stop_child() {
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" || true
+    exit 1
+}
+
+# fetch, fetch <codename>..., fetch --all. With more than one codename,
+# each runs in a new process of this script, as in import-bundle, and a
+# failure does not stop the others.
+cmd_fetch() {
+    local c ok failed child cancel
+    if [ $# -eq 0 ]; then
+        fetch_firmware
+        return
+    fi
+    if [ "$1" = --all ]; then
+        [ $# -eq 1 ] || die "usage: fetch [<codename>... | --all]"
+        # shellcheck disable=SC2086 # single words
+        set -- $FETCH_CODENAMES
+    fi
+    for c; do
+        debian_mirror "$c" >/dev/null ||
+            die "fetch: cannot fetch '$c'. Supported: $FETCH_CODENAMES. Nothing was downloaded"
+    done
+    if [ $# -eq 1 ]; then
+        fetch_debian "$1"
+        return
+    fi
+    ok=''
+    failed=''
+    # Each codename runs in a child. On a signal, stop the child and wait
+    # for it, so that its EXIT trap removes its temp directories. A signal
+    # between "&" and "child=$!" only sets cancel. The check after the
+    # assignment then stops that child.
+    child=''
+    cancel=0
+    trap 'cancel=1; [ -z "$child" ] || fetch_stop_child' INT TERM HUP
+    for c; do
+        [ "$cancel" -eq 0 ] || exit 1
+        "$SELF_DIR/$PROG" fetch "$c" &
+        child=$!
+        [ "$cancel" -eq 0 ] || fetch_stop_child
+        if wait "$child"; then ok="$ok $c"; else failed="$failed $c"; fi
+        child=''
+    done
+    trap - INT TERM HUP
+    [ -n "$failed" ] || { log "fetch: done. Bundles ready for:$ok"; return 0; }
+    die "fetch: failed for:$failed (above).${ok:+ Ready for:$ok.} Run fetch$failed again later"
+}
+
 import_one() {
     local b name
     mkdir -p "$BUNDLES"
     tmp=$(mktemp -d "$BUNDLES/.import.XXXXXX")
     trap 'rm -rf -- "${tmp:?}"' EXIT
+    trap 'exit 1' INT TERM HUP
     tar -xzf "$1" -C "$tmp" --no-same-owner || die "cannot extract $1"
     set -- "$tmp"/*/
     [ $# -eq 1 ] && [ -d "$1" ] || die "bundle archive must contain exactly one top-level directory"
@@ -853,6 +1020,7 @@ cmd_boot() {
     local i
     [ $# -eq 0 ] || die "usage: boot"
     setup_lock
+    clean_put_leftovers
     install_units
     link_command
     for i in $(instances); do
@@ -972,7 +1140,9 @@ check_bundles() {
         case "$d" in *.prev) continue ;; esac
         list="${list:+$list, }$d"
     done
-    if [ -d "$BUNDLES/$want" ]; then
+    if [ "$list" = "$want" ]; then
+        echo "INFO bundles: $list (this release: $want). Before a firmware update, run: $PROG fetch --all"
+    elif [ -d "$BUNDLES/$want" ]; then
         echo "INFO bundles: $list (this release: $want)"
     elif [ -n "$list" ]; then
         echo "WARN bundles: $list. None for this release ($want). Run fetch or import-bundle"
@@ -984,6 +1154,7 @@ check_bundles() {
 cmd_check() {
     local rc n i
     rc=0
+    [ $# -le 1 ] || die "usage: check [iface]"
     if [ $# -ge 1 ]; then
         need_iface "$1"
         check_one "$1" || rc=1
@@ -1288,6 +1459,22 @@ put() {
     mv -f "$3.new.$$" "$3"
 }
 
+# put() leaves "<file>.new.<pid>" if the process ends between the copy and
+# the rename. In on_boot.d such a file is executable, and the boot runner
+# can run it. Removes them. Call this only with the setup lock held, so
+# that no other install is between a copy and its rename.
+clean_put_leftovers() {
+    local f
+    for f in "$DATA/$PROG".new.* "$DATA/legacy.sh".new.* "$DATA/README.md".new.* \
+        "$DATA/$KEYS_FILE".new.* "$DATA/systemd/$INSTANCE_UNIT".new.* \
+        "$DATA/on_boot.d/$ONBOOT_NAME".new.* "$ONBOOT/$ONBOOT_NAME".new.* \
+        "$UNITS/$INSTANCE_UNIT".new.*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        case "${f##*.new.}" in '' | *[!0-9]*) continue ;; esac
+        rm -f -- "$f" && log "removed $f, left by an install that did not finish"
+    done
+}
+
 cmd_install() {
     local self i act idle
     self=$(cd "$SELF_DIR" && pwd)
@@ -1298,8 +1485,9 @@ cmd_install() {
     [ -d "${DATA%/*}" ] || { mkdir -p "${DATA%/*}" && chmod 0755 "${DATA%/*}"; }
     umask 077
     setup_lock
-    mkdir -p "$DATA" "$INST" "$BUNDLES" "$DATA/systemd"
-    chmod 0700 "$DATA" "$INST" "$BUNDLES" "$DATA/systemd"
+    mkdir -p "$DATA" "$INST" "$BUNDLES" "$DATA/systemd" "$DATA/keys"
+    chmod 0700 "$DATA" "$INST" "$BUNDLES" "$DATA/systemd" "$DATA/keys"
+    clean_put_leftovers
     install_recover
     # An activated interface restarts on the new code (at the next restart
     # or reboot). It needs a runtime that loads, from the bundle or .prev.
@@ -1312,6 +1500,7 @@ cmd_install() {
         put 0700 "$self/$PROG" "$DATA/$PROG"
         put 0600 "$self/legacy.sh" "$DATA/legacy.sh"
         put 0600 "$self/systemd/$INSTANCE_UNIT" "$DATA/systemd/$INSTANCE_UNIT"
+        put 0600 "$self/$KEYS_FILE" "$DATA/$KEYS_FILE"
         mkdir -p "$DATA/on_boot.d"
         put 0700 "$self/on_boot.d/$ONBOOT_NAME" "$DATA/on_boot.d/$ONBOOT_NAME"
         [ ! -f "$self/README.md" ] || put 0600 "$self/README.md" "$DATA/README.md"

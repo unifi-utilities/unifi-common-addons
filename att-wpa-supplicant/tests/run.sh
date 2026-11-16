@@ -25,7 +25,7 @@ setup() {
     S="$T/state"
     B="$T/bin"
     mkdir -p "$R/data/on_boot.d" "$R/etc/systemd/system" "$R/proc" "$R/sys/class/net/eth8" \
-        "$R/usr/sbin" "$R/sbin" "$R/run" "$S/pkgs" "$S/ver" "$S/units" "$S/fail" "$B" "$T/src"
+        "$R/usr/sbin" "$R/sbin" "$R/run" "$R/tmp" "$S/pkgs" "$S/ver" "$S/units" "$S/fail" "$B" "$T/src"
     printf 'PRETTY_NAME="Debian GNU/Linux 11 (bullseye)"\nVERSION_CODENAME=bullseye\n' >"$R/etc/os-release"
     export ATT_WPA_ROOT="$R" ATT_WPA_OWNER_UID="$(id -u)" ATT_WPA_TAKEOVER_TIMEOUT=2 \
         ATT_WPA_POLL=1 ATT_WPA_STOP_WAIT=1 \
@@ -305,16 +305,37 @@ for n; do
 done
 EOF
     chmod +x "$B/apt-cache"
+    # fetch <codename> sets APT_CONFIG to its scratch configuration. The
+    # stub then serves $STUB_STATE/repo-<codename> (the codename from the
+    # source list that the configuration names), keeps copies of the list
+    # and the configuration (sources-<codename>.list, apt-<codename>.conf),
+    # and ignores the firmware's own builds (the scratch status is empty).
+    # $STUB_STATE/hang-apt-update: update sleeps 3 s (signal tests).
     cat >"$B/apt-get" <<'EOF'
 #!/bin/sh
 S=$STUB_STATE
-echo "apt-get $*" >>"$S/apt.log"
+repo=$S/repo
+c=''
+if [ -n "${APT_CONFIG:-}" ]; then
+  echo "apt-get(APT_CONFIG=$APT_CONFIG) $*" >>"$S/apt.log"
+  sl=$(sed -n 's/^Dir::Etc::SourceList "\(.*\)";$/\1/p' "$APT_CONFIG")
+  c=$(awk 'NR == 1 {print $4}' "$sl")
+  cp "$sl" "$S/sources-$c.list"
+  cp "$APT_CONFIG" "$S/apt-$c.conf"
+  repo=$S/repo-$c
+else
+  echo "apt-get $*" >>"$S/apt.log"
+fi
 # -o takes a value.
 skip=0
 for a in "$@"; do
   [ "$skip" = 0 ] || { skip=0; continue; }
   case "$a" in
-    update) [ ! -f "$S/fail/apt-update" ] || exit 100; exit 0 ;;
+    update)
+      [ ! -f "$S/hang-apt-update" ] || sleep 3
+      [ ! -f "$S/fail/apt-update" ] || exit 100
+      [ -z "$c" ] || [ ! -f "$S/fail/apt-update-$c" ] || { echo "E: The repository for $c is not signed." >&2; exit 100; }
+      exit 0 ;;
     download) break ;;
     -o) skip=1 ;;
     -*) ;;
@@ -329,14 +350,14 @@ for a; do
   # A bare name asks for apt's candidate. $STUB_STATE/firmware-build/<name>
   # holds an installed vendor version, which is the candidate, and which
   # no repository serves (as libnl-3-200 3.7.0-2+ubnt on UniFi OS).
-  if [ "$n" = "$a" ] && [ -f "$S/firmware-build/$n" ]; then
+  if [ -z "$c" ] && [ "$n" = "$a" ] && [ -f "$S/firmware-build/$n" ]; then
     echo "E: Can't find a source to download version '$(cat "$S/firmware-build/$n")' of '$n:arm64'"; exit 100
   fi
-  [ -f "$S/repo/$n.deb" ] || { echo "E: Can't find a source to download '$a'"; exit 100; }
-  if [ "$n" != "$a" ] && [ "${a#*=}" != "$("$STUB_REAL_DPKG" -f "$S/repo/$n.deb" Version)" ]; then
+  [ -f "$repo/$n.deb" ] || { echo "E: Can't find a source to download '$a'"; exit 100; }
+  if [ "$n" != "$a" ] && [ "${a#*=}" != "$("$STUB_REAL_DPKG" -f "$repo/$n.deb" Version)" ]; then
     echo "E: Version '${a#*=}' for '$n' was not found"; exit 100
   fi
-  cp "$S/repo/$n.deb" .
+  cp "$repo/$n.deb" .
 done
 EOF
     cat >"$B/fake-wpa_supplicant" <<'EOF'
@@ -486,6 +507,160 @@ t_fetch() {
     expect_rc 1 "fetch: fails when apt-get update fails"
     expect_out 'Existing bundle kept' "fetch: says that it kept the bundle"
     [ -z "$(find "$R/data/unifi-common-addons/att-wpa-supplicant/bundles" -name '.fetch.*')" ] && ok "fetch: no temp dir left" || bad "fetch: no temp dir left"
+}
+
+# repo_c codename name version [control lines]: a package that Debian's
+# mirror serves for that release (fetch <codename>).
+repo_c() {
+    mkdir -p "$S/repo-$1"
+    cp "$(mkdeb "$2" "$3" "${4:-}")" "$S/repo-$1/$2.deb"
+}
+
+t_fetch_codename() {
+    setup fetchc
+    D="$R/data/unifi-common-addons/att-wpa-supplicant"
+    expect_file "$D/keys/debian-archive.asc" "fetch codename: install copies the Debian keys"
+    expect_eq "$(stat -c %a "$D/keys/debian-archive.asc")" 600 "fetch codename: the keys file is 0600"
+    dep='Depends: libc6 (>= 2.34), libnl-3-200 (>= 3.2.21), libnl-genl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.4.0), libpcsclite1 (>= 1.0.0)
+'
+    repo_c bookworm wpasupplicant 2:2.10-12+deb12u3 "$dep"
+    repo_c bookworm libnl-genl-3-200 3.7.0-0.2+b1
+    repo_c bookworm libnl-route-3-200 3.7.0-0.2+b1
+    repo_c bookworm libpcsclite1 1.9.9-2
+    # Not in Depends: fetch must not download it.
+    repo_c bookworm libreadline8 8.2-1.3
+    # A firmware build of the same name must not matter: APT reads no
+    # firmware status in the scratch configuration.
+    mkdir -p "$S/firmware-build"; printf '3.7.0-2+ubnt' >"$S/firmware-build/libnl-3-200"
+    run fetch bookworm
+    expect_rc 1 "fetch codename: fails when a library in Depends is missing"
+    expect_out 'fetch bookworm: the download of the libraries failed (above). Run fetch bookworm again later. Existing bundle kept' "fetch codename: names the failed step and the next step"
+    expect_nofile "$D/bundles/bookworm-arm64" "fetch codename: a failed fetch leaves no bundle"
+    repo_c bookworm libnl-3-200 3.7.0-0.2+b1
+    : >"$S/apt.log"
+    run fetch bookworm
+    expect_rc 0 "fetch codename: succeeds"
+    m="$D/bundles/bookworm-arm64/MANIFEST"
+    expect_grep '^codename=bookworm$' "$m" "fetch codename: MANIFEST names the release"
+    expect_grep '^pkg=wpasupplicant 2:2.10-12+deb12u3$' "$m" "fetch codename: bundles wpasupplicant of that release"
+    expect_grep '^pkg=libnl-3-200 3.7.0-0.2+b1$' "$m" "fetch codename: bundles the Debian library, not the firmware build"
+    expect_eq "$(grep -c '^pkg=' "$m")" 5 "fetch codename: bundles only the runtime packages and the libraries in Depends"
+    expect_file "$D/bundles/bookworm-arm64/root/usr/sbin/wpa_supplicant" "fetch codename: unpacks the runtime"
+    expect_out 'note: bookworm-arm64 is for another Debian release. This gateway cannot test it' "fetch codename: says that a bundle for another release is not tested here"
+    sl="$S/sources-bookworm.list"
+    k=$(readlink -f "$HERE/../keys/debian-archive.asc")
+    expect_grep "^deb \[signed-by=$k\] http://deb.debian.org/debian bookworm main\$" "$sl" "fetch codename: main from deb.debian.org, signed by the shipped keys only"
+    expect_grep "^deb \[signed-by=$k\] http://deb.debian.org/debian bookworm-updates main\$" "$sl" "fetch codename: uses bookworm-updates"
+    expect_grep "^deb \[signed-by=$k\] http://deb.debian.org/debian-security bookworm-security main\$" "$sl" "fetch codename: uses bookworm-security"
+    expect_eq "$(grep -c . "$sl")" 3 "fetch codename: no other source"
+    expect_nogrep 'apt-cache' "$S/apt.log" "fetch codename: asks the firmware's APT nothing"
+    expect_eq "$(grep -c "^apt-get(APT_CONFIG=$R/tmp/att-wpa-supplicant-apt\.[^/]*/apt.conf) " "$S/apt.log")" 3 "fetch codename: every apt-get call uses the scratch configuration"
+    expect_eq "$(grep -c '^apt-get ' "$S/apt.log")" 0 "fetch codename: no apt-get call without it"
+    ac="$S/apt-bookworm.conf"
+    sd=$(sed -n 's/^Dir::Etc::Main "\(.*\)\/empty.conf";$/\1/p' "$ac")
+    case "$sd" in
+        "$R/tmp/att-wpa-supplicant-apt."*) ok "fetch codename: an empty file replaces the firmware's apt.conf" ;;
+        *) bad "fetch codename: an empty file replaces the firmware's apt.conf" "got '$sd'" ;;
+    esac
+    for kv in "Dir::Etc::Parts \"$sd/apt.conf.d\"" "Dir::Etc::SourceParts \"$sd/sources.list.d\"" \
+        "Dir::Etc::PreferencesParts \"$sd/preferences.d\"" "Dir::Etc::TrustedParts \"$sd/trusted.gpg.d\"" \
+        "Dir::State::Lists \"$sd/lists\"" "Dir::State::status \"$sd/status\"" "Dir::Cache \"$sd/cache\"" \
+        'Dir::Cache::pkgcache ""' 'Dir::Cache::srcpkgcache ""' 'APT::Update::Error-Mode "any"' \
+        'Acquire::AllowInsecureRepositories "false"' 'Acquire::AllowDowngradeToInsecureRepositories "false"' \
+        'APT::Get::AllowUnauthenticated "false"' "Dir::Etc::netrc \"$sd/auth.conf\"" \
+        "Dir::Etc::netrcparts \"$sd/auth.conf.d\""; do
+        grep -qxF "$kv;" "$ac" && ok "fetch codename: apt.conf sets $kv" || bad "fetch codename: apt.conf sets $kv"
+    done
+    [ -z "$(find "$R/tmp" -name 'att-wpa-supplicant-apt.*')" ] && ok "fetch codename: no scratch dir left" || bad "fetch codename: no scratch dir left"
+    # The running release (bullseye): from archive.debian.org, with the load check.
+    repo_c bullseye wpasupplicant 2:2.9.0-21+deb11u3
+    repo_c bullseye libpcsclite1 1.9.1-1
+    run fetch bullseye
+    expect_rc 0 "fetch codename: succeeds for the running release"
+    expect_grep "^deb \[signed-by=$k\] http://archive.debian.org/debian-security bullseye-security main\$" "$S/sources-bullseye.list" "fetch codename: bullseye from archive.debian.org"
+    printf '%s\n' "$OUT" >"$T/out"
+    expect_nogrep 'another Debian release' "$T/out" "fetch codename: no note for the running release"
+    # Unsupported codename: refused before any download.
+    : >"$S/apt.log"
+    run fetch bullseye sid
+    expect_rc 1 "fetch codename: refuses an unsupported codename"
+    expect_out "fetch: cannot fetch 'sid'. Supported: bullseye bookworm trixie. Nothing was downloaded" "fetch codename: names the supported codenames"
+    expect_eq "$(cat "$S/apt.log")" "" "fetch codename: no apt call for a refused list"
+    run fetch --all bookworm
+    expect_rc 1 "fetch codename: --all takes no codename"
+    # --all: one failure does not stop the others.
+    repo_c trixie wpasupplicant 2:2.10-24
+    repo_c trixie libpcsclite1 2.3.3-1
+    repo_c bookworm wpasupplicant 2:2.10-12+deb12u4 "$dep"
+    : >"$S/fail/apt-update-bookworm"
+    run fetch --all
+    expect_rc 1 "fetch --all: fails if one release fails"
+    expect_out 'fetch: failed for: bookworm (above). Ready for: bullseye trixie. Run fetch bookworm again later' "fetch --all: names the failed and the ready releases, and the next step"
+    expect_file "$D/bundles/trixie-arm64/MANIFEST" "fetch --all: fetches the release after the failed one"
+    expect_grep '^pkg=wpasupplicant 2:2.10-12+deb12u3$' "$m" "fetch --all: keeps the bundle of the failed release"
+    rm "$S/fail/apt-update-bookworm"
+    run fetch --all
+    expect_rc 0 "fetch --all: succeeds"
+    expect_out 'fetch: done. Bundles ready for: bullseye bookworm trixie' "fetch --all: lists the ready releases"
+    expect_grep '^pkg=wpasupplicant 2:2.10-12+deb12u4$' "$m" "fetch --all: updates the bundle"
+    # A copy of the addon without the keys file.
+    mkdir -p "$T/nokeys"
+    cp "$SCRIPT" "$HERE/../legacy.sh" "$T/nokeys/"
+    OUT=$("$T/nokeys/att-wpa-supplicant" fetch trixie 2>&1) && RC=0 || RC=$?
+    expect_rc 1 "fetch codename: fails without the keys file"
+    expect_out 'the Debian keys file is missing' "fetch codename: says that the keys file is missing"
+    # A signal ends fetch: the temp directories go.
+    left() { find "$D/bundles" "$R/tmp" -maxdepth 1 \( -name '.fetch.*' -o -name 'att-wpa-supplicant-apt.*' \); }
+    : >"$S/hang-apt-update"
+    # Not INT: a background job of this shell ignores it, and an ignored
+    # signal cannot be trapped. INT uses the same trap as TERM and HUP.
+    for sig in TERM HUP; do
+        "$SCRIPT" fetch trixie >/dev/null 2>&1 &
+        pid=$!
+        sleep 1
+        kill -"$sig" "$pid"
+        wait "$pid" && rc=0 || rc=$?
+        [ "$rc" -ne 0 ] && ok "fetch codename: SIG$sig stops fetch" || bad "fetch codename: SIG$sig stops fetch"
+        expect_eq "$(left)" "" "fetch codename: SIG$sig removes the temp directories"
+    done
+    # A signal to fetch --all stops its child, the child's temp
+    # directories go, and no later codename starts.
+    rm -f "$S/apt-trixie.conf"
+    "$SCRIPT" fetch --all >/dev/null 2>&1 &
+    pid=$!
+    sleep 1
+    kill -TERM "$pid"
+    wait "$pid"
+    expect_eq "$(left)" "" "fetch --all: SIGTERM removes the temp directories of the child"
+    sleep 4
+    expect_nofile "$S/apt-trixie.conf" "fetch --all: no later codename starts after the signal"
+    rm "$S/hang-apt-update"
+}
+
+t_hardening() {
+    setup hard
+    D="$R/data/unifi-common-addons/att-wpa-supplicant"
+    run validate eth8 eth9
+    expect_rc 1 "validate: refuses extra arguments"
+    expect_out 'usage: validate \[iface\]' "validate: shows the usage"
+    run check eth8 eth9
+    expect_rc 1 "check: refuses extra arguments"
+    expect_out 'usage: check \[iface\]' "check: shows the usage"
+    : >"$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.4242"
+    chmod +x "$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.4242"
+    : >"$D/att-wpa-supplicant.new.77"
+    : >"$D/keys/debian-archive.asc.new.78"
+    : >"$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.abc"
+    run boot
+    expect_nofile "$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.4242" "boot: removes a leftover temp file of install in on_boot.d"
+    expect_nofile "$D/att-wpa-supplicant.new.77" "boot: removes a leftover temp file of install in the addon home"
+    expect_nofile "$D/keys/debian-archive.asc.new.78" "boot: removes a leftover temp file of the keys"
+    expect_file "$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.abc" "boot: keeps a file that is not a temp file of install"
+    expect_out "removed $R/data/on_boot.d/01-att-wpa-supplicant.sh.new.4242, left by an install that did not finish" "boot: says which file it removed"
+    : >"$R/etc/systemd/system/att-wpa-supplicant@.service.new.99"
+    run install
+    expect_rc 0 "install: succeeds with a leftover temp file"
+    expect_nofile "$R/etc/systemd/system/att-wpa-supplicant@.service.new.99" "install: removes a leftover temp file of the unit"
 }
 
 # wpasupplicant names its libraries in Depends. fetch bundles those in
@@ -1883,7 +2058,7 @@ t_check_bundles() {
     mkdir -p "$bds/.hidden-arm64"
     run check
     expect_rc 0 "check: bundles line does not change the exit status"
-    expect_out '^INFO bundles: bullseye-arm64, trixie-arm64 (this release: bullseye-arm64)$' "check: lists both bundles and marks this release"
+    expect_out '^INFO bundles: bullseye-arm64, trixie-arm64 (this release: bullseye-arm64)$' "check: lists both bundles and marks this release, with no fetch --all hint"
     printf '%s\n' "$OUT" >"$T/check.out"
     expect_nogrep 'prev' "$T/check.out" "check: .prev is not listed"
     expect_nogrep 'hidden' "$T/check.out" "check: dot-directories are not listed"
@@ -1895,6 +2070,10 @@ t_check_bundles() {
     unit att-wpa-supplicant@eth8.service enabled inactive
     run check
     expect_rc 1 "check: still fails when the unit is not active"
+    rm -rf "$bds/trixie-arm64" "$bds/trixie-arm64.prev"
+    "$SCRIPT" import-bundle "$(mktgz_rel bullseye 2:2.9.0-21)" >/dev/null 2>&1
+    run check
+    expect_out '^INFO bundles: bullseye-arm64 (this release: bullseye-arm64). Before a firmware update, run: att-wpa-supplicant fetch --all$' "check: with only this release's bundle, suggests fetch --all"
 }
 
 t_legacy_file() {
@@ -1964,7 +2143,7 @@ t_units_static() {
     grep -q '^RequiresMountsFor=/data$' "$u" && ok "unit: waits for /data (a skipped start is not retried)" || bad "unit: waits for /data (a skipped start is not retried)"
 }
 
-for t in t_install_inert t_fetch t_fetch_libs t_bundle_lib_twice t_add_instance t_validate_rejects \
+for t in t_install_inert t_fetch t_fetch_codename t_hardening t_fetch_libs t_bundle_lib_twice t_add_instance t_validate_rejects \
     t_runtime_start t_runtime_refusals t_runtime_prev t_import_unpacks t_swap_while_running t_install_upgrade \
     t_bundle_swap_keeps_previous t_bundle_lock \
     t_activate_refuses_unknown t_activate_dormant_launchers t_activate_needs_takeover t_plan \

@@ -157,8 +157,8 @@ command, the shell stops with an error and runs nothing.
 
    On Debian 11 (bullseye), `fetch` usually fails. Debian moved bullseye
    to `archive.debian.org`, and the package sources of the gateway still
-   use the old address. Build the bundle on your computer instead. See
-   [Build a bundle on your computer](#build-a-bundle-on-your-computer).
+   use the old address. Run `att-wpa-supplicant fetch bullseye` instead.
+   It downloads from Debian's own servers.
 
 6. **Move the ONT ethernet cable from the RG to the gateway.**
 
@@ -232,10 +232,8 @@ the install. Keep it nearby in case you must go back.
    `validate` must print `att-wpa-supplicant: validate: OK`. If you made
    `/data/att-certs`, you may remove it: `rm -r /data/att-certs`.
 
-   If `fetch` fails on Debian 11 (bullseye), build the bundle on your
-   computer and import it. See
-   [Build a bundle on your computer](#build-a-bundle-on-your-computer).
-   Then run `validate` again.
+   If `fetch` fails on Debian 11 (bullseye), run
+   `att-wpa-supplicant fetch bullseye`. Then run `validate` again.
 5. **Preview the takeover.** This command changes nothing and does not
    stop your current setup:
 
@@ -371,13 +369,22 @@ bundle. Without it, internet access stops after the update until you run
    tries to start the supplicant every 30 seconds.
 4. After 2 minutes, run `att-wpa-supplicant check`.
 
-**To avoid the outage:** if you know that the new firmware uses a newer
-Debian version, put a bundle for that version on the gateway before you
-update. `fetch` can only download a bundle for the version that the
-gateway runs now, so
-[build the bundle on your computer](#build-a-bundle-on-your-computer)
-and import it. The `bundles` line of `att-wpa-supplicant check` then
-lists it.
+**To avoid the outage:** before you update, put a bundle for each Debian
+version on the gateway. You do not need to know which version the new
+firmware uses. On the gateway, run:
+
+```sh
+att-wpa-supplicant fetch --all
+```
+
+It downloads a bundle for Debian 11, 12, and 13 (about 2 MB each) from
+Debian's servers. It must end with
+`att-wpa-supplicant: fetch: done. Bundles ready for: bullseye bookworm trixie`.
+The `bundles` line of `att-wpa-supplicant check` then lists them.
+
+The gateway cannot test a bundle for another Debian version. After the
+update, the supplicant tests it at each start. If it fails, follow
+"If internet access stops after an update" above.
 
 ## Go back to the RG
 
@@ -453,8 +460,8 @@ If internet access is down, first [go back to the RG](#go-back-to-the-rg).
 
 ## Build a bundle on your computer
 
-Do this if the gateway cannot run `fetch` (no internet, or Debian 11).
-Also do this to put bundles for other Debian releases on the gateway. You need a
+Do this if the gateway cannot download a bundle itself, for example
+because it has no internet access. You need a
 computer with Docker, `sh`, `tar`, `sha256sum`, and a `readlink` that
 supports `-f`. It does not need to be arm64.
 
@@ -509,6 +516,7 @@ supports `-f`. It does not need to be arm64.
 | `validate [iface]` | no |
 | `plan <iface>` | no |
 | `fetch` | bundles, and the APT package lists. Installs no package. |
+| `fetch <codename>...`, `fetch --all` | bundles only. Uses its own temporary APT setup and changes no APT file of the firmware. |
 | `import-bundle <file.tgz>...` | bundles only |
 | `activate <iface> [--takeover]` | yes |
 | `deactivate <iface> [--restore-legacy]` | yes |
@@ -528,6 +536,13 @@ nearby.
   into `bundles/<codename>-<arch>/root`. They install nothing. Before each
   start, the unit tests that runtime. If the test fails, the unit tries
   the previous bundle (`.prev`) once. A start writes nothing on `/data`.
+- `fetch` downloads with the APT sources of the firmware.
+  `fetch <codename>` and `fetch --all` download from Debian's servers
+  (`deb.debian.org`, and `archive.debian.org` for bullseye). APT checks
+  the signatures with the Debian keys in `keys/debian-archive.asc`, and
+  with no other key. `tools/update-keys.sh` makes that file again and
+  prints the fingerprints. Compare them with
+  [Debian's list](https://ftp-master.debian.org/keys.html).
 - A bundle holds `wpasupplicant`, `libpcsclite1`, `libnl` (3 packages),
   `libdbus-1`, and `libreadline`. The firmware supplies the rest: `libc`,
   OpenSSL, `libsystemd`, and `libtinfo`. OpenSSL security fixes come with
@@ -547,6 +562,7 @@ nearby.
 /data/on_boot.d/01-att-wpa-supplicant.sh   the boot entry
 /data/unifi-common-addons/att-wpa-supplicant/
   att-wpa-supplicant  legacy.sh  systemd/  on_boot.d/
+  keys/debian-archive.asc           the Debian keys for fetch <codename>
   bundles/<codename>-<arch>/        *.deb, SHA256SUMS, MANIFEST
     root/                           the packages, unpacked
   bundles/<codename>-<arch>.prev/   the previous bundle, kept as a fallback
@@ -567,7 +583,8 @@ nearby.
   the
   [unifi-utilities discussions](https://github.com/orgs/unifi-utilities/discussions).
 - Debian 11 (bullseye) gets no more security updates. Debian moved it to
-  `archive.debian.org`. `tools/build-bundle.sh` downloads it from there.
+  `archive.debian.org`. `fetch bullseye` and `tools/build-bundle.sh`
+  download it from there.
 - If a firmware update removes the unifi-common boot service, no addon
   runs at boot. All unifi-common addons share this limit.
 - A launcher that the addon does not recognize can start a second
