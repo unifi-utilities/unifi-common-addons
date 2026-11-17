@@ -124,7 +124,7 @@ and the identity in its output, so you can share if you ask for help.
    | 3. Certificates | Looks in `/data/att-certs`. If it finds nothing, it shows an example `scp` command. | Copy your certificate folder from your computer, in a second terminal. If there is more than one folder, choose one. |
    | 4. Download | Downloads the bundle for this Debian version. Offers the other versions, for a later firmware update. | Answer yes (recommended) or no. |
    | 5. Check | Checks the files and that the supplicant loads. Looks for an older bypass. | Nothing |
-   | 6. Connect | Tells you to move the ONT cable from the RG to the WAN port. Then waits a few minutes for AT&T. | Move the cable, then type `yes`. |
+   | 6. Connect | Tells you to move the ONT cable from the RG to the WAN port. Then waits up to two minutes for AT&T. | Move the cable, then type `yes`. |
 
 5. **Done.** The setup ends with
    `Done. The gateway now connects to AT&T directly on <port>.` After
@@ -331,6 +331,9 @@ If internet access is down, first [go back to the RG](#go-back-to-the-rg).
 If the setup or `activate` fails, or `check` shows `802.1X not authorized`:
 
 1. Make sure that the ONT cable is in the WAN port that the setup used.
+   To use another port, run `att-wpa-supplicant setup <port-name>`.
+   After an authorization timeout, the instance on the old port stays
+   inactive. It starts nothing, even after a reboot.
 2. Read the log of the attempt:
    `journalctl -u att-wpa-supplicant@<iface> -b`. If it shows an error,
    fix that error first. After a failed activation, the supplicant is
@@ -466,8 +469,8 @@ an error and runs nothing. Keep the RG connected until step 6.
    att-wpa-supplicant activate <iface>
    ```
 
-   The command tests the supplicant for a few seconds. Then it waits a
-   few minutes at most for AT&T. It must print
+   The command tests the supplicant for a few seconds. Then it waits
+   up to two minutes for AT&T. It must print
    `att-wpa-supplicant: <iface>: authorized. Activation complete`.
 
    If activation fails, the addon stops the supplicant and does not try
@@ -562,9 +565,9 @@ nearby.
 - `fetch` downloads with the APT sources of the firmware.
   `fetch <codename>` and `fetch --all` download from Debian's servers
   (`deb.debian.org`, and `archive.debian.org` for bullseye). APT checks
-  the signatures with the Debian keys in `keys/debian-archive.asc`, and
-  with no other key. `tools/update-keys.sh` makes that file again and
-  prints the fingerprints. Compare them with
+  the signatures with only that release's keys in
+  `keys/debian-<codename>.asc`. `tools/update-keys.sh` makes these files
+  again and prints the fingerprints. Compare them with
   [Debian's list](https://ftp-master.debian.org/keys.html).
 - A bundle holds `wpasupplicant`, `libpcsclite1`, `libnl` (3 packages),
   `libdbus-1`, and `libreadline`. The firmware supplies the rest: `libc`,
@@ -585,7 +588,7 @@ nearby.
 /data/on_boot.d/01-att-wpa-supplicant.sh   the boot entry
 /data/unifi-common-addons/att-wpa-supplicant/
   att-wpa-supplicant  legacy.sh  systemd/  on_boot.d/
-  keys/debian-archive.asc           the Debian keys for fetch <codename>
+  keys/debian-<codename>.asc        one Debian key file per release for fetch
   bundles/<codename>-<arch>/        *.deb, SHA256SUMS, MANIFEST
     root/                           the packages, unpacked
   bundles/<codename>-<arch>.prev/   the previous bundle, kept as a fallback
@@ -608,7 +611,9 @@ nearby.
   [unifi-utilities discussions](https://github.com/orgs/unifi-utilities/discussions).
 - Debian 11 (bullseye) gets no more security updates. Debian moved it to
   `archive.debian.org`. `fetch bullseye` and `tools/build-bundle.sh`
-  download it from there.
+  download it from there. The Debian 11 archive and security keys expire
+  on 2029-01-15. The release key expires on 2029-02-11. After these dates,
+  `fetch bullseye` stops working.
 - If a firmware update removes the unifi-common boot service, no addon
   runs at boot. All unifi-common addons share this limit.
 - A launcher that the addon does not recognize can start a second

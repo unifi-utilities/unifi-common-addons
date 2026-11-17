@@ -43,9 +43,9 @@ LOCK_WAIT="${ATT_WPA_LOCK_WAIT:-60}"
 LOAD_TIMEOUT="${ATT_WPA_LOAD_TIMEOUT:-10}"
 # fetch <codename> (v0.3): the Debian releases that it can fetch from
 # Debian's mirrors, and the keys that it trusts for them
-# (keys/debian-archive.asc, made by tools/update-keys.sh).
+# (keys/debian-<codename>.asc, made by tools/update-keys.sh).
 FETCH_CODENAMES="bullseye bookworm trixie"
-KEYS_FILE="keys/debian-archive.asc"
+KEYS_FILES="keys/debian-bullseye.asc keys/debian-bookworm.asc keys/debian-trixie.asc"
 SCRATCH="$R/tmp"
 
 log() {
@@ -499,7 +499,7 @@ fetch_firmware() {
     [ -n "$c" ] || die "cannot read VERSION_CODENAME from $OS_RELEASE"
     mkdir -p "$BUNDLES"
     chmod 0700 "$DATA" "$BUNDLES" 2>/dev/null || true
-    tmp=$(mktemp -d "$BUNDLES/.fetch.XXXXXX")
+    tmp=$(mktemp -d "$BUNDLES/.fetch.$$.XXXXXX")
     trap 'rm -rf -- "${tmp:?}"' EXIT
     trap 'exit 1' INT TERM HUP
     apt-get update -qq || die "apt-get update failed (no internet?). Existing bundle kept"
@@ -589,11 +589,11 @@ fetch_debian() {
     a=$(arch)
     this="$(codename)-$a"
     m=$(debian_mirror "$c") || die "fetch: cannot fetch '$c'. Supported: $FETCH_CODENAMES"
-    keys="$SELF_DIR/$KEYS_FILE"
+    keys="$SELF_DIR/keys/debian-$c.asc"
     [ -r "$keys" ] || die "fetch $c: the Debian keys file is missing ($keys). Run install again from a full download of the addon. Existing bundle kept"
     mkdir -p "$BUNDLES" "$SCRATCH"
     chmod 0700 "$DATA" "$BUNDLES" 2>/dev/null || true
-    tmp=$(mktemp -d "$BUNDLES/.fetch.XXXXXX")
+    tmp=$(mktemp -d "$BUNDLES/.fetch.$$.XXXXXX")
     apt_dir=''
     trap 'rm -rf -- "${tmp:?}" ${apt_dir:+"$apt_dir"}' EXIT
     # dash runs no EXIT trap when a signal ends it. "exit" runs it.
@@ -626,18 +626,11 @@ fetch_debian() {
         log "note: $c-$a is for another Debian release. This gateway cannot test it. After a firmware update to $c, each start tests it"
 }
 
-# Stop the running child of fetch --all, wait for it, and exit.
-fetch_stop_child() {
-    kill -TERM "$child" 2>/dev/null || true
-    wait "$child" || true
-    exit 1
-}
-
 # fetch, fetch <codename>..., fetch --all. With more than one codename,
 # each runs in a new process of this script, as in import-bundle, and a
 # failure does not stop the others.
 cmd_fetch() {
-    local c ok failed child cancel
+    local c ok failed cancel
     if [ $# -eq 0 ]; then
         fetch_firmware
         return
@@ -657,20 +650,15 @@ cmd_fetch() {
     fi
     ok=''
     failed=''
-    # Each codename runs in a child. On a signal, stop the child and wait
-    # for it, so that its EXIT trap removes its temp directories. A signal
-    # between "&" and "child=$!" only sets cancel. The check after the
-    # assignment then stops that child.
-    child=''
+    # Each codename runs in the foreground, so Ctrl-C reaches its APT
+    # commands too. A signal only sets cancel. The child cleans up before
+    # this loop stops. TERM to this parent alone waits for that child.
     cancel=0
-    trap 'cancel=1; [ -z "$child" ] || fetch_stop_child' INT TERM HUP
+    trap 'cancel=1' INT TERM HUP
     for c; do
         [ "$cancel" -eq 0 ] || exit 1
-        "$SELF_DIR/$PROG" fetch "$c" &
-        child=$!
-        [ "$cancel" -eq 0 ] || fetch_stop_child
-        if wait "$child"; then ok="$ok $c"; else failed="$failed $c"; fi
-        child=''
+        if "$SELF_DIR/$PROG" fetch "$c"; then ok="$ok $c"; else failed="$failed $c"; fi
+        [ "$cancel" -eq 0 ] || exit 1
     done
     trap - INT TERM HUP
     [ -n "$failed" ] || { log "fetch: done. Bundles ready for:$ok"; return 0; }
@@ -680,7 +668,7 @@ cmd_fetch() {
 import_one() {
     local b name
     mkdir -p "$BUNDLES"
-    tmp=$(mktemp -d "$BUNDLES/.import.XXXXXX")
+    tmp=$(mktemp -d "$BUNDLES/.import.$$.XXXXXX")
     trap 'rm -rf -- "${tmp:?}"' EXIT
     trap 'exit 1' INT TERM HUP
     tar -xzf "$1" -C "$tmp" --no-same-owner || die "cannot extract $1"
@@ -1449,8 +1437,21 @@ link_command() {
 # Finish a bundle swap of this release that a power loss cut short
 # (recover_bundle), under the bundle lock.
 install_recover() {
+    local d pid
     lock_take -x || die "a unit start, fetch, or import-bundle holds the bundle lock (waited ${LOCK_WAIT}s). Nothing changed"
     recover_bundle "$BUNDLES/$(codename)-$(arch)"
+    # Fetch and import stage files before they take the lock. Keep their
+    # directories while the owner lives, and remove abandoned ones.
+    for d in "$BUNDLES"/.fetch.* "$BUNDLES"/.import.*; do
+        [ -d "$d" ] || continue
+        pid=${d%.*}
+        pid=${pid##*.}
+        case "$pid" in
+            '' | *[!0-9]*) ;;
+            *) kill -0 "$pid" 2>/dev/null && continue ;;
+        esac
+        rm -rf -- "$d"
+    done
     lock_drop
 }
 
@@ -1470,7 +1471,7 @@ put() {
 clean_put_leftovers() {
     local f
     for f in "$DATA/$PROG".new.* "$DATA/legacy.sh".new.* "$DATA/README.md".new.* \
-        "$DATA/$KEYS_FILE".new.* "$DATA/systemd/$INSTANCE_UNIT".new.* \
+        "$DATA/keys/debian-"*.asc.new.* "$DATA/systemd/$INSTANCE_UNIT".new.* \
         "$DATA/on_boot.d/$ONBOOT_NAME".new.* "$ONBOOT/$ONBOOT_NAME".new.* \
         "$UNITS/$INSTANCE_UNIT".new.*; do
         [ -e "$f" ] || [ -L "$f" ] || continue
@@ -1480,12 +1481,17 @@ clean_put_leftovers() {
 }
 
 cmd_install() {
-    local self i act idle
+    local self i act idle f
     self=$(cd "$SELF_DIR" && pwd)
     # /data/unifi-common-addons is shared with other addons: make it 0755
     # if it is missing, and never change it. /data exists on a gateway, so
     # mkdir makes only the shared directory.
     [ $# -eq 0 ] || die "usage: install"
+    # Check every required source before any installed file changes.
+    for f in "$PROG" legacy.sh "systemd/$INSTANCE_UNIT" $KEYS_FILES "on_boot.d/$ONBOOT_NAME"; do
+        [ -f "$self/$f" ] && [ -r "$self/$f" ] ||
+            die "install: missing or unreadable $self/$f. Nothing changed. Download the full addon, then run install again"
+    done
     [ -d "${DATA%/*}" ] || { mkdir -p "${DATA%/*}" && chmod 0755 "${DATA%/*}"; }
     umask 077
     setup_lock
@@ -1504,11 +1510,14 @@ cmd_install() {
         put 0700 "$self/$PROG" "$DATA/$PROG"
         put 0600 "$self/legacy.sh" "$DATA/legacy.sh"
         put 0600 "$self/systemd/$INSTANCE_UNIT" "$DATA/systemd/$INSTANCE_UNIT"
-        put 0600 "$self/$KEYS_FILE" "$DATA/$KEYS_FILE"
+        for f in $KEYS_FILES; do
+            put 0600 "$self/$f" "$DATA/$f"
+        done
         mkdir -p "$DATA/on_boot.d"
         put 0700 "$self/on_boot.d/$ONBOOT_NAME" "$DATA/on_boot.d/$ONBOOT_NAME"
         [ ! -f "$self/README.md" ] || put 0600 "$self/README.md" "$DATA/README.md"
     fi
+    rm -f -- "$DATA/keys/debian-archive.asc"
     mkdir -p "$ONBOOT"
     put 0755 "$DATA/on_boot.d/$ONBOOT_NAME" "$ONBOOT/$ONBOOT_NAME"
     link_command
@@ -1640,25 +1649,25 @@ st_yes() {
         st_say "Type y for yes or n for no."
     done
 }
-# Hide addresses in text: APT's "[IP: ...]", IPv6 addresses (with "::",
-# a leading "::", or at least four colons, with a zone), MAC addresses
-# (colon, hyphen, dot, and compact forms), and IPv4 addresses, but
-# 1.1.1.1, which the messages name as the test address. IPv6 goes before
-# MAC, so that no part of an address stays. "_" counts as a separator
-# (GNU sed's \b treats it as a letter): names like cert_aabbccddeeff.
+# Hide certificate folder serials, addresses, and MAC addresses. IPv4
+# goes before IPv6, so an IPv4-mapped address leaves no digits behind.
+# 1.1.1.1 stays: the messages name it as the test address. IPv6 goes
+# before MAC. Four groups count as IPv6, but a time (12:34:56) does not.
+# "_" counts as a separator (GNU sed's \b treats it as a letter).
 # A four-part version or a 12-digit hex number is hidden too: safe, not
 # exact. The input is the output of a step, or names that the user chose.
 st_mask_text() {
-    sed -E 's/_/\x01/g
+    sed -E 's/(EAP-TLS_8021x_[0-9A-Fa-f]{6}-)[0-9A-Za-z]+/\1<serial>/g
+        s/_/\x01/g
         s/\[IP: [^]]*\]/[IP: hidden]/g
-        s/(^|[^0-9A-Za-z:])::[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*(%[A-Za-z0-9.-]+)?/\1<address>/g
+        s/\b1\.1\.1\.1\b/@ONE@/g
+        s/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/<address>/g
+        s/(^|[^0-9A-Za-z:])::([0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*)?(%[A-Za-z0-9.-]+)?/\1<address>/g
         s/\b[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{0,4})*::([0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*)?(%[A-Za-z0-9.-]+)?/<address>/g
-        s/\b([0-9A-Fa-f]{1,4}:){4,7}[0-9A-Fa-f]{1,4}\b(%[A-Za-z0-9.-]+)?/<address>/g
+        s/\b([0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}\b(%[A-Za-z0-9.-]+)?/<address>/g
         s/\b([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b/<MAC>/g
         s/\b[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\b/<MAC>/g
         s/\b[0-9A-Fa-f]{12}\b/<MAC>/g
-        s/\b1\.1\.1\.1\b/@ONE@/g
-        s/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/<address>/g
         s/@ONE@/1.1.1.1/g
         s/\x01/_/g'
 }
@@ -1699,7 +1708,7 @@ st_installed() {
     local f
     [ -x "$DATA/$PROG" ] || return 1
     if [ "$(cd "$SELF_DIR" && pwd)" != "$DATA" ]; then
-        for f in "$PROG" legacy.sh "$KEYS_FILE" "systemd/$INSTANCE_UNIT" "on_boot.d/$ONBOOT_NAME"; do
+        for f in "$PROG" legacy.sh $KEYS_FILES "systemd/$INSTANCE_UNIT" "on_boot.d/$ONBOOT_NAME"; do
             cmp -s "$SELF_DIR/$f" "$DATA/$f" || return 1
         done
     fi
@@ -1859,6 +1868,9 @@ st_activate_failed() {
         "" \
         "Then look at these causes:" \
         "  - Is the ONT cable in $i? Setup used $i." \
+        "    To use another port, run: $PROG setup <port-name>" \
+        "    After an authorization timeout, the instance on $i stays inactive." \
+        "    It starts nothing, even after a reboot." \
         "  - Some gateways must use the MAC address of the RG on the WAN. In UniFi" \
         "    Network, set the WAN MAC address to the value of the identity= line" \
         "    in your wpa_supplicant.conf." \
@@ -1871,7 +1883,7 @@ st_activate_failed() {
 }
 
 cmd_setup() {
-    local i c a others next takeover
+    local i c a others next takeover wait_text
     [ $# -le 1 ] || die "usage: setup [iface]"
     st_tmp=$(mktemp -d) || die "setup: cannot make a temp directory"
     trap 'rm -rf -- "${st_tmp:?}"' EXIT
@@ -1991,6 +2003,11 @@ cmd_setup() {
             "Nothing changed on the WAN. Please report this, with the lines above." ;;
     esac
 
+    if [ "$TAKEOVER_TIMEOUT" = 120 ]; then
+        wait_text="This can take up to two minutes."
+    else
+        wait_text="This can take up to $TAKEOVER_TIMEOUT seconds."
+    fi
     st_step 6 "Connect to AT&T"
     if [ "$takeover" -eq 1 ]; then
         # plan also names an old setup that does not run now, for example
@@ -2009,12 +2026,12 @@ cmd_setup() {
             "If you moved the cable, put it back on the RG to get internet access again." \
             "Run setup again when you are ready."
         st_phase=connect
-        st_say "Waiting for AT&T to accept the addon. This can take a few minutes."
+        st_say "Waiting for AT&T to accept the addon. $wait_text"
         st_run activate "$i" --takeover
     else
         st_move_cable "$i"
         st_phase=connect
-        st_say "Waiting for AT&T to accept the gateway. This can take a few minutes."
+        st_say "Waiting for AT&T to accept the gateway. $wait_text"
         st_run activate "$i"
     fi
     [ "$st_rc" -eq 0 ] || st_activate_failed "$i" "$takeover"

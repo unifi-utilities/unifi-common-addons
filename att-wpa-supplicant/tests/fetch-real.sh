@@ -60,9 +60,9 @@ b="$R/data/unifi-common-addons/att-wpa-supplicant/bundles/trixie-$(dpkg --print-
 digest() { (cd "$b" && find . -type f -o -type l | sort | while read -r f; do
     if [ -L "$f" ]; then echo "$f -> $(readlink "$f")"; else sha256sum "$f"; fi; done); }
 digest >/out/trixie-before.digest
-# A wrong key: the bullseye stable key only. fetch must fail and keep the bundle.
+# A wrong key: the bullseye keys only. fetch must fail and keep the bundle.
 cp -r /addon /wrong
-awk '/BEGIN PGP/ {n++} n == 6' /addon/keys/debian-archive.asc >/wrong/keys/debian-archive.asc
+cp /addon/keys/debian-bullseye.asc /wrong/keys/debian-trixie.asc
 /wrong/att-wpa-supplicant fetch trixie >/out/wrong.log 2>&1
 echo "rc=$?" >>/out/wrong.log
 digest >/out/trixie-after.digest

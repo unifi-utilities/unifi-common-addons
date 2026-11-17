@@ -313,7 +313,7 @@ EOF
     # source list that the configuration names), keeps copies of the list
     # and the configuration (sources-<codename>.list, apt-<codename>.conf),
     # and ignores the firmware's own builds (the scratch status is empty).
-    # $STUB_STATE/hang-apt-update: update sleeps 3 s (signal tests).
+    # $STUB_STATE/hang-apt-update: update sleeps for its value in seconds.
     cat >"$B/apt-get" <<'EOF'
 #!/bin/sh
 S=$STUB_STATE
@@ -337,7 +337,10 @@ for a in "$@"; do
   [ "$skip" = 0 ] || { skip=0; continue; }
   case "$a" in
     update)
-      [ ! -f "$S/hang-apt-update" ] || sleep 3
+      if [ -f "$S/hang-apt-update" ]; then
+        : >"$S/apt-sleeping"
+        sleep "$(cat "$S/hang-apt-update")"
+      fi
       [ ! -f "$S/fail/apt-update" ] || exit 100
       [ -z "$c" ] || [ ! -f "$S/fail/apt-update-$c" ] || { echo "Err:1 http://deb.debian.org/debian $c InRelease [IP: 192.0.2.5 80]" >&2; echo "  Could not connect to 192.0.2.6:80 198.51.100.7 2001:db8::5 2001:db8:0:0:1:2:3:4 fe80::1%eth8 [::abcd:1234] aa:bb:cc:00:11:22 192.0.2.9_x cert_aabbcc001122, connection timed out" >&2; echo "E: The repository for $c is not signed." >&2; exit 100; }
       exit 0 ;;
@@ -524,8 +527,10 @@ repo_c() {
 t_fetch_codename() {
     setup fetchc
     D="$R/data/unifi-common-addons/att-wpa-supplicant"
-    expect_file "$D/keys/debian-archive.asc" "fetch codename: install copies the Debian keys"
-    expect_eq "$(stat -c %a "$D/keys/debian-archive.asc")" 600 "fetch codename: the keys file is 0600"
+    for c in bullseye bookworm trixie; do
+        expect_file "$D/keys/debian-$c.asc" "fetch codename: install copies the $c keys"
+        expect_eq "$(stat -c %a "$D/keys/debian-$c.asc")" 600 "fetch codename: the $c keys file is 0600"
+    done
     dep='Depends: libc6 (>= 2.34), libnl-3-200 (>= 3.2.21), libnl-genl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.4.0), libpcsclite1 (>= 1.0.0)
 '
     repo_c bookworm wpasupplicant 2:2.10-12+deb12u3 "$dep"
@@ -553,7 +558,7 @@ t_fetch_codename() {
     expect_file "$D/bundles/bookworm-arm64/root/usr/sbin/wpa_supplicant" "fetch codename: unpacks the runtime"
     expect_out 'note: bookworm-arm64 is for another Debian release. This gateway cannot test it' "fetch codename: says that a bundle for another release is not tested here"
     sl="$S/sources-bookworm.list"
-    k=$(readlink -f "$HERE/../keys/debian-archive.asc")
+    k=$(readlink -f "$HERE/../keys/debian-bookworm.asc")
     expect_grep "^deb \[signed-by=$k\] http://deb.debian.org/debian bookworm main\$" "$sl" "fetch codename: main from deb.debian.org, signed by the shipped keys only"
     expect_grep "^deb \[signed-by=$k\] http://deb.debian.org/debian bookworm-updates main\$" "$sl" "fetch codename: uses bookworm-updates"
     expect_grep "^deb \[signed-by=$k\] http://deb.debian.org/debian-security bookworm-security main\$" "$sl" "fetch codename: uses bookworm-security"
@@ -582,6 +587,7 @@ t_fetch_codename() {
     repo_c bullseye libpcsclite1 1.9.1-1
     run fetch bullseye
     expect_rc 0 "fetch codename: succeeds for the running release"
+    k=$(readlink -f "$HERE/../keys/debian-bullseye.asc")
     expect_grep "^deb \[signed-by=$k\] http://archive.debian.org/debian-security bullseye-security main\$" "$S/sources-bullseye.list" "fetch codename: bullseye from archive.debian.org"
     printf '%s\n' "$OUT" >"$T/out"
     expect_nogrep 'another Debian release' "$T/out" "fetch codename: no note for the running release"
@@ -608,15 +614,19 @@ t_fetch_codename() {
     expect_rc 0 "fetch --all: succeeds"
     expect_out 'fetch: done. Bundles ready for: bullseye bookworm trixie' "fetch --all: lists the ready releases"
     expect_grep '^pkg=wpasupplicant 2:2.10-12+deb12u4$' "$m" "fetch --all: updates the bundle"
+    k=$(readlink -f "$HERE/../keys/debian-trixie.asc")
+    expect_grep "^deb \[signed-by=$k\] http://deb.debian.org/debian trixie main\$" "$S/sources-trixie.list" "fetch codename: trixie uses only its own keys"
     # A copy of the addon without the keys file.
     mkdir -p "$T/nokeys"
     cp "$SCRIPT" "$HERE/../legacy.sh" "$T/nokeys/"
+    : >"$S/apt.log"
     OUT=$("$T/nokeys/att-wpa-supplicant" fetch trixie 2>&1) && RC=0 || RC=$?
     expect_rc 1 "fetch codename: fails without the keys file"
     expect_out 'the Debian keys file is missing' "fetch codename: says that the keys file is missing"
+    expect_eq "$(cat "$S/apt.log")" "" "fetch codename: missing keys fail before any download"
     # A signal ends fetch: the temp directories go.
     left() { find "$D/bundles" "$R/tmp" -maxdepth 1 \( -name '.fetch.*' -o -name 'att-wpa-supplicant-apt.*' \); }
-    : >"$S/hang-apt-update"
+    echo 3 >"$S/hang-apt-update"
     # Not INT: a background job of this shell ignores it, and an ignored
     # signal cannot be trapped. INT uses the same trap as TERM and HUP.
     for sig in TERM HUP; do
@@ -628,18 +638,42 @@ t_fetch_codename() {
         [ "$rc" -ne 0 ] && ok "fetch codename: SIG$sig stops fetch" || bad "fetch codename: SIG$sig stops fetch"
         expect_eq "$(left)" "" "fetch codename: SIG$sig removes the temp directories"
     done
-    # A signal to fetch --all stops its child, the child's temp
-    # directories go, and no later codename starts.
+    # TERM to the parent alone waits for its foreground child. The
+    # child finishes and cleans up, then the parent stops the loop.
     rm -f "$S/apt-trixie.conf"
     "$SCRIPT" fetch --all >/dev/null 2>&1 &
     pid=$!
     sleep 1
     kill -TERM "$pid"
-    wait "$pid"
+    wait "$pid" && RC=0 || RC=$?
+    expect_rc 1 "fetch --all: SIGTERM stops fetch after the child finishes"
     expect_eq "$(left)" "" "fetch --all: SIGTERM removes the temp directories of the child"
-    sleep 4
     expect_nofile "$S/apt-trixie.conf" "fetch --all: no later codename starts after the signal"
     rm "$S/hang-apt-update"
+}
+
+t_install_staging() {
+    setup install-staging
+    D="$R/data/unifi-common-addons/att-wpa-supplicant"
+    sleep 300 &
+    live_pid=$!
+    sleep 300 &
+    dead_pid=$!
+    kill "$dead_pid"
+    wait "$dead_pid" 2>/dev/null || true
+    for kind in fetch import; do
+        mkdir "$D/bundles/.$kind.$dead_pid.stale" "$D/bundles/.$kind.$live_pid.live" "$D/bundles/.$kind.$live_pid"
+        : >"$D/bundles/.$kind.$dead_pid.stale/partial"
+        : >"$D/bundles/.$kind.$live_pid.live/partial"
+    done
+    run install
+    for kind in fetch import; do
+        expect_nofile "$D/bundles/.$kind.$dead_pid.stale" "install: removes $kind staging with a dead owner PID"
+        expect_file "$D/bundles/.$kind.$live_pid.live/partial" "install: keeps $kind staging with a live owner PID"
+        expect_nofile "$D/bundles/.$kind.$live_pid" "install: removes old-format $kind staging with a numeric suffix"
+    done
+    kill "$live_pid"
+    wait "$live_pid" 2>/dev/null || true
 }
 
 t_hardening() {
@@ -655,16 +689,29 @@ t_hardening() {
     chmod +x "$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.4242"
     : >"$D/att-wpa-supplicant.new.77"
     : >"$D/keys/debian-archive.asc.new.78"
+    for c in bullseye bookworm trixie; do
+        : >"$D/keys/debian-$c.asc.new.79"
+    done
     : >"$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.abc"
     run boot
     expect_nofile "$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.4242" "boot: removes a leftover temp file of install in on_boot.d"
     expect_nofile "$D/att-wpa-supplicant.new.77" "boot: removes a leftover temp file of install in the addon home"
     expect_nofile "$D/keys/debian-archive.asc.new.78" "boot: removes a leftover temp file of the keys"
+    for c in bullseye bookworm trixie; do
+        expect_nofile "$D/keys/debian-$c.asc.new.79" "boot: removes a leftover temp file of the $c keys"
+    done
     expect_file "$R/data/on_boot.d/01-att-wpa-supplicant.sh.new.abc" "boot: keeps a file that is not a temp file of install"
     expect_out "removed $R/data/on_boot.d/01-att-wpa-supplicant.sh.new.4242, left by an install that did not finish" "boot: says which file it removed"
+    : >"$D/keys/debian-archive.asc"
+    mkdir -p "$D/bundles/.fetch.stale" "$D/bundles/.import.stale"
+    : >"$D/bundles/.fetch.stale/partial"
+    : >"$D/bundles/.import.stale/partial"
     : >"$R/etc/systemd/system/att-wpa-supplicant@.service.new.99"
     run install
     expect_rc 0 "install: succeeds with a leftover temp file"
+    expect_nofile "$D/keys/debian-archive.asc" "install: removes the old shared keys file"
+    expect_nofile "$D/bundles/.fetch.stale" "install: removes a fetch left by a power loss"
+    expect_nofile "$D/bundles/.import.stale" "install: removes an import left by a power loss"
     expect_nofile "$R/etc/systemd/system/att-wpa-supplicant@.service.new.99" "install: removes a leftover temp file of the unit"
 }
 
@@ -1266,6 +1313,21 @@ old_sig() {
     cat "$dd/att-wpa-supplicant" "$dd/legacy.sh" "$dd/systemd/att-wpa-supplicant@.service" \
         "$R/etc/systemd/system/att-wpa-supplicant@.service" "$dd/on_boot.d/01-att-wpa-supplicant.sh" \
         "$R/data/on_boot.d/01-att-wpa-supplicant.sh" 2>&1 | sha256sum
+}
+
+# A missing source must fail before install replaces the main script.
+t_install_sources() {
+    setup inst-sources
+    D="$R/data/unifi-common-addons/att-wpa-supplicant"
+    cp -R "$HERE/.." "$T/incomplete"
+    printf '\n# candidate install\n' >>"$T/incomplete/att-wpa-supplicant"
+    rm "$T/incomplete/keys/debian-trixie.asc"
+    cp "$D/att-wpa-supplicant" "$T/script.before"
+    OUT=$("$T/incomplete/att-wpa-supplicant" install 2>&1) && RC=0 || RC=$?
+    expect_rc 1 "install source check: refuses a missing key file"
+    expect_out 'missing or unreadable .*keys/debian-trixie.asc. Nothing changed' "install source check: names the missing source and says nothing changed"
+    cmp -s "$D/att-wpa-supplicant" "$T/script.before" && ok "install source check: leaves the installed script unchanged" ||
+        bad "install source check: leaves the installed script unchanged"
 }
 
 # install over an installed version: it stops before it changes anything
@@ -1935,6 +1997,95 @@ expect_private() {
     expect_nogrep '[Aa][Aa]:[Bb][Bb]:[Cc][Cc]\|[Aa][Aa][Bb][Bb][Cc][Cc]' "$T/setup.out" "$1: prints no identity or MAC address"
 }
 
+t_setup_mask() {
+    setup mask
+    sed -n '/^st_mask_text() {/,/^}/p' "$SCRIPT" >"$T/mask.sh"
+    printf '\nst_mask_text\n' >>"$T/mask.sh"
+    mask_text() { printf '%s\n' "$1" | sh "$T/mask.sh"; }
+    expect_eq "$(mask_text '::ffff:192.168.1.5')" '<address>:<address>' "setup mask: hides all of an IPv4-mapped IPv6 address"
+    expect_eq "$(mask_text 'fe80::1%eth8')" '<address>' "setup mask: hides all of a scoped IPv6 address"
+    expect_eq "$(mask_text 'aa:bb:cc:dd:ee:ff')" '<address>' "setup mask: hides all of a colon MAC address"
+    expect_eq "$(mask_text '2600:1700:ab:cd/64')" '<address>/64' "setup mask: hides four IPv6 groups without a double colon"
+    expect_eq "$(mask_text '12:34:56')" '12:34:56' "setup mask: keeps a time"
+    expect_eq "$(mask_text '1.1.1.1')" '1.1.1.1' "setup mask: keeps the test address"
+    expect_eq "$(mask_text '/data/att-certs/EAP-TLS_8021x_001E46-123456789012345/wpa_supplicant.conf')" \
+        '/data/att-certs/EAP-TLS_8021x_001E46-<serial>/wpa_supplicant.conf' "setup mask: hides a numeric certificate folder serial"
+    expect_eq "$(mask_text 'EAP-TLS_8021x_aBcD12-RGserial9')" 'EAP-TLS_8021x_aBcD12-<serial>' "setup mask: hides a non-hex certificate folder serial"
+    for punctuation in . ')' "'" '"' ',' :; do
+        expect_eq "$(mask_text "EAP-TLS_8021x_001E46-RGserial9$punctuation")" \
+            "EAP-TLS_8021x_001E46-<serial>$punctuation" "setup mask: keeps trailing $punctuation after a certificate folder serial"
+    done
+    expect_eq "$(mask_text '"EAP-TLS_8021x_001E46-RGserial9".')" \
+        '"EAP-TLS_8021x_001E46-<serial>".' "setup mask: keeps quotes and a period around a certificate folder name"
+}
+
+t_setup_keys() {
+    for c in bullseye bookworm trixie; do
+        setup_ready "setup-key-$c"
+        rm "$D/keys/debian-$c.asc"
+        run_in '' setup
+        expect_out 'Installed. Nothing runs yet' "setup keys: installs again when the $c keys are missing"
+        expect_file "$D/keys/debian-$c.asc" "setup keys: restores the $c keys"
+    done
+}
+
+# Start a session with SIGINT reset, as for a command in a terminal.
+# A job started with & inherits ignored SIGINT from this test shell.
+# The waiter stays outside the group and records the real exit status.
+start_int_group() {
+    (
+        env --default-signal=INT setsid -w sh -c 'echo $$ >"$1"; shift; exec "$@"' sh \
+            "$T/int.pgid" "$SCRIPT" "$@" <"$T/int.answers" >"$T/int.out" 2>&1
+        echo $? >"$T/int.rc"
+    ) &
+    int_waiter=$!
+}
+
+stop_int_group() {
+    n=0
+    until [ -f "$S/apt-sleeping" ] || [ "$n" -ge 80 ]; do sleep 0.1; n=$((n + 1)); done
+    expect_file "$S/apt-sleeping" "$1: reaches the sleeping apt-get"
+    # Let apt-get start its foreground sleep before sending the signal.
+    sleep 0.25
+    /bin/kill -INT -- "-$(cat "$T/int.pgid")"
+    n=0
+    until [ -f "$T/int.rc" ] || [ "$n" -ge 50 ]; do sleep 0.1; n=$((n + 1)); done
+    [ -f "$T/int.rc" ] && ok "$1: SIGINT stops within five seconds of a 20 s sleep" ||
+        bad "$1: SIGINT stops within five seconds of a 20 s sleep"
+    # Bound a failing test too. TERM releases the old background child.
+    /bin/kill -TERM -- "-$(cat "$T/int.pgid")" 2>/dev/null
+    sleep 0.25
+    /bin/kill -KILL -- "-$(cat "$T/int.pgid")" 2>/dev/null
+    wait "$int_waiter"
+    expect_eq "$(cat "$T/int.rc")" 1 "$1: exits with failure"
+    expect_eq "$(find "$D/bundles" "$R/tmp" -maxdepth 1 \( -name '.fetch.*' -o -name 'att-wpa-supplicant-apt.*' \))" "" "$1: removes fetch and scratch directories"
+    for c in $int_later; do
+        expect_nofile "$S/apt-$c.conf" "$1: no later codename ($c) starts"
+    done
+}
+
+t_fetch_int() {
+    setup fetch-int
+    D="$R/data/unifi-common-addons/att-wpa-supplicant"
+    echo 20 >"$S/hang-apt-update"
+    : >"$T/int.answers"
+    int_later="bookworm trixie"
+    start_int_group fetch --all
+    stop_int_group "fetch --all Ctrl-C"
+}
+
+t_setup_fetch_int() {
+    setup_ready setup-fetch-int
+    bundle_ready
+    # Skip the current release and interrupt the optional multi-release
+    # download of bookworm and trixie in setup step 4.
+    echo 20 >"$S/hang-apt-update"
+    printf '\n\n' >"$T/int.answers"
+    int_later=trixie
+    start_int_group setup
+    stop_int_group "setup step 4 Ctrl-C"
+}
+
 t_setup_fresh() {
     setup_ready setup-fresh
     rm -f "$D/att-wpa-supplicant"
@@ -1961,6 +2112,7 @@ t_setup_fresh() {
     expect_file "$D/bundles/bullseye-arm64/root" "setup: fetches the bundle of this release"
     expect_out 'Skipped. Before a firmware update, run: att-wpa-supplicant fetch --all' "setup: names fetch --all when the user skips the other bundles"
     expect_nofile "$D/bundles/trixie-arm64" "setup: no other bundle when the user says no"
+    expect_out 'This can take up to 2 seconds.' "setup: wait text uses the configured timeout"
     expect_out 'Type yes when the ONT cable is in the WAN port' "setup: asks the user to move the cable"
     expect_file "$(INSTD eth8)/active" "setup: activates eth8"
     expect_out 'Done. The gateway now connects to AT&T directly on eth8' "setup: says that it is done"
@@ -1988,8 +2140,9 @@ t_setup_other_bundles() {
     repo_c trixie libpcsclite1 2.3.3-1
     authorized
     # The default answer (Enter) downloads the other bundles.
-    run_in '\n\nyes\n' setup
+    ATT_WPA_TAKEOVER_TIMEOUT=120 run_in '\n\nyes\n' setup
     expect_rc 0 "setup bundles: succeeds"
+    expect_out 'This can take up to two minutes.' "setup: wait text names the default timeout"
     expect_out 'Download the bundles for bookworm trixie now' "setup bundles: offers the releases that have no bundle"
     expect_file "$D/bundles/bookworm-arm64/MANIFEST" "setup bundles: fetches bookworm"
     expect_file "$D/bundles/trixie-arm64/MANIFEST" "setup bundles: fetches trixie"
@@ -2084,6 +2237,9 @@ t_setup_stops() {
     expect_out 'AT&T did not accept the gateway in time' "setup unauthorized: says what happened"
     expect_out "rm -r /data/unifi-common-addons/att-wpa-supplicant/instances/eth8/certs /data/unifi-common-addons/att-wpa-supplicant/instances/eth8/wpa_supplicant.conf" "setup unauthorized: tells how to import other certificates, and keeps the takeover record"
     expect_out 'Connect the ONT cable to the ONT port of the RG again' "setup unauthorized: tells how to get internet access back"
+    expect_out 'att-wpa-supplicant setup <port-name>' "setup unauthorized: says how to choose another port"
+    expect_out 'After an authorization timeout, the instance on eth8 stays inactive.' "setup unauthorized: explains the unused instance after a timeout"
+    expect_out 'It starts nothing, even after a reboot.' "setup unauthorized: explains that the unused instance does not start"
     expect_out 'value of the identity= line' "setup unauthorized: names the identity line for the MAC clone"
     expect_out 'journalctl -u att-wpa-supplicant@eth8.service -b' "setup unauthorized: names the log"
     expect_nofile "$(INSTD eth8)/active" "setup unauthorized: the rollback deactivated eth8"
@@ -2106,8 +2262,9 @@ t_setup_takeover() {
     expect_nogrep 'Now move the cable' "$T/tk.out" "setup takeover: no cable step when the old bypass runs"
     expect_nogrep 'stop\|disable' "$S/systemctl.log" "setup takeover: stops nothing without yes"
     expect_eq "$(state_of wpa_supplicant-wired@eth8.service active)" active "setup takeover: the old setup still runs"
-    run_in 'n\ny\nyes\n' setup
+    ATT_WPA_TAKEOVER_TIMEOUT=120 run_in 'n\ny\nyes\n' setup
     expect_rc 0 "setup takeover: succeeds with yes"
+    expect_out 'Waiting for AT&T to accept the addon. This can take up to two minutes.' "setup takeover: wait text names the default timeout"
     expect_grep 'setup: run activate eth8 --takeover$' "$S/logger.log" "setup takeover: runs activate --takeover"
     expect_grep '^unit wpa_supplicant-wired@eth8.service' "$(INSTD eth8)/takeover.state" "setup takeover: activate --takeover recorded the old unit"
     expect_out 'Done. The gateway now connects to AT&T directly on eth8' "setup takeover: says that it is done"
@@ -2447,7 +2604,7 @@ t_units_static() {
     grep -q '^RequiresMountsFor=/data$' "$u" && ok "unit: waits for /data (a skipped start is not retried)" || bad "unit: waits for /data (a skipped start is not retried)"
 }
 
-for t in t_install_inert t_fetch t_fetch_codename t_hardening t_fetch_libs t_bundle_lib_twice t_add_instance t_validate_rejects \
+for t in t_install_inert t_install_sources t_fetch t_fetch_codename t_fetch_int t_hardening t_install_staging t_fetch_libs t_bundle_lib_twice t_add_instance t_validate_rejects \
     t_runtime_start t_runtime_refusals t_runtime_prev t_import_unpacks t_swap_while_running t_install_upgrade \
     t_bundle_swap_keeps_previous t_bundle_lock \
     t_activate_refuses_unknown t_activate_dormant_launchers t_activate_needs_takeover t_plan \
@@ -2457,7 +2614,7 @@ for t in t_install_inert t_fetch t_fetch_codename t_hardening t_fetch_libs t_bun
     t_deactivate_refuses_restore_if_ours_runs t_takeover_records_disabled_running_unit \
     t_restore_failure_keeps_ledger t_rollback_without_legacy_stops_ours \
     t_stop_query_error_is_not_stopped t_validate_exact_modes t_boot t_uninstall t_check t_import_bundle_several t_check_bundles t_legacy_file t_journal_once t_units_static \
-    t_setup_fresh t_setup_other_bundles t_setup_stops t_setup_takeover t_setup_dormant t_setup_more; do
+    t_setup_mask t_setup_keys t_setup_fetch_int t_setup_fresh t_setup_other_bundles t_setup_stops t_setup_takeover t_setup_dormant t_setup_more; do
     # ONLY="t_a t_b" runs only those tests.
     case " ${ONLY:-$t} " in *" $t "*) ;; *) continue ;; esac
     $t
