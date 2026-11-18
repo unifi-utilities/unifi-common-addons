@@ -41,6 +41,12 @@ POLL="${ATT_WPA_POLL:-5}"
 STOP_WAIT="${ATT_WPA_STOP_WAIT:-10}"
 LOCK_WAIT="${ATT_WPA_LOCK_WAIT:-60}"
 LOAD_TIMEOUT="${ATT_WPA_LOAD_TIMEOUT:-10}"
+# fetch <codename> (v0.3): the Debian releases that it can fetch from
+# Debian's mirrors, and the keys that it trusts for them
+# (keys/debian-<codename>.asc, made by tools/update-keys.sh).
+FETCH_CODENAMES="bullseye bookworm trixie"
+KEYS_FILES="keys/debian-bullseye.asc keys/debian-bookworm.asc keys/debian-trixie.asc"
+SCRATCH="$R/tmp"
 
 log() {
     [ "${log_quiet:-0}" -eq 0 ] || return 0
@@ -61,6 +67,10 @@ usage() {
     cat <<'EOF'
 Usage: att-wpa-supplicant <command> [args]
 
+Start here
+  setup [iface]                   Guided setup. Asks questions and runs the steps
+                                  below in order. Asks before it changes the WAN.
+
 Setup
   install                         Copy the addon to /data. Unpack the runtime of
                                   bundles that have none. Install the boot entry
@@ -70,6 +80,9 @@ Setup
                                   for one WAN interface.
   fetch                           Download the bundle (the supplicant packages)
                                   for this release. Needs internet access.
+  fetch <codename>... | --all     Download a bundle for each named Debian release
+                                  (bullseye, bookworm, trixie) from Debian's
+                                  mirrors. Use it before a firmware update.
   import-bundle <file.tgz>...     Install one or more bundles built with
                                   tools/build-bundle.sh. Stops at the first failure.
   activate <iface> [--takeover]   Start the supplicant on <iface>. --takeover
@@ -221,6 +234,7 @@ validate_platform() {
 cmd_validate() {
     local rc n i
     rc=0
+    [ $# -le 1 ] || die "usage: validate [iface]"
     if [ -d "$DATA" ]; then
         if [ "$(uid_of "$DATA")" != "$OWNER_UID" ] || [ -n "$(find "$DATA" -maxdepth 0 -perm /022)" ]; then
             log "$DATA must be owned by uid $OWNER_UID and not writable by group/other"
@@ -476,15 +490,18 @@ in_use_fails() {
     return "$rc"
 }
 
-cmd_fetch() {
+# fetch with no argument: the running release, from the firmware's APT
+# sources. Unchanged since v0.2.3.
+fetch_firmware() {
     local c a libs specs
     c=$(codename)
     a=$(arch)
     [ -n "$c" ] || die "cannot read VERSION_CODENAME from $OS_RELEASE"
     mkdir -p "$BUNDLES"
     chmod 0700 "$DATA" "$BUNDLES" 2>/dev/null || true
-    tmp=$(mktemp -d "$BUNDLES/.fetch.XXXXXX")
+    tmp=$(mktemp -d "$BUNDLES/.fetch.$$.XXXXXX")
     trap 'rm -rf -- "${tmp:?}"' EXIT
+    trap 'exit 1' INT TERM HUP
     apt-get update -qq || die "apt-get update failed (no internet?). Existing bundle kept"
     # The fetch directory is 0700 root, so APT's _apt user cannot write to
     # it. Download as root, which APT would also do, with a warning.
@@ -507,11 +524,153 @@ cmd_fetch() {
     log "fetch: bundle $c-$a ready: $(sed -n 's/^pkg=//p' "$BUNDLES/$c-$a/MANIFEST" | tr '\n' ' ')"
 }
 
+# Prints the Debian mirror of codename $1, or returns 1 if fetch does not
+# support it. bullseye moved to archive.debian.org (security support
+# ended); tools/build-bundle.sh uses the same mirrors.
+debian_mirror() {
+    case "$1" in
+        bullseye) echo http://archive.debian.org ;;
+        bookworm | trixie) echo http://deb.debian.org ;;
+        *) return 1 ;;
+    esac
+}
+
+# Write the scratch APT configuration in $apt_dir/apt.conf. APT reads the
+# file in APT_CONFIG first, before apt.conf.d and apt.conf, so these
+# settings send it to empty files instead: APT then reads no setting,
+# hook, source, pin, key, credential, list, or status file of the
+# firmware, and writes only in $apt_dir. It still uses the proxy
+# variables (http_proxy and others) of the environment, on purpose: a
+# gateway behind a proxy needs them, and the signature check does not
+# depend on them. A firmware setting cannot allow an unsigned
+# repository or run a hook. Error-Mode "any": a source that fails (for
+# example only -security) fails the update, so that a bundle never loses
+# its security updates. The package caches are off; the indexes stay
+# compressed.
+scratch_apt_conf() {
+    local d
+    d=$apt_dir
+    mkdir -p "$d/lists/partial" "$d/cache/archives/partial" "$d/apt.conf.d" \
+        "$d/sources.list.d" "$d/preferences.d" "$d/trusted.gpg.d" "$d/auth.conf.d"
+    : >"$d/status"
+    : >"$d/empty.conf"
+    cat >"$d/apt.conf" <<EOF
+Dir::Etc::Main "$d/empty.conf";
+Dir::Etc::Parts "$d/apt.conf.d";
+Dir::Etc::SourceList "$d/sources.list";
+Dir::Etc::SourceParts "$d/sources.list.d";
+Dir::Etc::Preferences "$d/preferences";
+Dir::Etc::PreferencesParts "$d/preferences.d";
+Dir::Etc::Trusted "$d/trusted.gpg";
+Dir::Etc::TrustedParts "$d/trusted.gpg.d";
+Dir::Etc::netrc "$d/auth.conf";
+Dir::Etc::netrcparts "$d/auth.conf.d";
+Dir::State::Lists "$d/lists";
+Dir::State::status "$d/status";
+Dir::Cache "$d/cache";
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
+Acquire::GzipIndexes "true";
+APT::Sandbox::User "root";
+APT::Update::Error-Mode "any";
+Acquire::AllowInsecureRepositories "false";
+Acquire::AllowDowngradeToInsecureRepositories "false";
+APT::Get::AllowUnauthenticated "false";
+EOF
+}
+scratch_apt() { APT_CONFIG="$apt_dir/apt.conf" apt-get "$@"; }
+
+# fetch <codename>: one bundle for Debian release $1, from Debian's
+# mirrors, with the keys that the addon ships. The checks are those of
+# fetch. Only the running release gets the load check.
+fetch_debian() {
+    local c a m keys libs this
+    c=$1
+    a=$(arch)
+    this="$(codename)-$a"
+    m=$(debian_mirror "$c") || die "fetch: cannot fetch '$c'. Supported: $FETCH_CODENAMES"
+    keys="$SELF_DIR/keys/debian-$c.asc"
+    [ -r "$keys" ] || die "fetch $c: the Debian keys file is missing ($keys). Run install again from a full download of the addon. Existing bundle kept"
+    mkdir -p "$BUNDLES" "$SCRATCH"
+    chmod 0700 "$DATA" "$BUNDLES" 2>/dev/null || true
+    tmp=$(mktemp -d "$BUNDLES/.fetch.$$.XXXXXX")
+    apt_dir=''
+    trap 'rm -rf -- "${tmp:?}" ${apt_dir:+"$apt_dir"}' EXIT
+    # dash runs no EXIT trap when a signal ends it. "exit" runs it.
+    trap 'exit 1' INT TERM HUP
+    apt_dir=$(mktemp -d "$SCRATCH/$PROG-apt.XXXXXX") || die "fetch $c: cannot make a temp directory in $SCRATCH. Existing bundle kept"
+    scratch_apt_conf
+    printf 'deb [signed-by=%s] %s/debian %s main\ndeb [signed-by=%s] %s/debian %s-updates main\ndeb [signed-by=%s] %s/debian-security %s-security main\n' \
+        "$keys" "$m" "$c" "$keys" "$m" "$c" "$keys" "$m" "$c" >"$apt_dir/sources.list"
+    log "fetch $c: downloading the package lists from $m"
+    scratch_apt update -qq ||
+        die "fetch $c: cannot download or verify the package lists (above). Check the internet access of the gateway, then run fetch $c again. Existing bundle kept"
+    # shellcheck disable=SC2086 # RUNTIME_PKGS holds single words
+    (cd "$tmp" && scratch_apt download -qq $RUNTIME_PKGS) ||
+        die "fetch $c: the download failed (above). Run fetch $c again later. Existing bundle kept"
+    libs=$(runtime_lib_deps "$(bundle_debs "$tmp" wpasupplicant)") ||
+        die "fetch $c: cannot read the dependencies of wpasupplicant. Existing bundle kept. Run fetch $c again. If it fails again, report it with the lines above"
+    if [ -n "$libs" ]; then
+        # shellcheck disable=SC2086 # package names are single words
+        (cd "$tmp" && scratch_apt download -qq $libs) ||
+            die "fetch $c: the download of the libraries failed (above). Run fetch $c again later. Existing bundle kept"
+    fi
+    seal_bundle "$tmp" "$c" "$a" "Debian mirrors (fetch $c) on $(hostname 2>/dev/null || echo gateway)"
+    bundle_ok "$tmp" "$c-$a" || die "fetch $c: the new bundle failed its check (above). Existing bundle kept. Run fetch $c again. If it fails again, report it with the lines above"
+    bundle_unpack "$tmp" "$tmp/root" "$c-$a" || die "fetch $c: the runtime of the new bundle failed its check (above). Existing bundle kept. Report it with the lines above"
+    swap_bundle "$tmp" "$BUNDLES/$c-$a"
+    trap - EXIT
+    rm -rf -- "${apt_dir:?}"
+    log "fetch: bundle $c-$a ready: $(sed -n 's/^pkg=//p' "$BUNDLES/$c-$a/MANIFEST" | tr '\n' ' ')"
+    [ "$c-$a" = "$this" ] ||
+        log "note: $c-$a is for another Debian release. This gateway cannot test it. After a firmware update to $c, each start tests it"
+}
+
+# fetch, fetch <codename>..., fetch --all. With more than one codename,
+# each runs in a new process of this script, as in import-bundle, and a
+# failure does not stop the others.
+cmd_fetch() {
+    local c ok failed cancel
+    if [ $# -eq 0 ]; then
+        fetch_firmware
+        return
+    fi
+    if [ "$1" = --all ]; then
+        [ $# -eq 1 ] || die "usage: fetch [<codename>... | --all]"
+        # shellcheck disable=SC2086 # single words
+        set -- $FETCH_CODENAMES
+    fi
+    for c; do
+        debian_mirror "$c" >/dev/null ||
+            die "fetch: cannot fetch '$c'. Supported: $FETCH_CODENAMES. Nothing was downloaded"
+    done
+    if [ $# -eq 1 ]; then
+        fetch_debian "$1"
+        return
+    fi
+    ok=''
+    failed=''
+    # Each codename runs in the foreground, so Ctrl-C reaches its APT
+    # commands too. A signal only sets cancel. The child cleans up before
+    # this loop stops. TERM to this parent alone waits for that child.
+    cancel=0
+    trap 'cancel=1' INT TERM HUP
+    for c; do
+        [ "$cancel" -eq 0 ] || exit 1
+        if "$SELF_DIR/$PROG" fetch "$c"; then ok="$ok $c"; else failed="$failed $c"; fi
+        [ "$cancel" -eq 0 ] || exit 1
+    done
+    trap - INT TERM HUP
+    [ -n "$failed" ] || { log "fetch: done. Bundles ready for:$ok"; return 0; }
+    die "fetch: failed for:$failed (above).${ok:+ Ready for:$ok.} Run fetch$failed again later"
+}
+
 import_one() {
     local b name
     mkdir -p "$BUNDLES"
-    tmp=$(mktemp -d "$BUNDLES/.import.XXXXXX")
+    tmp=$(mktemp -d "$BUNDLES/.import.$$.XXXXXX")
     trap 'rm -rf -- "${tmp:?}"' EXIT
+    trap 'exit 1' INT TERM HUP
     tar -xzf "$1" -C "$tmp" --no-same-owner || die "cannot extract $1"
     set -- "$tmp"/*/
     [ $# -eq 1 ] && [ -d "$1" ] || die "bundle archive must contain exactly one top-level directory"
@@ -853,6 +1012,7 @@ cmd_boot() {
     local i
     [ $# -eq 0 ] || die "usage: boot"
     setup_lock
+    clean_put_leftovers
     install_units
     link_command
     for i in $(instances); do
@@ -972,7 +1132,9 @@ check_bundles() {
         case "$d" in *.prev) continue ;; esac
         list="${list:+$list, }$d"
     done
-    if [ -d "$BUNDLES/$want" ]; then
+    if [ "$list" = "$want" ]; then
+        echo "INFO bundles: $list (this release: $want). Before a firmware update, run: $PROG fetch --all"
+    elif [ -d "$BUNDLES/$want" ]; then
         echo "INFO bundles: $list (this release: $want)"
     elif [ -n "$list" ]; then
         echo "WARN bundles: $list. None for this release ($want). Run fetch or import-bundle"
@@ -984,6 +1146,7 @@ check_bundles() {
 cmd_check() {
     local rc n i
     rc=0
+    [ $# -le 1 ] || die "usage: check [iface]"
     if [ $# -ge 1 ]; then
         need_iface "$1"
         check_one "$1" || rc=1
@@ -1274,8 +1437,21 @@ link_command() {
 # Finish a bundle swap of this release that a power loss cut short
 # (recover_bundle), under the bundle lock.
 install_recover() {
+    local d pid
     lock_take -x || die "a unit start, fetch, or import-bundle holds the bundle lock (waited ${LOCK_WAIT}s). Nothing changed"
     recover_bundle "$BUNDLES/$(codename)-$(arch)"
+    # Fetch and import stage files before they take the lock. Keep their
+    # directories while the owner lives, and remove abandoned ones.
+    for d in "$BUNDLES"/.fetch.* "$BUNDLES"/.import.*; do
+        [ -d "$d" ] || continue
+        pid=${d%.*}
+        pid=${pid##*.}
+        case "$pid" in
+            '' | *[!0-9]*) ;;
+            *) kill -0 "$pid" 2>/dev/null && continue ;;
+        esac
+        rm -rf -- "$d"
+    done
     lock_drop
 }
 
@@ -1288,18 +1464,40 @@ put() {
     mv -f "$3.new.$$" "$3"
 }
 
+# put() leaves "<file>.new.<pid>" if the process ends between the copy and
+# the rename. In on_boot.d such a file is executable, and the boot runner
+# can run it. Removes them. Call this only with the setup lock held, so
+# that no other install is between a copy and its rename.
+clean_put_leftovers() {
+    local f
+    for f in "$DATA/$PROG".new.* "$DATA/legacy.sh".new.* "$DATA/README.md".new.* \
+        "$DATA/keys/debian-"*.asc.new.* "$DATA/systemd/$INSTANCE_UNIT".new.* \
+        "$DATA/on_boot.d/$ONBOOT_NAME".new.* "$ONBOOT/$ONBOOT_NAME".new.* \
+        "$UNITS/$INSTANCE_UNIT".new.*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        case "${f##*.new.}" in '' | *[!0-9]*) continue ;; esac
+        rm -f -- "$f" && log "removed $f, left by an install that did not finish"
+    done
+}
+
 cmd_install() {
-    local self i act idle
+    local self i act idle f
     self=$(cd "$SELF_DIR" && pwd)
     # /data/unifi-common-addons is shared with other addons: make it 0755
     # if it is missing, and never change it. /data exists on a gateway, so
     # mkdir makes only the shared directory.
     [ $# -eq 0 ] || die "usage: install"
+    # Check every required source before any installed file changes.
+    for f in "$PROG" legacy.sh "systemd/$INSTANCE_UNIT" $KEYS_FILES "on_boot.d/$ONBOOT_NAME"; do
+        [ -f "$self/$f" ] && [ -r "$self/$f" ] ||
+            die "install: missing or unreadable $self/$f. Nothing changed. Download the full addon, then run install again"
+    done
     [ -d "${DATA%/*}" ] || { mkdir -p "${DATA%/*}" && chmod 0755 "${DATA%/*}"; }
     umask 077
     setup_lock
-    mkdir -p "$DATA" "$INST" "$BUNDLES" "$DATA/systemd"
-    chmod 0700 "$DATA" "$INST" "$BUNDLES" "$DATA/systemd"
+    mkdir -p "$DATA" "$INST" "$BUNDLES" "$DATA/systemd" "$DATA/keys"
+    chmod 0700 "$DATA" "$INST" "$BUNDLES" "$DATA/systemd" "$DATA/keys"
+    clean_put_leftovers
     install_recover
     # An activated interface restarts on the new code (at the next restart
     # or reboot). It needs a runtime that loads, from the bundle or .prev.
@@ -1312,10 +1510,14 @@ cmd_install() {
         put 0700 "$self/$PROG" "$DATA/$PROG"
         put 0600 "$self/legacy.sh" "$DATA/legacy.sh"
         put 0600 "$self/systemd/$INSTANCE_UNIT" "$DATA/systemd/$INSTANCE_UNIT"
+        for f in $KEYS_FILES; do
+            put 0600 "$self/$f" "$DATA/$f"
+        done
         mkdir -p "$DATA/on_boot.d"
         put 0700 "$self/on_boot.d/$ONBOOT_NAME" "$DATA/on_boot.d/$ONBOOT_NAME"
         [ ! -f "$self/README.md" ] || put 0600 "$self/README.md" "$DATA/README.md"
     fi
+    rm -f -- "$DATA/keys/debian-archive.asc"
     mkdir -p "$ONBOOT"
     put 0755 "$DATA/on_boot.d/$ONBOOT_NAME" "$ONBOOT/$ONBOOT_NAME"
     link_command
@@ -1369,6 +1571,478 @@ cmd_uninstall() {
     log "uninstall: units and boot entry removed. $DATA kept"
 }
 
+# ---------- setup (v0.3) ----------
+
+# Guided setup. It talks to the user on stdout and reads the answers on
+# stdin. It runs each step as a new process of the installed script, so
+# that each step keeps its own checks, EXIT trap, and rollback. User
+# guide: README.md, "Set up". Each message says what happened, what it
+# means for the WAN, and the next step.
+
+SETUP_STEPS=6
+CERTS_HOME="$R/data/att-certs"
+# st_phase: where setup is, for the message after an interruption or the
+# end of input. safe: nothing on the WAN changed. cable: the user may
+# have moved the cable. connect: activate runs or ran.
+st_phase=safe
+
+st_step() { printf '\nStep %s of %s: %s\n' "$1" "$SETUP_STEPS" "$2"; }
+st_say() {
+    local l
+    for l; do
+        if [ -n "$l" ]; then printf '  %s\n' "$l"; else printf '\n'; fi
+    done
+}
+# Stop setup. Each argument is one line. Exit status 1.
+st_stop() {
+    printf '\n'
+    st_say "$@"
+    exit 1
+}
+# The lines that tell the user where the WAN is, for each phase.
+st_where() {
+    case "$st_phase" in
+        safe) st_say "Nothing changed on the WAN." ;;
+        cable) st_say "The addon changed nothing. If you moved the cable, put it back" \
+            "on the RG to get internet access again ('Go back to the RG' in the README)." ;;
+        connect) st_say "The addon was connecting to AT&T. The lines above show what it did." \
+            "Run: $PROG check" \
+            "If internet access is down, follow 'Go back to the RG' in the README." ;;
+    esac
+}
+st_eof() {
+    printf '\n'
+    st_say "Setup stopped: no answer (end of input)."
+    st_where
+    st_say "Run setup again in a terminal: $PROG setup"
+    exit 1
+}
+# INT, TERM, HUP. dash runs a trap after the foreground command ends, so
+# a running step (and its own rollback) finishes first. Ctrl-C reaches
+# the step too: activate then rolls back. Its output went to a file, so
+# no closed pipe can stop the rollback. Show that output now.
+st_interrupted() {
+    trap - INT TERM HUP
+    printf '\n'
+    [ "$st_phase" != connect ] || [ ! -s "$st_tmp/out" ] || st_mask <"$st_tmp/out"
+    st_say "" "Setup stopped: interrupted."
+    st_where
+    st_say "Run setup again when you are ready: $PROG setup"
+    exit 1
+}
+# Ask a question. Sets st_ans. Stops setup at the end of input.
+st_read() {
+    printf '  %s ' "$1"
+    IFS= read -r st_ans || st_eof
+}
+# Yes or no. $2 is the default for an empty answer (y or n).
+st_yes() {
+    local hint
+    if [ "$2" = y ]; then hint='[Y/n]'; else hint='[y/N]'; fi
+    while :; do
+        st_read "$1 $hint"
+        case "$st_ans" in
+            '') [ "$2" = y ]; return ;;
+            y | Y | yes | Yes | YES) return 0 ;;
+            n | N | no | No | NO) return 1 ;;
+        esac
+        st_say "Type y for yes or n for no."
+    done
+}
+# Hide certificate folder serials, addresses, and MAC addresses. IPv4
+# goes before IPv6, so an IPv4-mapped address leaves no digits behind.
+# 1.1.1.1 stays: the messages name it as the test address. IPv6 goes
+# before MAC. Four groups count as IPv6, but a time (12:34:56) does not.
+# "_" counts as a separator (GNU sed's \b treats it as a letter).
+# A four-part version or a 12-digit hex number is hidden too: safe, not
+# exact. The input is the output of a step, or names that the user chose.
+st_mask_text() {
+    sed -E 's/(EAP-TLS_8021x_[0-9A-Fa-f]{6}-)[0-9A-Za-z]+/\1<serial>/g
+        s/_/\x01/g
+        s/\[IP: [^]]*\]/[IP: hidden]/g
+        s/\b1\.1\.1\.1\b/@ONE@/g
+        s/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/<address>/g
+        s/(^|[^0-9A-Za-z:])::([0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*)?(%[A-Za-z0-9.-]+)?/\1<address>/g
+        s/\b[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{0,4})*::([0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*)?(%[A-Za-z0-9.-]+)?/<address>/g
+        s/\b([0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}\b(%[A-Za-z0-9.-]+)?/<address>/g
+        s/\b([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b/<MAC>/g
+        s/\b[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\b/<MAC>/g
+        s/\b[0-9A-Fa-f]{12}\b/<MAC>/g
+        s/@ONE@/1.1.1.1/g
+        s/\x01/_/g'
+}
+# The output of a step, as setup shows it: masked, without the program
+# name, indented, and with no space at the end of a line.
+st_mask() {
+    sed "s/^$PROG: //" | st_mask_text | sed 's/^/    /; s/ *$//'
+}
+# Run a step: the installed script with these arguments. Its output goes
+# to a file, not to a pipe: a pipe reader that Ctrl-C ends could stop the
+# step (for example the rollback of activate) with SIGPIPE. Then setup
+# shows the output, indented, with addresses hidden. Sets st_out and
+# st_rc (the exit status of the step itself). A step reads nothing from
+# stdin: the answers of the user are for setup only.
+st_run() {
+    st_run_quiet "$@"
+    [ "$st_rc" -ne 0 ] || [ -z "$st_out" ] || printf '%s\n' "$st_out" | st_mask
+}
+# The same, but shows the output only if the step fails.
+st_run_quiet() {
+    logger -t "$PROG" -- "setup: run $*" 2>/dev/null || true
+    st_rc=0
+    # "true", not ":": in dash a failed redirection of the special
+    # builtin ":" ends the shell.
+    if ! true >"$st_tmp/out" 2>/dev/null; then
+        st_stop "Setup stopped: cannot write in $st_tmp. Check the free space: df -h /tmp" \
+            "Setup changed nothing on the WAN in this step. Then run setup again."
+    fi
+    "$st_bin" "$@" </dev/null >"$st_tmp/out" 2>&1 || st_rc=$?
+    st_out=$(cat "$st_tmp/out" 2>/dev/null) || st_out=
+    [ "$st_rc" -eq 0 ] || [ -z "$st_out" ] || printf '%s\n' "$st_out" | st_mask
+}
+
+# True if the addon is installed and deployed: the installed copy has the
+# files of this copy, and the boot entry, the unit, and the command link
+# are in place.
+st_installed() {
+    local f
+    [ -x "$DATA/$PROG" ] || return 1
+    if [ "$(cd "$SELF_DIR" && pwd)" != "$DATA" ]; then
+        for f in "$PROG" legacy.sh $KEYS_FILES "systemd/$INSTANCE_UNIT" "on_boot.d/$ONBOOT_NAME"; do
+            cmp -s "$SELF_DIR/$f" "$DATA/$f" || return 1
+        done
+    fi
+    cmp -s "$DATA/on_boot.d/$ONBOOT_NAME" "$ONBOOT/$ONBOOT_NAME" &&
+        cmp -s "$DATA/systemd/$INSTANCE_UNIT" "$UNITS/$INSTANCE_UNIT" &&
+        [ "$(readlink "$R/usr/local/sbin/$PROG" 2>/dev/null)" = "$PROD_DATA/$PROG" ]
+}
+
+# The interface of the IPv4 route to the internet, if it is a valid name
+# that exists. Prints nothing else. Never prints an address.
+st_route_iface() {
+    local d
+    command -v ip >/dev/null 2>&1 || return 0
+    d=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
+    if valid_iface "$d" && [ -e "$SYSNET/$d" ]; then printf '%s' "$d"; fi
+}
+
+# The Ethernet ports, by name: eth followed by digits.
+st_ports() {
+    local d n list
+    list=''
+    for d in "$SYSNET"/eth*; do
+        n=${d##*/}
+        case "$n" in eth | *[!a-z0-9]* | eth*[!0-9]*) continue ;; esac
+        [ -e "$d" ] && list="$list $n"
+    done
+    printf '%s' "${list# }"
+}
+
+# Ask for the WAN port by name. Sets st_iface. Never repeats the answer:
+# a user can type an address or the identity by mistake.
+st_ask_iface() {
+    local n
+    st_say "Type the name of the WAN port: the gateway port that the AT&T cable" \
+        "goes into. The README lists the usual names, in 'WAN port names'."
+    [ -z "$(st_ports)" ] || st_say "Ports on this gateway: $(st_ports)"
+    n=0
+    while [ "$n" -lt 3 ]; do
+        n=$((n + 1))
+        st_read "WAN port name (for example eth8):"
+        if valid_iface "$st_ans" && [ -e "$SYSNET/$st_ans" ]; then
+            st_iface=$st_ans
+            return 0
+        fi
+        st_say "This gateway has no port with that name."
+    done
+    st_stop "Setup stopped: no valid port name." \
+        "Nothing changed. The README lists the usual names, in 'WAN port names'." \
+        "Then run: $PROG setup <port-name>"
+}
+
+# Folders under CERTS_HOME (depth 0 and 1) that hold a wpa_supplicant.conf,
+# one per line.
+st_cert_dirs() {
+    local d
+    for d in "$CERTS_HOME" "$CERTS_HOME"/*; do
+        if [ -d "$d" ] && [ -f "$d/wpa_supplicant.conf" ]; then printf '%s\n' "$d"; fi
+    done
+}
+
+# Choose the certificate folder. Sets st_certs.
+st_find_certs() {
+    local dirs n k
+    dirs=$(st_cert_dirs)
+    if [ -z "$dirs" ]; then
+        if [ ! -d "$CERTS_HOME" ] && ! install -d -m 700 "$CERTS_HOME"; then
+            st_stop "Setup stopped: cannot make the folder /data/att-certs." \
+                "Nothing changed on the WAN. Check the free space: df -h /data" \
+                "Then run setup again."
+        fi
+        st_say "Copy your certificate folder to the gateway. The folder must hold the" \
+            "files CA_*.pem, Client_*.pem, PrivateKey*.pem, and wpa_supplicant.conf." \
+            "On your computer, open a second terminal and run:" \
+            "" \
+            "    scp -r <your-certificate-folder> root@<gateway-ip>:/data/att-certs/" \
+            "" \
+            "If scp shows an error about sftp, add -O after scp and try again."
+        st_read "Press Enter when the copy is done."
+        dirs=$(st_cert_dirs)
+        [ -n "$dirs" ] || st_stop "Setup stopped: no certificate folder in /data/att-certs." \
+            "Setup looks for a folder that holds wpa_supplicant.conf." \
+            "Nothing changed on the WAN. Copy the folder, then run setup again."
+    fi
+    n=$(printf '%s\n' "$dirs" | wc -l | tr -d ' ')
+    if [ "$n" -eq 1 ]; then
+        st_certs=$dirs
+        st_say "Found one certificate folder in /data/att-certs."
+        return 0
+    fi
+    # The user must choose, so this list shows the folder names, with
+    # addresses hidden.
+    st_say "Found more than one certificate folder in /data/att-certs:"
+    printf '%s\n' "$dirs" | sed "s#^$CERTS_HOME/*##; s#^\$#(the folder itself)#" | st_mask_text |
+        awk '{ printf "    %d. %s\n", NR, $0 }'
+    while :; do
+        st_read "Type the number of the folder to use:"
+        case "$st_ans" in '' | *[!0-9]*) k=0 ;; *) k=$st_ans ;; esac
+        if [ "$k" -ge 1 ] && [ "$k" -le "$n" ]; then
+            st_certs=$(printf '%s\n' "$dirs" | sed -n "${k}p")
+            return 0
+        fi
+        st_say "Type a number from 1 to $n."
+    done
+}
+
+# Tell the user to move the ONT cable, and wait for "yes".
+st_move_cable() {
+    st_phase=cable
+    st_say "Now move the cable. Internet access stops until AT&T accepts the gateway." \
+        "  1. Disconnect the cable between the RG and the WAN port ($1) of the gateway." \
+        "  2. At the RG, disconnect the cable that comes from the ONT (the AT&T fiber box)." \
+        "  3. Connect that ONT cable to the WAN port ($1) of the gateway."
+    st_read "Type yes when the ONT cable is in the WAN port:"
+    [ "$st_ans" = yes ] || st_stop "Setup stopped before it started the supplicant. Nothing changed on the WAN." \
+        "If you moved the cable, put it back on the RG to get internet access again." \
+        "Run setup again when you are ready."
+}
+
+# After a failed activate: say what happened, from its output. $2 is 1
+# for a takeover.
+st_activate_failed() {
+    local i
+    i=$1
+    st_has() { printf '%s\n' "$st_out" | grep -q -- "$1"; }
+    # Only rollback lines. "did not stop" alone can come from a takeover
+    # whose rollback then finished.
+    if st_has 'ROLLBACK INCOMPLETE' || st_has 'Legacy NOT restored'; then
+        st_stop "Setup stopped: the addon could not undo all of its changes (see the lines above)." \
+            "Run: $PROG deactivate $i --restore-legacy" \
+            "Then check internet access: ping -c 3 1.1.1.1" \
+            "If that fails, follow 'Go back to the RG' in the README."
+    fi
+    if st_has 'Nothing changed'; then
+        st_stop "Setup stopped: activate did not start (see the lines above). It changed nothing." \
+            "If you moved the cable, put it back on the RG to get internet access again." \
+            "Fix the problem that the lines above name. Then run setup again."
+    fi
+    if [ "$2" -eq 1 ] && st_has 'legacy start was requested'; then
+        st_stop "AT&T did not accept the addon, or the addon could not start (see the lines above)." \
+            "The addon stopped and asked your old setup to start again." \
+            "Check internet access: ping -c 3 1.1.1.1" \
+            "If that fails, follow 'Go back to the RG' in the README." \
+            "To see why: journalctl -u $(unit_of "$i") -b"
+    fi
+    if ! st_has 'not authorized within'; then
+        st_stop "Setup stopped: the addon could not start the supplicant (see the lines above)." \
+            "The lines above show what the addon undid. Run: $PROG check" \
+            "To get internet access back, follow 'Go back to the RG' in the README." \
+            "Fix the problem that the lines above name. Then run setup again."
+    fi
+    st_stop "AT&T did not accept the gateway in time. The addon stopped the" \
+        "supplicant, so $i probably has no internet access now." \
+        "" \
+        "To get internet access back now:" \
+        "  1. Connect the ONT cable to the ONT port of the RG again." \
+        "  2. Connect a LAN port of the RG to the WAN port ($i) of the gateway." \
+        "" \
+        "Then look at these causes:" \
+        "  - Is the ONT cable in $i? Setup used $i." \
+        "    To use another port, run: $PROG setup <port-name>" \
+        "    After an authorization timeout, the instance on $i stays inactive." \
+        "    It starts nothing, even after a reboot." \
+        "  - Some gateways must use the MAC address of the RG on the WAN. In UniFi" \
+        "    Network, set the WAN MAC address to the value of the identity= line" \
+        "    in your wpa_supplicant.conf." \
+        "  - Some gateways need VLAN ID 0 on the WAN, also in UniFi Network." \
+        "  - Wrong certificates? Remove the imported copy, then setup imports again:" \
+        "    rm -r $PROD_DATA/instances/$i/certs $PROD_DATA/instances/$i/wpa_supplicant.conf" \
+        "  - The log of the attempt: journalctl -u $(unit_of "$i") -b" \
+        "" \
+        "Then run setup again."
+}
+
+cmd_setup() {
+    local i c a others next takeover wait_text
+    [ $# -le 1 ] || die "usage: setup [iface]"
+    st_tmp=$(mktemp -d) || die "setup: cannot make a temp directory"
+    trap 'rm -rf -- "${st_tmp:?}"' EXIT
+    trap 'st_interrupted' INT TERM HUP
+    printf 'AT&T fiber bypass: guided setup\n\n'
+    st_say "This sets up the addon in $SETUP_STEPS steps. It asks before it changes the WAN." \
+        "If the gateway gets internet access through the AT&T box (the RG)," \
+        "keep the RG connected until step 6 tells you to move the cable."
+
+    # An activated interface: change nothing.
+    for i in $(instances); do
+        is_active_flag "$i" || continue
+        st_say "" "The addon already runs on $i. Setup changes nothing." \
+            "Here is the state of the connection:"
+        st_bin="$DATA/$PROG"
+        [ -x "$st_bin" ] || st_bin="$SELF_DIR/$PROG"
+        st_run check
+        [ "$st_rc" -eq 0 ] || st_stop "The check found a problem (FAIL lines above)." \
+            "See 'Troubleshooting' in the README."
+        return 0
+    done
+
+    st_step 1 "Install the addon"
+    if st_installed; then
+        st_say "The addon is already installed. Nothing to do."
+    else
+        st_bin="$SELF_DIR/$PROG"
+        st_run_quiet install
+        [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the install did not finish (see the lines above)." \
+            "Nothing runs yet, and the WAN did not change." \
+            "Fix the problem that the lines above name. Then run setup again."
+        st_say "Installed. Nothing runs yet. The command $PROG now works in any directory."
+    fi
+    st_bin="$DATA/$PROG"
+
+    st_step 2 "Find the WAN port"
+    st_iface=''
+    if [ $# -eq 1 ]; then
+        if ! valid_iface "$1" || [ ! -e "$SYSNET/$1" ]; then
+            st_stop "Setup stopped: this gateway has no port with the name that you gave." \
+                "Nothing changed. Run setup again with the right name, or with no name."
+        fi
+        st_iface=$1
+        st_say "Using $st_iface, as you asked."
+    elif [ "$(instances | wc -l | tr -d ' ')" -eq 1 ]; then
+        st_iface=$(instances)
+        st_say "Using $st_iface, from an earlier run of setup or add-instance."
+    else
+        i=$(st_route_iface)
+        if [ -n "$i" ]; then
+            st_say "The gateway reaches the internet through the port $i."
+            if st_yes "Is $i the WAN port (the port for the AT&T connection)?" y; then
+                st_iface=$i
+            fi
+        else
+            st_say "The gateway has no internet route now, so setup cannot suggest a port."
+        fi
+        [ -n "$st_iface" ] || st_ask_iface
+    fi
+    i=$st_iface
+
+    st_step 3 "Import the certificates"
+    if [ -e "$(inst_dir "$i")/wpa_supplicant.conf" ]; then
+        st_say "The certificates for $i are already imported. Nothing to do." \
+            "To import other ones, remove the imported copy, then run setup again:" \
+            "  rm -r $PROD_DATA/instances/$i/certs $PROD_DATA/instances/$i/wpa_supplicant.conf"
+    else
+        st_find_certs
+        st_run add-instance "$i" "$st_certs"
+        [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the certificates were not imported (see the lines above)." \
+            "Nothing changed on the WAN." \
+            "Check the four files that the README lists in 'What you need'. Then run setup again."
+    fi
+
+    st_step 4 "Download the supplicant"
+    c=$(codename)
+    a=$(arch)
+    if [ -d "$BUNDLES/$c-$a/root" ]; then
+        st_say "A bundle for this Debian release ($c) is already here. Nothing to download."
+    else
+        st_say "Downloading the supplicant for this Debian release ($c)."
+        if debian_mirror "$c" >/dev/null; then st_run fetch "$c"; else st_run fetch; fi
+        [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the download failed (see the lines above)." \
+            "Nothing changed on the WAN. This step needs internet access." \
+            "Check that the RG is connected and that this works: ping -c 3 1.1.1.1" \
+            "Then run setup again."
+    fi
+    others=''
+    for c in $FETCH_CODENAMES; do
+        [ -d "$BUNDLES/$c-$a" ] || others="$others $c"
+    done
+    if [ -n "$others" ]; then
+        st_say "A later firmware update can move the gateway to a newer Debian release." \
+            "The supplicant then needs a bundle for that release."
+        if st_yes "Download the bundles for$others now (about 2 MB each)?" y; then
+            # shellcheck disable=SC2086 # codenames are single words
+            st_run fetch $others
+            [ "$st_rc" -eq 0 ] || st_say "Some bundles were not downloaded (see above). Setup continues." \
+                "Before a firmware update, run: $PROG fetch --all"
+        else
+            st_say "Skipped. Before a firmware update, run: $PROG fetch --all"
+        fi
+    fi
+
+    st_step 5 "Check the setup"
+    st_run_quiet validate "$i"
+    [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the check found a problem (see the lines above)." \
+        "Nothing changed on the WAN. Fix the problem, then run setup again."
+    st_run plan "$i"
+    [ "$st_rc" -eq 0 ] || st_stop "Setup stopped: the addon cannot start on $i yet (see the 'blocked' lines above)." \
+        "Nothing changed on the WAN. Fix what those lines name. Then run setup again."
+    next=$(printf '%s\n' "$st_out" | sed -n 's/^  next: //p')
+    case "$next" in
+        *" activate $i --takeover") takeover=1 ;;
+        *" activate $i") takeover=0 ;;
+        *) st_stop "Setup stopped: plan did not say what to do next." \
+            "Nothing changed on the WAN. Please report this, with the lines above." ;;
+    esac
+
+    if [ "$TAKEOVER_TIMEOUT" = 120 ]; then
+        wait_text="This can take up to two minutes."
+    else
+        wait_text="This can take up to $TAKEOVER_TIMEOUT seconds."
+    fi
+    st_step 6 "Connect to AT&T"
+    if [ "$takeover" -eq 1 ]; then
+        # plan also names an old setup that does not run now, for example
+        # a boot script that is left, while the RG still gives internet
+        # access. So ask where the cable is.
+        st_say "Step 5 found another bypass setup for $i (listed above). The addon will" \
+            "stop it and take its place. If AT&T does not accept the addon, the" \
+            "addon tries to start the old setup again."
+        if st_yes "Is the ONT cable already in the WAN port ($i)?" n; then
+            :
+        else
+            st_move_cable "$i"
+        fi
+        st_read "Type yes to replace the old setup now:"
+        [ "$st_ans" = yes ] || st_stop "Setup stopped before it changed the old setup." \
+            "If you moved the cable, put it back on the RG to get internet access again." \
+            "Run setup again when you are ready."
+        st_phase=connect
+        st_say "Waiting for AT&T to accept the addon. $wait_text"
+        st_run activate "$i" --takeover
+    else
+        st_move_cable "$i"
+        st_phase=connect
+        st_say "Waiting for AT&T to accept the gateway. $wait_text"
+        st_run activate "$i"
+    fi
+    [ "$st_rc" -eq 0 ] || st_activate_failed "$i" "$takeover"
+    printf '\nDone. The gateway now connects to AT&T directly on %s.\n' "$i"
+    st_say "- To check the connection later, run: $PROG check" \
+        "- Keep a copy of your certificate folder on your computer."
+    [ ! -d "$CERTS_HOME" ] || st_say "- The addon keeps its own copy. You can remove the one that you sent:" \
+        "  rm -r /data/att-certs"
+    st_say "- Before a firmware update, read 'Before a firmware update' in the README."
+}
+
 # ---------- main ----------
 
 # The directory of the real script. $0 can be the /usr/local/sbin link.
@@ -1377,6 +2051,7 @@ SELF_DIR=$(dirname "$(readlink -f "$0")")
 cmd=${1:-help}
 [ $# -eq 0 ] || shift
 case "$cmd" in
+    setup) cmd_setup "$@" ;;
     install) cmd_install "$@" ;;
     add-instance) cmd_add_instance "$@" ;;
     validate) cmd_validate "$@" ;;

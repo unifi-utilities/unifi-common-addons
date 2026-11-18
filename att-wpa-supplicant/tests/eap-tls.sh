@@ -7,7 +7,7 @@
 # machine's architecture, starts systemd in a debian:<codename> container
 # with the libraries that UniFi OS supplies (but no wpasupplicant package),
 # runs hostapd as the authenticator on one end of a veth pair, and uses the
-# addon (install, add-instance, import-bundle, activate) on the other end.
+# addon (import-bundle, then the guided setup) on the other end.
 #
 # Usage: tests/eap-tls.sh [codename...]   (default: bullseye bookworm trixie)
 # Exit status 0 only if every assertion passed for every codename.
@@ -96,12 +96,13 @@ stop_hostapd() { kill "$(cat /t/hostapd.pid)" 2>/dev/null; sleep 1; }
 hostapd_conf /t/ca.pem
 start_hostapd
 
-# The addon, as a user installs it.
+# The addon, as a user sets it up: the guided setup, with answers on
+# stdin. The bundle is imported first, so that setup uses the bundle that
+# this test qualifies and downloads nothing.
 mkdir -p /data/on_boot.d
-cd /addon && ./att-wpa-supplicant install >/dev/null 2>&1 || bad "install"
-cd /
-"$A" add-instance veth1 /src >/dev/null 2>&1 && ok "add-instance" || bad "add-instance"
-"$A" import-bundle /bundle.tgz >/dev/null 2>&1 && ok "import-bundle" || bad "import-bundle"
+# Without the bundle, setup would download one: stop here instead.
+cd /addon && ./att-wpa-supplicant import-bundle /bundle.tgz >/dev/null 2>&1 && ok "import-bundle" ||
+    { bad "import-bundle"; echo "RESULT $PASS passed, $FAIL failed"; exit 1; }
 dpkg-query -W wpasupplicant >/dev/null 2>&1 && bad "no wpasupplicant package installed" || ok "no wpasupplicant package installed"
 B=$(ls -d "$BUNDLES"/*-*[!v])
 [ -x "$(find "$B/root" -name wpa_supplicant -type f | head -n 1)" ] && ok "import-bundle: unpacks the runtime in the bundle" || bad "import-bundle: unpacks the runtime in the bundle"
@@ -109,13 +110,46 @@ B=$(ls -d "$BUNDLES"/*-*[!v])
 # drop-in changes nothing else.
 mkdir -p /etc/systemd/system/$U.d
 printf '[Service]\nRestartSec=2\n' >/etc/systemd/system/$U.d/test.conf
+mkdir -p /data/att-certs && cp /src/* /data/att-certs/
 
-out=$("$A" plan veth1 2>&1); rc=$?
-[ "$rc" -eq 0 ] && ok "plan: passes" || bad "plan: passes" "$out"
-echo "$out" | grep -q 'loads on this firmware' && ok "plan: the runtime passes the load check" || bad "plan: the runtime passes the load check" "$out"
+# First run: the server does not trust the client, as when AT&T rejects
+# the gateway. Answers: not the suggested port (or, with no route, an
+# invalid name), veth1, no other bundles, yes (the cable moved).
+# Each setup run has a deadline, so that a stalled step cannot hang the
+# test.
+stop_hostapd; hostapd_conf /t/other.pem; start_hostapd
+t=$(date +%s)
+out=$(printf 'n\nveth1\nn\nyes\n' | ATT_WPA_TAKEOVER_TIMEOUT=20 timeout 300 ./att-wpa-supplicant setup 2>&1); rc=$?
+cd /
+[ "$rc" -eq 1 ] && ok "setup, rejected: exit 1" || bad "setup, rejected: exit 1" "rc=$rc $(echo "$out" | tail -n 5)"
+echo "$out" | grep -q 'Installed. Nothing runs yet' && ok "setup, rejected: installs" || bad "setup, rejected: installs" "$out"
+echo "$out" | grep -q 'loads on this firmware' && ok "setup, rejected: the runtime passes the load check" || bad "setup, rejected: the runtime passes the load check" "$out"
+# The supplicant ran and the server rejected it: the rollback stopped a
+# running supplicant.
+journalctl -u "$U" --since "@$t" --no-pager 2>/dev/null | grep -q 'CTRL-EVENT-EAP-FAILURE' &&
+    ok "setup, rejected: the server rejected the client (EAP-FAILURE)" || bad "setup, rejected: the server rejected the client (EAP-FAILURE)"
+echo "$out" | grep -q 'AT&T did not accept the gateway in time' && ok "setup, rejected: says AT&T did not accept" || bad "setup, rejected: says AT&T did not accept" "$(echo "$out" | tail -n 20)"
+echo "$out" | grep -q 'Connect the ONT cable to the ONT port of the RG again' && ok "setup, rejected: says how to go back to the RG" || bad "setup, rejected: says how to go back to the RG"
+[ "$(systemctl is-active "$U")" != active ] && ok "setup, rejected: the unit is stopped" || bad "setup, rejected: the unit is stopped"
+pgrep -x wpa_supplicant >/dev/null && bad "setup, rejected: no supplicant runs" "$(pgrep -a wpa_supplicant)" || ok "setup, rejected: no supplicant runs"
+[ ! -e /data/unifi-common-addons/att-wpa-supplicant/instances/veth1/active ] && ok "setup, rejected: not marked active" || bad "setup, rejected: not marked active"
 
-out=$(ATT_WPA_TAKEOVER_TIMEOUT=60 "$A" activate veth1 2>&1); rc=$?
-[ "$rc" -eq 0 ] && ok "activate: authorized through the real unit" || bad "activate: authorized through the real unit" "$(echo "$out" | tail -n 5)"
+# Second run, after the fix: setup skips the finished steps and connects.
+# Answers: no other bundles, yes (the cable is in).
+stop_hostapd; hostapd_conf /t/ca.pem; start_hostapd
+out=$(printf 'n\nyes\n' | ATT_WPA_TAKEOVER_TIMEOUT=60 timeout 300 "$A" setup 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "setup: authorized through the real unit" || bad "setup: authorized through the real unit" "rc=$rc $(echo "$out" | tail -n 20)"
+for l in 'The addon is already installed' 'Using veth1, from an earlier run' 'certificates for veth1 are already imported' 'is already here. Nothing to download' 'Done. The gateway now connects to AT&T directly on veth1.'; do
+    echo "$out" | grep -qF "$l" && ok "setup, again: $l" || bad "setup, again: $l" "$out"
+done
+
+# Third run: the addon runs, so setup changes nothing.
+pid=$(mainpid)
+before=$(data_sig)
+out=$(timeout 120 "$A" setup </dev/null 2>&1); rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q 'already runs on veth1. Setup changes nothing' && ok "setup, once more: changes nothing" || bad "setup, once more: changes nothing" "rc=$rc $out"
+[ "$(mainpid)" = "$pid" ] && ok "setup, once more: the supplicant runs on" || bad "setup, once more: the supplicant runs on"
+[ "$(data_sig)" = "$before" ] && ok "setup, once more: wrote nothing on /data" || bad "setup, once more: wrote nothing on /data"
 out=$("$A" check veth1 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "check: exit 0" || bad "check: exit 0" "$out"
 echo "$out" | grep -q 'OK veth1: 802.1X authorized' && ok "check: authorized" || bad "check: authorized" "$out"
