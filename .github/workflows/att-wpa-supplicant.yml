@@ -16,8 +16,11 @@ on:
 permissions: {}
 
 concurrency:
-  group: att-wpa-supplicant-${{ github.ref }}
-  cancel-in-progress: true
+  # A new run of a PR cancels the older one. A run on main, or a manual
+  # run, has a group of its own, so no later run cancels it, running or
+  # pending.
+  group: att-wpa-supplicant-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
