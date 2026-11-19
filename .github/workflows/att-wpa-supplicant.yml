@@ -1,0 +1,58 @@
+name: att-wpa-supplicant
+
+on:
+  pull_request:
+    paths:
+      - att-wpa-supplicant/**
+      - .github/workflows/att-wpa-supplicant.yml
+  push:
+    branches:
+      - main
+    paths:
+      - att-wpa-supplicant/**
+      - .github/workflows/att-wpa-supplicant.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: att-wpa-supplicant-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests/run.sh
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Off-box suite
+        working-directory: att-wpa-supplicant
+        run: sh tests/run.sh
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      # shellcheck v0.10.0
+      SHELLCHECK_IMAGE: koalaman/shellcheck@sha256:2097951f02e735b613f4a34de20c40f937a6c8f18ecb170612c88c34517221fb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck -S warning
+        working-directory: att-wpa-supplicant
+        run: |
+          # tests/eap-tls.sh writes its container-side script from a
+          # heredoc, which shellcheck does not see. Check it as a file.
+          # tests/fixtures/ holds copies of legacy setups, not addon code.
+          sed -n "/<<'INNER'\$/,/^INNER\$/p" tests/eap-tls.sh | sed '1d;$d' >"$RUNNER_TEMP/eap-tls-inner.sh"
+          test -s "$RUNNER_TEMP/eap-tls-inner.sh"
+          docker run --rm -v "$PWD:/mnt:ro" -v "$RUNNER_TEMP:/inner:ro" "$SHELLCHECK_IMAGE" -S warning \
+            att-wpa-supplicant legacy.sh on_boot.d/*.sh tests/*.sh tools/*.sh \
+            /inner/eap-tls-inner.sh
