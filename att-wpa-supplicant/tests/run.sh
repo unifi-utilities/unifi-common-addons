@@ -2036,6 +2036,12 @@ t_setup_mask() {
     expect_eq "$(mask_text 'nvg599_RGserial9 and 5268AC_RGserial9')" \
         'nvg599_<serial> and 5268AC_<serial>' "setup mask: hides the serial after other gateway models"
     expect_eq "$(mask_text 'BGW210-700_notes')" 'BGW210-700_notes' "setup mask: keeps a model name followed by a word with no digit"
+    expect_eq "$(mask_text 'BGW320_RG1234 BGW320_RG5678')" \
+        'BGW320_<serial> BGW320_<serial>' "setup mask: hides serials in adjacent model folder names"
+    expect_eq "$(mask_text 'NVG599_X1,NVG599_X2')" 'NVG599_<serial>,NVG599_<serial>' "setup mask: hides serials in model names split by a comma"
+    expect_eq "$(mask_text 'BGW210-700_1/BGW210-700_2/BGW210-700_3')" \
+        'BGW210-700_<serial>/BGW210-700_<serial>/BGW210-700_<serial>' "setup mask: hides serials in three adjacent model names"
+    expect_eq "$(mask_text '001E46-X1 001E46-X2')" '001E46-<serial> 001E46-<serial>' "setup mask: hides serials in adjacent OUI names"
 }
 
 t_setup_keys() {

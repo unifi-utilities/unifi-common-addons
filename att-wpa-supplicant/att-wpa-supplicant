@@ -1659,7 +1659,10 @@ st_yes() {
 # - "<6 hex digits>-" (the OUI of the AT&T box), at the start of a line
 #   or after a character that is not a letter or digit
 # - "<model>_", for a gateway model such as BGW210-700, NVG599, or
-#   5268AC. Not if "-" follows the run: that run is an OUI.
+#   5268AC. Not if "-" follows the run: that run is an OUI. This rule
+#   uses up the character after the run (sed -E has no lookahead), so
+#   the next name cannot start there. It runs twice: the second pass
+#   hides every second name in a list such as "BGW320_RG1 BGW320_RG2".
 # A name that the user chose can match by chance (decade-2026): safe,
 # not exact. MAC addresses go last.
 # "_" counts as a separator (GNU sed's \b treats it as a letter).
@@ -1674,6 +1677,7 @@ st_mask_text() {
         s/\b[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{0,4})*::([0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{1,4})*)?(%[A-Za-z0-9.-]+)?/<address>/g
         s/\b([0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}\b(%[A-Za-z0-9.-]+)?/<address>/g
         s/(^|[^0-9A-Za-z])([0-9A-Fa-f]{6}-)[0-9A-Za-z]*[0-9][0-9A-Za-z]*/\1\2<serial>/g
+        s/(^|[^0-9A-Za-z])(([Bb][Gg][Ww]|[Nn][Vv][Gg])[0-9]{3}(-[0-9]{3})?|5268[Aa][Cc])\x01[0-9A-Za-z]*[0-9][0-9A-Za-z]*([^0-9A-Za-z-]|$)/\1\2\x01<serial>\5/g
         s/(^|[^0-9A-Za-z])(([Bb][Gg][Ww]|[Nn][Vv][Gg])[0-9]{3}(-[0-9]{3})?|5268[Aa][Cc])\x01[0-9A-Za-z]*[0-9][0-9A-Za-z]*([^0-9A-Za-z-]|$)/\1\2\x01<serial>\5/g
         s/\b([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b/<MAC>/g
         s/\b[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\b/<MAC>/g
