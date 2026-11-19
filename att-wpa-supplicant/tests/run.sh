@@ -2017,6 +2017,25 @@ t_setup_mask() {
     done
     expect_eq "$(mask_text '"EAP-TLS_8021x_001E46-RGserial9".')" \
         '"EAP-TLS_8021x_001E46-<serial>".' "setup mask: keeps quotes and a period around a certificate folder name"
+    expect_eq "$(mask_text '/data/att-certs/eap-tls_8021x_001e46-123456789012345/')" \
+        '/data/att-certs/eap-tls_8021x_001e46-<serial>/' "setup mask: hides the serial in a lowercase folder name"
+    expect_eq "$(mask_text '/data/att-certs/BGW320_001E46-RGserial9 (2)')" \
+        '/data/att-certs/BGW320_001E46-<serial> (2)' "setup mask: hides the serial after another folder prefix"
+    expect_eq "$(mask_text '/data/att-certs/001E46-123456789012345/x')" \
+        '/data/att-certs/001E46-<serial>/x' "setup mask: hides the serial in a folder name with no prefix"
+    expect_eq "$(mask_text '001E46-123456789012345')" '001E46-<serial>' "setup mask: hides a serial at the start of a line"
+    expect_eq "$(mask_text 'need exactly one Client_001E46-RGserial9.pem')" \
+        'need exactly one Client_001E46-<serial>.pem' "setup mask: hides the serial in a certificate file name"
+    expect_eq "$(mask_text 'a decade-old box')" 'a decade-old box' "setup mask: keeps a word that holds no digit after six hex letters"
+    expect_eq "$(mask_text 'abc001E46-123')" 'abc001E46-123' "setup mask: keeps an OUI-like part inside a longer word"
+    expect_eq "$(mask_text 'on 2026-11-18')" 'on 2026-11-18' "setup mask: keeps a date"
+    expect_eq "$(mask_text '/data/att-certs/abc123-192.0.2.77')" '/data/att-certs/abc123-<address>' "setup mask: hides all of an IPv4 address after an OUI-like part"
+    expect_eq "$(mask_text '/data/att-certs/abc123-2001:db8:1:2')" '/data/att-certs/abc123-<address>' "setup mask: hides all of an IPv6 address after an OUI-like part"
+    expect_eq "$(mask_text '/data/att-certs/BGW210-700_123456789012345/')" \
+        '/data/att-certs/BGW210-700_<serial>/' "setup mask: hides the serial in an extract-mfg folder name"
+    expect_eq "$(mask_text 'nvg599_RGserial9 and 5268AC_RGserial9')" \
+        'nvg599_<serial> and 5268AC_<serial>' "setup mask: hides the serial after other gateway models"
+    expect_eq "$(mask_text 'BGW210-700_notes')" 'BGW210-700_notes' "setup mask: keeps a model name followed by a word with no digit"
 }
 
 t_setup_keys() {

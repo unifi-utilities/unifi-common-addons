@@ -85,7 +85,9 @@ The guided setup will be sufficient for most standard setups. It asks you
 questions and does most of the work. It asks permission before it
 changes the WAN. If it stops, it says why and what to do, and on retry
 it skips the steps that are finished. It hides IP addresses, MAC addresses,
-and the identity in its output, so you can share if you ask for help.
+the identity, and the serial number in common certificate folder names in
+its output, so you can share if you ask for help. A folder name that you
+chose yourself can still show a serial, so read the output before you post it.
 
 1. **Log in to the gateway.** On your computer, run:
 
