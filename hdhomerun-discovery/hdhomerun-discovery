@@ -1,0 +1,544 @@
+#!/bin/sh
+# hdhomerun-discovery: let HDHomeRun apps on one network find tuners on
+# another, on a UniFi OS gateway. Usage and design: README.md.
+# Run "hdhomerun-discovery help".
+set -eu
+# The proxy runs as a temporary user, which must read the addon's files.
+# A restrictive umask (077) would make them root-only.
+umask 022
+
+PROG=hdhomerun-discovery
+PORT=65001
+# HDHR_ROOT prefixes every absolute path. Only the tests set it.
+# On a gateway it is empty.
+R="${HDHR_ROOT:-}"
+DATA="$R/data/unifi-common-addons/$PROG"
+CONF="$DATA/$PROG.conf"
+ACTIVE="$DATA/active"
+PROXY="$DATA/proxy.pl"
+ONBOOT="$R/data/on_boot.d"
+ONBOOT_NAME="20-$PROG.sh"
+UNITS="$R/etc/systemd/system"
+SYSNET="$R/sys/class/net"
+UNIT_NAME="$PROG.service"
+# A link, so that the command works in any directory. /usr/local does not
+# survive a firmware update, so boot makes the link again.
+LINK="$R/usr/local/sbin/$PROG"
+LOCK="$R/run/$PROG.lock"
+# Seconds to wait for another command to finish. Only the tests change it.
+LOCK_WAIT="${HDHR_LOCK_WAIT:-30}"
+
+err() { printf '%s: ERROR: %s\n' "$PROG" "$*" >&2; }
+die() { err "$*"; exit 1; }
+note() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+    cat <<'USAGE'
+Usage: hdhomerun-discovery <command>
+
+Setup
+  setup       Guided setup: install, choose the networks, find the tuners,
+              and start the proxy. Asks before each change.
+  install     Copy the addon to /data (if it is elsewhere). Install the boot
+              entry and the unit. Starts nothing.
+  enable      Check the config, then start the proxy now and after each boot.
+  disable     Stop the proxy. Keeps the config.
+  uninstall   Stop the proxy. Remove the unit, the boot entry, and the addon
+              directory in /data.
+
+Read-only
+  status      Show the config and the state of the addon.
+  precheck    Check the config, the interfaces, and the port.
+  probe       Send one discovery request on each tuner network, and list the
+              tuners that answer the gateway.
+
+Called by systemd and by the boot entry
+  boot        Restore the unit. Start the proxy if it is enabled.
+  run         Run the proxy in the foreground.
+USAGE
+}
+
+# ---------- files ----------
+
+# put MODE SRC DST: copy only when the content differs. Returns 0 when it
+# wrote DST and 1 when DST was already the same. A failed write stops the
+# script. (set -e does not act inside a function that an || or if tests, so
+# each step checks its own result.) DST is replaced only by a whole copy.
+# The temporary name holds the process ID, so two runs never share it.
+put() {
+    # A symlink or a directory at DST: chmod would follow the link, and mv
+    # would move the file into the directory.
+    [ ! -L "$3" ] || die "$3 is a symlink; not replacing it"
+    [ ! -d "$3" ] || die "$3 is a directory; not replacing it"
+    if [ -f "$3" ] && cmp -s "$2" "$3"; then
+        chmod "$1" "$3" || die "cannot chmod $3"
+        return 1
+    fi
+    mkdir -p "$(dirname "$3")" || die "cannot create the directory of $3"
+    tmp="$3.new.$$"
+    if ! { cp "$2" "$tmp" && chmod "$1" "$tmp" && mv -f "$tmp" "$3"; }; then
+        rm -f "$tmp"
+        die "cannot write $3"
+    fi
+}
+
+# lock: let one changing command run at a time. Two boot runs can overlap
+# when two launchers call the boot entry. The lock ends when the script
+# exits.
+lock() {
+    mkdir -p "$(dirname "$LOCK")" || die "cannot create the directory of $LOCK"
+    exec 9>"$LOCK" || die "cannot open $LOCK"
+    flock -w "$LOCK_WAIT" 9 || die "another $PROG command is running (lock $LOCK)"
+}
+
+# clean_tmp: remove the temporary copies that a put() cut short by a power
+# loss left behind. Call it only while holding the lock: every put() runs
+# under the lock, so no temporary copy is in use then. It looks only at the
+# files that put() writes, and only at names that end in .new.<digits>.
+clean_tmp() {
+    for f in "$ONBOOT/$ONBOOT_NAME".new.* "$UNITS/$UNIT_NAME".new.* \
+        "$DATA/$PROG".new.* "$PROXY".new.* "$DATA/systemd/$UNIT_NAME".new.* \
+        "$DATA/on_boot.d/$ONBOOT_NAME".new.* "$CONF".new.*; do
+        [ -f "$f" ] || continue
+        case ${f##*.new.} in ''|*[!0-9]*) continue ;; esac
+        rm -f "$f"
+    done
+}
+
+# no_args COMMAND ARGS...: COMMAND takes no arguments.
+no_args() {
+    c=$1; shift
+    [ $# -eq 0 ] || die "$c takes no arguments (got: $*)"
+}
+
+# need_home: the addon home and the active mark are not symlinks. A symlink
+# could point into another addon, and enable or disable would then write or
+# delete that addon's file.
+need_home() {
+    [ ! -L "$DATA" ] || die "$DATA is a symlink"
+    [ ! -L "$ACTIVE" ] || die "$ACTIVE is a symlink"
+}
+
+# ---------- config ----------
+
+# parse_conf: set CLIENTS and TUNERS. The file is data, not shell.
+parse_conf() {
+    [ -f "$CONF" ] || { err "no config at $CONF. Run: $PROG setup"; return 1; }
+    CLIENTS='' TUNERS=''
+    seen=
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in ''|'#'*) continue ;; esac
+        key=${line%%=*}
+        val=${line#*=}
+        if [ "$key" = "$line" ]; then
+            err "$CONF: line is not KEY=VALUE: $line"
+            return 1
+        fi
+        val=${val#\"}
+        val=${val%\"}
+        case " $seen " in *" $key "*) err "$CONF: $key is set twice"; return 1 ;; esac
+        seen="$seen $key"
+        case $key in
+        CLIENTS) CLIENTS=$val ;;
+        TUNERS) TUNERS=$val ;;
+        *) err "$CONF: unknown key $key"; return 1 ;;
+        esac
+    done <"$CONF"
+}
+
+# check_names KEY NAMES: one or more well-formed interface names, none
+# listed twice in CLIENTS and TUNERS together.
+check_names() {
+    key=$1
+    count=0
+    set -f
+    for d in $2; do
+        case $d in
+        *[!A-Za-z0-9_.@-]*) set +f; err "$key: bad interface name '$d'"; return 1 ;;
+        esac
+        [ "${#d}" -le 15 ] || { set +f; err "$key: interface name '$d' is too long"; return 1; }
+        case " $all " in *" $d "*) set +f; err "interface $d is listed twice (a network is either a client network or a tuner network)"; return 1 ;; esac
+        all="$all $d"
+        count=$((count + 1))
+    done
+    set +f
+    [ "$count" -ge 1 ] || { err "$key is empty"; return 1; }
+}
+
+check_values() {
+    all=
+    check_names CLIENTS "$CLIENTS" || return 1
+    check_names TUNERS "$TUNERS" || return 1
+}
+
+# port_holder: print the sockets on UDP $PORT, if any. Fails when ss
+# cannot tell, so that a missing ss never reads as a free port.
+port_holder() {
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -Hlun "sport = :$PORT" 2>/dev/null
+}
+
+# wan_ifaces: the interfaces that hold a default route, in any routing
+# table (multi-WAN uses policy tables). These face the internet: setup
+# never lists them, and precheck refuses them.
+wan_ifaces() {
+    ip -4 route show table all 2>/dev/null |
+        awk '$1 == "default" { for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1) }' | sort -u
+}
+
+# check_system: the parts that depend on this gateway.
+check_system() {
+    wans=$(wan_ifaces)
+    for d in $CLIENTS $TUNERS; do
+        case " $(echo $wans) " in *" $d "*) err "interface $d holds a default route (it faces the internet); choose a LAN network"; return 1 ;; esac
+        [ -d "$SYSNET/$d" ] || { err "interface $d does not exist"; return 1; }
+        flags=$(cat "$SYSNET/$d/flags" 2>/dev/null) || flags=0
+        [ $((flags & 1)) -eq 1 ] || { err "interface $d is down"; return 1; }
+        [ $((flags & 8)) -eq 0 ] || { err "interface $d is a loopback interface"; return 1; }
+        a=$(ip -4 -o addr show dev "$d" 2>/dev/null) || a=
+        [ -n "$a" ] || { err "interface $d has no IPv4 address"; return 1; }
+    done
+    command -v perl >/dev/null 2>&1 || { err "perl is missing (Debian always has perl-base)"; return 1; }
+    [ -f "$PROXY" ] || { err "no proxy at $PROXY. Run install from a full copy of the addon"; return 1; }
+    perl -c "$PROXY" >/dev/null 2>&1 || { err "$PROXY does not compile with this perl"; return 1; }
+    # A second program on UDP 65001 would take some of the requests. Our
+    # own proxy holds the port while it runs, so ignore it then.
+    held=$(port_holder) || { err "cannot check UDP $PORT: ss is missing or failed"; return 1; }
+    if [ -n "$held" ] && ! systemctl is-active --quiet "$UNIT_NAME"; then
+        err "another program uses UDP $PORT (for example udp-broadcast-relay). Stop it first."
+        return 1
+    fi
+}
+
+cmd_precheck() {
+    no_args precheck "$@"
+    need_home
+    parse_conf || return 1
+    check_values || return 1
+    check_system || return 1
+}
+
+# ---------- units ----------
+
+reload() { systemctl daemon-reload; }
+
+# install_unit: restore the unit file. /data survives a firmware update and
+# /etc/systemd/system does not. Returns 0 when the file changed.
+install_unit() {
+    [ -f "$DATA/systemd/$UNIT_NAME" ] || die "missing $DATA/systemd/$UNIT_NAME"
+    put 0644 "$DATA/systemd/$UNIT_NAME" "$UNITS/$UNIT_NAME"
+}
+
+# install_link: point $LINK at the command. Leaves a file that is not a
+# link alone: it is not ours.
+install_link() {
+    if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+        note "$LINK exists and is not a link; left as it is"
+        return 0
+    fi
+    [ "$(readlink "$LINK" 2>/dev/null)" = "$DATA/$PROG" ] && return 0
+    mkdir -p "$(dirname "$LINK")" && ln -sfn "$DATA/$PROG" "$LINK" ||
+        note "cannot create $LINK; run $DATA/$PROG instead"
+}
+
+install_onboot() {
+    [ -f "$DATA/on_boot.d/$ONBOOT_NAME" ] || die "missing $DATA/on_boot.d/$ONBOOT_NAME"
+    put 0755 "$DATA/on_boot.d/$ONBOOT_NAME" "$ONBOOT/$ONBOOT_NAME" || true
+}
+
+# ---------- commands ----------
+
+# do_install: the work of install, under a lock that the caller holds.
+do_install() {
+    # The directory of the real script: $0 can be the link in $LINK.
+    self=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+    # Check the copy before the first write, so that an incomplete copy
+    # changes nothing.
+    for f in "$self/$PROG" "$self/proxy.pl" "$self/systemd/$UNIT_NAME" "$self/on_boot.d/$ONBOOT_NAME"; do
+        [ -f "$f" ] || die "missing $f; run install from a full copy of the addon. Nothing changed."
+    done
+    need_home
+    clean_tmp
+    mkdir -p "$DATA"
+    chmod 0755 "$DATA" || die "cannot chmod $DATA"
+    here=$(cd "$DATA" && pwd -P)
+    if [ "$self" != "$here" ]; then
+        put 0755 "$self/$PROG" "$DATA/$PROG" || true
+        put 0644 "$self/proxy.pl" "$PROXY" || true
+        put 0644 "$self/systemd/$UNIT_NAME" "$DATA/systemd/$UNIT_NAME" || true
+        put 0755 "$self/on_boot.d/$ONBOOT_NAME" "$DATA/on_boot.d/$ONBOOT_NAME" || true
+    fi
+    install_onboot
+    install_link
+    if install_unit; then reload; fi
+    check_path_open
+}
+
+# check_path_open: the temporary user must pass through each directory
+# above the addon home. Warn if one is closed to other users; do not
+# change it, because other addons share it.
+check_path_open() {
+    p=$(dirname "$DATA")
+    while [ "$p" != "$R" ] && [ "$p" != / ] && [ -n "$p" ]; do
+        case $(stat -c %A "$p" 2>/dev/null) in
+        ?????????[xt]) ;;
+        *) note "WARNING: $p is closed to other users, so the proxy cannot start. Fix: chmod o+x $p" ;;
+        esac
+        p=$(dirname "$p")
+    done
+}
+
+cmd_install() {
+    no_args install "$@"
+    lock
+    do_install
+    if [ -f "$CONF" ]; then
+        note "installed. The config is kept. To use the new version: $PROG disable, then $PROG enable"
+    else
+        note "installed. Next: $PROG setup"
+    fi
+}
+
+cmd_boot() {
+    no_args boot "$@"
+    lock
+    need_home
+    clean_tmp
+    [ ! -d "$DATA" ] || install_link
+    if [ -d "$DATA" ] && install_unit; then reload; fi
+    if [ -f "$ACTIVE" ] && [ ! -L "$ACTIVE" ]; then
+        # --no-block: the boot hook must not wait for the proxy.
+        systemctl start --no-block "$UNIT_NAME" || note "could not start $UNIT_NAME"
+    fi
+}
+
+do_enable() {
+    cmd_precheck || die "not enabling"
+    : >"$ACTIVE"
+    systemctl restart "$UNIT_NAME"
+    note "enabled"
+}
+
+cmd_enable() {
+    no_args enable "$@"
+    lock
+    do_enable
+}
+
+cmd_disable() {
+    no_args disable "$@"
+    lock
+    need_home
+    # If the stop fails the proxy may still run, so keep the active mark.
+    systemctl stop "$UNIT_NAME" || die "could not stop $UNIT_NAME; it stays enabled"
+    rm -f "$ACTIVE"
+    note "disabled (config kept)"
+}
+
+cmd_run() {
+    no_args run "$@"
+    # Check again: the config may have changed since ExecStartPre.
+    cmd_precheck || exit 1
+    set --
+    for d in $CLIENTS; do set -- "$@" --client "$d"; done
+    for d in $TUNERS; do set -- "$@" --tuner "$d"; done
+    exec perl "$PROXY" "$@"
+}
+
+cmd_probe() {
+    no_args probe "$@"
+    parse_conf || exit 1
+    all=
+    check_names TUNERS "$TUNERS" || exit 1
+    probe_tuners "$TUNERS"
+}
+
+# probe_tuners NAMES: list the tuners that answer the gateway. Returns 0
+# when one or more answered.
+probe_tuners() {
+    names=$1
+    set --
+    for d in $names; do set -- "$@" --tuner "$d"; done
+    perl "$PROXY" --probe "$@"
+}
+
+cmd_status() {
+    no_args status "$@"
+    echo "home:       $DATA"
+    [ -f "$ONBOOT/$ONBOOT_NAME" ] && b=present || b=missing
+    echo "boot entry: $b"
+    [ -f "$UNITS/$UNIT_NAME" ] && b=present || b=missing
+    echo "unit:       $b"
+    if parse_conf 2>/dev/null; then
+        echo "clients:    $CLIENTS"
+        echo "tuners:     $TUNERS"
+    else
+        echo "config:     missing or not valid ($CONF)"
+    fi
+    [ -f "$ACTIVE" ] && e=enabled || e=disabled
+    s=$(systemctl is-active "$UNIT_NAME" 2>/dev/null) || true
+    echo "proxy:      $e, unit ${s:-unknown}"
+}
+
+cmd_uninstall() {
+    no_args uninstall "$@"
+    lock
+    case $DATA in */"$PROG") ;; *) die "refusing to remove $DATA" ;; esac
+    systemctl stop "$UNIT_NAME" || die "could not stop $UNIT_NAME; nothing was removed"
+    rm -f "${UNITS:?}/$UNIT_NAME" "${ONBOOT:?}/$ONBOOT_NAME"
+    # Remove the link only when it is ours.
+    if [ "$(readlink "$LINK" 2>/dev/null)" = "$DATA/$PROG" ]; then rm -f "$LINK"; fi
+    reload || true
+    rm -rf "${DATA:?}"
+    note "uninstalled. You can delete the firewall rule for HDHomeRun discovery."
+}
+
+# ---------- setup ----------
+
+# ask PROMPT: print PROMPT, read one line into $answer. Stops at end of input.
+ask() {
+    printf '%s' "$1"
+    IFS= read -r answer || { echo; die "setup stopped: no answer"; }
+}
+
+# confirm PROMPT DEFAULT: ask a yes/no question. DEFAULT is y or n.
+confirm() {
+    ask "$1"
+    case ${answer:-$2} in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+# pick PROMPT: read numbers from the network list; set $picked to the names.
+pick() {
+    while :; do
+        ask "$1"
+        picked=
+        okay=1
+        set -f
+        for n in $answer; do
+            case $n in ''|*[!0-9]*) okay=0; break ;; esac
+            name=$(sed -n "${n}p" "$nets" | cut -d' ' -f1)
+            [ -n "$name" ] || { okay=0; break; }
+            case " $picked " in *" $name "*) ;; *) picked="$picked $name" ;; esac
+        done
+        set +f
+        picked=${picked# }
+        [ "$okay" -eq 1 ] && [ -n "$picked" ] && return 0
+        echo "Type one or more numbers from the list, separated by spaces."
+    done
+}
+
+firewall_help() {
+    cat <<EOF
+
+No tuner answered. Most often the gateway's firewall drops the tuner's
+answer. In UniFi Network, add this firewall rule (with the zone-based
+firewall, a policy):
+
+  Action:            Allow
+  Protocol:          UDP
+  Source zone:       the zone of the tuner network ($1)
+  Source:            your HDHomeRun tuners (or the tuner network)
+  Source port:       $PORT
+  Destination zone:  Gateway
+  Destination port:  Any
+
+Also check that the tuner is on and connected to that network.
+EOF
+}
+
+cmd_setup() {
+    no_args setup "$@"
+    echo "HDHomeRun discovery setup. Press Ctrl-C at any time to stop."
+    echo
+    echo "Step 1 of 4: install the addon in /data."
+    lock
+    do_install
+    exec 9>&-    # release the lock: enable takes it again
+    echo "Installed in $DATA."
+    echo
+
+    echo "Step 2 of 4: choose the networks."
+    nets="$DATA/.networks.$$"
+    trap 'rm -f "$nets"' EXIT
+    wans=" $(wan_ifaces | tr '\n' ' ')"
+    ip -4 -o addr show 2>/dev/null | while read -r _ name _ cidr _; do
+        case $name in lo) continue ;; esac
+        # Leave out the internet ports: they are never a choice, and their
+        # public address does not belong in output that users post.
+        case "$wans " in *" ${name%%@*} "*) continue ;; esac
+        printf '%s %s\n' "${name%%@*}" "$cidr"
+    done | awk '!seen[$1]++' >"$nets"
+    [ -s "$nets" ] || die "found no network with an IPv4 address"
+    echo "The networks on this gateway (on UniFi OS, brNN is the network of VLAN NN):"
+    awk '{ printf "  %2d) %-12s %s\n", NR, $1, $2 }' "$nets"
+    echo
+    pick "Which number is the network with the HDHomeRun tuner? "
+    tuners=$picked
+    while :; do
+        pick "Which numbers are the networks with the apps? (separate with spaces) "
+        clients=$picked
+        clash=
+        for c in $clients; do
+            case " $tuners " in *" $c "*) clash=$c ;; esac
+        done
+        [ -z "$clash" ] && break
+        echo "$clash is the tuner network. Choose only the networks with the apps."
+    done
+    had=
+    if [ -f "$CONF" ]; then
+        echo "A config already exists:"
+        sed 's/^/  /' "$CONF"
+        confirm "Replace it? [y/N] " n || die "setup stopped. The config is unchanged."
+        had=$(cat "$CONF")
+    fi
+    # Write under the lock, as put() does, so that clean_tmp in a boot or
+    # install never removes the temporary file. Check that nobody changed
+    # the config since the question.
+    lock
+    [ "$(cat "$CONF" 2>/dev/null)" = "$had" ] || die "the config changed while setup ran. Run setup again."
+    [ ! -L "$CONF" ] || die "$CONF is a symlink"
+    printf '# Written by %s setup.\n# The networks with the apps.\nCLIENTS="%s"\n# The networks with the tuners.\nTUNERS="%s"\n' \
+        "$PROG" "$clients" "$tuners" >"$CONF.new.$$" || die "cannot write $CONF"
+    chmod 0644 "$CONF.new.$$" && mv -f "$CONF.new.$$" "$CONF" || die "cannot write $CONF"
+    exec 9>&-
+    echo "Saved: apps on $clients, tuners on $tuners."
+    echo
+
+    echo "Step 3 of 4: find the tuners."
+    while :; do
+        if probe_tuners "$tuners"; then
+            break
+        fi
+        firewall_help "$tuners"
+        ask "Press Enter to try again, or type skip to go on: "
+        [ "$answer" != skip ] || break
+    done
+    echo
+
+    echo "Step 4 of 4: start the proxy."
+    if confirm "Start it now, and after each reboot? [Y/n] " y; then
+        lock
+        do_enable
+        echo
+        echo "Done. Open the HDHomeRun app on a device on $clients. It should find the tuner."
+    else
+        echo "Not started. To start it later: $PROG enable"
+    fi
+}
+
+cmd=${1:-help}
+[ $# -eq 0 ] || shift
+case $cmd in
+setup) cmd_setup "$@" ;;
+install) cmd_install "$@" ;;
+boot) cmd_boot "$@" ;;
+enable) cmd_enable "$@" ;;
+disable) cmd_disable "$@" ;;
+precheck) cmd_precheck "$@" ;;
+probe) cmd_probe "$@" ;;
+run) cmd_run "$@" ;;
+status) cmd_status "$@" ;;
+uninstall) cmd_uninstall "$@" ;;
+help|-h|--help) usage ;;
+*) usage >&2; exit 2 ;;
+esac
