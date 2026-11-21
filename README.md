@@ -45,6 +45,10 @@ Physically bypass the AT&T Fiber Residential Gateway by running 802.1X authentic
 
 Enables 6RD on CenturyLink connections. This allows you to use IPv6 on your LAN and have it routed over the 6RD tunnel to the internet.
 
+### [hdhomerun-discovery](hdhomerun-discovery)
+
+Lets HDHomeRun apps on one VLAN find HDHomeRun tuners on another, with a small discovery proxy on the gateway and a guided setup.
+
 ### he-ipv6
 
 Enables a [Hurricane Electric Tunnel Broker](https://tunnelbroker.net/) [6in4](https://www.rfc-editor.org/rfc/rfc4213.html) tunnel on UniFi OS gateways where the ISP only provides IPv4.
