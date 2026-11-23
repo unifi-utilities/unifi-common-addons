@@ -39,8 +39,11 @@ to the tuner directly.
   [Ubiquiti's SSH article](https://help.ui.com/hc/en-us/articles/204909374).
 - An HDHR tuner on one network, and the HDHR apps (iOS, Apple TV, Android, etc.) on one or more other
   networks.
-- Your firewall already lets the apps' networks reach the tuner. After this add-on fixes
-  discovery, the apps will connect to the tuner directly. If your firewall blocks them, the apps will now find the tuner but may not actually play anything. See [Let the apps reach the tuner](#let-the-apps-reach-the-tuner).
+- Your firewall already lets the apps' networks reach the tuner. After this
+  addon fixes discovery, the apps will connect to the tuner directly. If
+  your firewall blocks them, the apps will now find the tuner but may not
+  actually play anything. See
+  [Let the apps reach the tuner](#let-the-apps-reach-the-tuner).
 
 ### Words in this README
 
@@ -56,20 +59,25 @@ to the tuner directly.
 
 ## Set up
 
-1. **Add the firewall rule.** The add-on proxy asks the tuner network for tuners,
-   and each tuner answers to the gateway. The gateway's firewall usually
-   drops that answer, so this rule will allow it. In UniFi Network, add a firewall rule
-   (or with the zone-based firewall, a policy):
+1. **Add the firewall rule.** The addon proxy asks the tuner network for
+   tuners, and each tuner answers to the gateway. The gateway's firewall
+   usually drops that answer, so this rule will allow it. In UniFi
+   Network, add a firewall rule (or with the zone-based firewall, a
+   policy):
 
    | Field | Value |
    |---|---|
    | Action | Allow |
    | Protocol | UDP |
    | Source zone | the zone of the tuner network |
-   | Source | your HDHomeRun tuners (or the whole tuner network) |
+   | Source | the HDHomeRun tuners only (select them as devices, or enter their IP addresses) |
    | Source port | `65001` |
    | Destination zone | Gateway |
    | Destination port | Any |
+
+   The tuner answers to a random port, so the destination port must be
+   Any. For that reason, name only the tuners as the source, not the whole
+   tuner network.
 
    With the older firewall (without zones), this is a rule in the
    "LAN Local" set. If your firewall already lets the tuner network reach
@@ -204,11 +212,11 @@ Download the new version as in [Set up](#set-up), step 3. Then run:
 ```sh
 cd hdhomerun-discovery
 ./hdhomerun-discovery install
-hdhomerun-discovery disable
 hdhomerun-discovery enable
 ```
 
-`install` replaces the program files and keeps your config.
+`install` replaces the program files and keeps your config. `enable`
+checks the config and restarts the proxy, so the new version runs.
 
 ## After a firmware update
 
@@ -278,7 +286,7 @@ The same steps as the guided setup, one command at a time.
    config first, and starts the proxy only if every check passes.
 
 To change the config later, edit the file, then run
-`hdhomerun-discovery disable` and `hdhomerun-discovery enable`.
+`hdhomerun-discovery enable`. It restarts the proxy.
 
 ### The config file
 
@@ -313,8 +321,11 @@ the same time.
 
 1. An HDHR client app on an app network sends an HDHomeRun discovery request, a
    broadcast to UDP 65001.
-2. The proxy receives it on the app network's bridge. It drops anything
-   that is not a complete discovery request with a correct checksum.
+2. The proxy receives it on the app network's bridge. It drops a request
+   whose source address is outside the networks of that bridge (it reads
+   them again every 10 seconds, and keeps the last good list if a read
+   fails), and anything that is not a complete
+   discovery request with a correct checksum.
 3. The proxy sends the request as a broadcast on each tuner network, from
    a new port for each request.
 4. Each tuner answers the gateway on that port. This is the answer that
@@ -327,7 +338,9 @@ the same time.
 The proxy never sends a packet onto an app network except an answer to the
 app that asked, so it cannot cause a loop or a broadcast storm. It limits
 each app to 10 requests at once and 5 per second after that, and keeps at
-most 32 requests waiting for answers.
+most 32 requests waiting for answers. It keeps a rate-limit record for
+at most 1024 app addresses, and only addresses in the app network can
+have one.
 
 The unit runs the proxy as a temporary user that systemd creates
 (`DynamicUser=yes`), not as root. The proxy opens no raw socket. It gets
@@ -348,7 +361,8 @@ socket to one interface.
 
 - **HDHomeRun only.** The proxy forwards HDHomeRun discovery requests and
   nothing else.
-- **The answer comes from the gateway's address.** The HDHR apps take the tuner's address from inside the answer. An app that
+- **The answer comes from the gateway's address.** The HDHR apps take
+  the tuner's address from inside the answer. An app that
   uses the sender's address instead would try to reach the tuner through
   the gateway, and fail.
 - **IPv4 only.**
@@ -368,7 +382,9 @@ Off the gateway:
   `systemctl`, `ip`, `ss`, and `perl`. It passes as root and as a normal
   user.
 - `tests/proxy-netns.sh` runs the real proxy in private network
-  namespaces (`unshare`, no sudo), with a fake tuner. It checks the
+  namespaces (`unshare`), with a fake tuner. It needs unprivileged user namespaces:
+  run it as a normal user on Debian, and with `sudo` on Ubuntu 24.04, which
+  blocks them (CI runs it as root). It checks the
   answer path, two apps at once, packets that must be dropped, the rate
   limit, `probe`, and the exit after a bridge is created again.
 - `tests/mutate.sh` breaks the command and the proxy on purpose, one fault

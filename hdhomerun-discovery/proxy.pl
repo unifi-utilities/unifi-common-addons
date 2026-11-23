@@ -125,18 +125,19 @@ sub ifindex {
     return $i;
 }
 
-# nets DEV: the IPv4 networks on DEV, as [network, mask] pairs.
+# nets DEV: the IPv4 networks on DEV, as [network, mask] pairs. undef when
+# the lookup failed, which is not the same as an interface with no address.
 sub nets {
     my ($dev) = @_;
     my @n;
-    open(my $fh, '-|', 'ip', '-4', '-o', 'addr', 'show', 'dev', $dev) or return [];
+    open(my $fh, '-|', 'ip', '-4', '-o', 'addr', 'show', 'dev', $dev) or return undef;
     # A named variable: callers loop over interface names in $_.
     while (my $line = <$fh>) {
         next unless $line =~ m{\binet (\d+\.\d+\.\d+\.\d+)/(\d+)};
         my $mask = $2 == 0 ? 0 : (0xFFFFFFFF << (32 - $2)) & 0xFFFFFFFF;
         push @n, [unpack('N', inet_aton($1)) & $mask, $mask];
     }
-    close $fh;
+    close($fh) or return undef;
     return \@n;
 }
 
@@ -158,7 +159,7 @@ sub bound_socket {    # bound_socket DEV PORT BROADCAST
 
 my $bcast = sockaddr_in(PORT, INADDR_BROADCAST);
 my %tnet;
-$tnet{$_} = nets($_) for @tuners;
+$tnet{$_} = nets($_) // [] for @tuners;
 for (@tuners) { die "$_ has no IPv4 address\n" unless @{ $tnet{$_} } }
 
 # valid_answer SOCKADDR DATA TUNER: from port 65001 on the tuner network,
@@ -200,12 +201,15 @@ if ($probe) {
 # ---------- proxy ----------
 
 my $sel = IO::Select->new;
-my (%client_of, %pending, %idx, %bucket);
+my (%client_of, %pending, %idx, %bucket, %cnet);
 for my $c (@clients) {
     my $s = bound_socket($c, PORT, 0);
     $client_of{fileno $s} = [$c, $s];
     $sel->add($s);
 }
+# The IPv4 networks of each app interface, read again every CHECK_EVERY
+# seconds. A request must come from one of them.
+$cnet{$_} = nets($_) // [] for @clients;
 for (@clients, @tuners) {
     $idx{$_} = ifindex($_);
     die "$_: not in /sys/class/net\n" if $idx{$_} eq '-1';
@@ -246,6 +250,13 @@ sub on_request {
     my ($cdev, $csock, $from, $data, $now) = @_;
     my ($aport, $aaddr) = sockaddr_in($from);
     my $app = inet_ntoa($aaddr) . ":$aport";
+    # Only a host on the app network that received the request may ask. A
+    # source outside it is spoofed or misrouted, and it would cost a
+    # rate-limit record (so this also bounds that table by the subnet size).
+    unless (in_nets(unpack('N', $aaddr), $cnet{$cdev})) {
+        dbg("drop from $app on $cdev: source is outside the network");
+        return;
+    }
     my $type = frame_type($data);
     unless (defined $type && $type == TYPE_REQ) {
         dbg("drop from $app on $cdev: not a discovery request");
@@ -309,7 +320,10 @@ while (1) {
                 exit 1;
             }
         }
-        $tnet{$_} = nets($_) for @tuners;
+        # A failed lookup keeps the last list; an interface that lost every
+        # address gets an empty list, and then nothing is accepted.
+        for (@tuners) { my $n = nets($_); $tnet{$_} = $n if $n }
+        for (@clients) { my $n = nets($_); $cnet{$_} = $n if $n }
         for (keys %bucket) { delete $bucket{$_} if $now - $bucket{$_}[1] > 60 }
     }
     for my $fd (keys %pending) { drop_pending($fd) if $pending{$fd}{until} <= $now }

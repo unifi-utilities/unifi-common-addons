@@ -1,7 +1,9 @@
 #!/bin/sh
-# Functional test of proxy.pl in private network namespaces. Needs no sudo:
-# it runs itself again under `unshare -rn` (the "gateway"), and puts each
-# app and the fake tuner in a namespace of its own. Needs perl and python3.
+# Functional test of proxy.pl in private network namespaces. Needs no sudo
+# where unprivileged user namespaces are allowed (Debian), and sudo where they
+# are blocked (Ubuntu 24.04). It runs itself again under `unshare -rn` (the
+# "gateway"), and puts each app and the fake tuner in a namespace of its own.
+# Needs perl and python3.
 #
 # Usage: tests/proxy-netns.sh [path-to-proxy.pl]
 set -eu
@@ -114,15 +116,15 @@ while True:
         else:
             w.sendto(answer(), src)
 PY
-# app.py LOG KIND COUNT: send COUNT packets of KIND as broadcasts from one
-# socket, then log every answer for 3 s: "from-ip from-port valid".
+# app.py LOG KIND COUNT [SOURCE]: send COUNT packets of KIND as broadcasts
+# from one socket (bound to SOURCE, an address of the app, if given), then log every answer for 3 s: "from-ip from-port valid".
 cat >"$tmp/app.py" <<'PY'
 import socket, sys, time
 sys.path.insert(0, sys.argv[1]); from hdhr import *
 log, kind, count = sys.argv[2], sys.argv[3], int(sys.argv[4])
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-s.bind(("0.0.0.0", 0)); s.settimeout(0.2)
+s.bind((sys.argv[5] if len(sys.argv) > 5 else "0.0.0.0", 0)); s.settimeout(0.2)
 pkt = {"req": request(), "reqA": request(bytes.fromhex("AAAAAAAA")), "reqB": request(bytes.fromhex("BBBBBBBB")),
        "badcrc": request()[:-1] + b"\x00", "answer": answer(),
        "control": frame(4, b"\x03\x01\x00")}[kind]
@@ -151,7 +153,7 @@ start_proxy() {
     sleep 1
     kill -0 "$proxy_pid" 2>/dev/null || { cat "$tmp/proxy.log"; echo "FAIL the proxy exited at start"; exit 1; }
 }
-app() { in_ns "$1" python3 "$tmp/app.py" "$tmp" "$2" "$3" "$4"; }
+app() { in_ns "$1" python3 "$tmp/app.py" "$tmp" "$2" "$3" "$4" ${5:+"$5"}; }
 lines() { if [ -f "$1" ]; then wc -l <"$1" | tr -d ' '; else echo 0; fi; }
 
 start_tuner
@@ -233,6 +235,40 @@ if [ "$(lines "$tmp/a6c")" -eq 1 ]; then pass "6d: after the waiting requests ex
 else bad "6d: after expiry, the app got $(lines "$tmp/a6c") answers"; fi
 kill "$proxy_pid" 2>/dev/null; wait "$proxy_pid" 2>/dev/null
 start_proxy
+
+# 6e. The source of a request must lie in a network of the app interface.
+# appA also has 10.99.9.50, outside every network of br1: that request is
+# dropped. 10.99.8.0/24 is added to br1 while the proxy runs: the proxy
+# reads the addresses again within CHECK_EVERY (10 s), then accepts it.
+# The kernel's reverse-path filter would drop such a packet before the proxy
+# sees it. Turn it off, so that the test checks the proxy.
+echo 0 >/proc/sys/net/ipv4/conf/all/rp_filter
+echo 0 >/proc/sys/net/ipv4/conf/br1/rp_filter
+in_ns "$appA" ip addr add 10.99.9.50/24 dev h1
+in_ns "$appB" ip addr add 10.99.8.50/24 dev h2
+: >"$tmp/tuner.log"
+app "$appA" "$tmp/a6e" req 1 10.99.9.50
+if [ "$(lines "$tmp/tuner.log")" -eq 0 ] && [ "$(lines "$tmp/a6e")" -eq 0 ]; then
+    pass "6e: a request from a source outside the app network is dropped"
+else bad "6e: tuner saw $(lines "$tmp/tuner.log"), app got $(lines "$tmp/a6e")"; fi
+app "$appA" "$tmp/a6f" req 1
+if [ "$(lines "$tmp/a6f")" -eq 1 ]; then pass "6f: a request from the network itself still gets its answer"
+else bad "6f: app got $(lines "$tmp/a6f") answers"; fi
+: >"$tmp/tuner.log"
+app "$appB" "$tmp/b6g" req 1 10.99.8.50
+if [ "$(lines "$tmp/b6g")" -eq 0 ] && [ "$(lines "$tmp/tuner.log")" -eq 0 ]; then pass "6g: a source in a network that br1 does not have yet is dropped"
+else bad "6g: app got $(lines "$tmp/b6g") answers"; fi
+ip addr add 10.99.8.1/24 dev br1
+sleep 12
+app "$appB" "$tmp/b6h" req 1 10.99.8.50
+if [ "$(lines "$tmp/b6h")" -eq 1 ]; then pass "6h: a second network on br1 is accepted after the proxy reads the addresses again"
+else bad "6h: app got $(lines "$tmp/b6h") answers"; fi
+ip addr del 10.99.8.1/24 dev br1
+sleep 12
+: >"$tmp/tuner.log"
+app "$appB" "$tmp/b6i" req 1 10.99.8.50
+if [ "$(lines "$tmp/b6i")" -eq 0 ] && [ "$(lines "$tmp/tuner.log")" -eq 0 ]; then pass "6i: a network removed from br1 is no longer accepted"
+else bad "6i: app got $(lines "$tmp/b6i") answers"; fi
 
 # 7. probe lists the tuner with its device ID.
 rc=0; out=$(perl "$proxy" --probe --tuner br3 2>&1) || rc=$?

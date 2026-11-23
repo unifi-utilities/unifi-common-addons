@@ -57,6 +57,7 @@ printf '%s\n' "$*" >>"$STUB_STATE/systemctl.log"
 case "$1" in is-active)
     [ ! -e "$STUB_STATE/inactive" ] || { echo inactive; exit 3; }
     echo active ;;
+show) cat "$STUB_STATE/mainpid" 2>/dev/null || echo 0 ;;
 esac
 exit 0
 STUB
@@ -72,6 +73,7 @@ STUB
     cat >"$B/ss" <<'STUB'
 #!/bin/sh
 [ ! -e "$STUB_STATE/ss-fails" ] || exit 1
+printf '%s\n' "$*" >"$STUB_STATE/ss-args"
 cat "$STUB_STATE/ss" 2>/dev/null || true
 STUB
     # perl: -c passes unless perl-c-fails exists. --probe prints the tuners
@@ -212,13 +214,45 @@ conf "$GOOD"
 : >"$S/perl-c-fails"
 refuse "proxy.pl does not compile" hd precheck
 
+# A socket line as ss -e prints it. UID 0 and the test's own user ID differ
+# whenever the suite runs as a normal user; OTHER is never the test's own.
+ME=$(id -u)
+OTHER=$((ME + 1))
+sock() { printf 'UNCONN 0 0 %s:65001 0.0.0.0:* uid:%s ino:4242 sk:1 cgroup:/x <->\n' "$1" "$2"; }
+# running PID: our unit is active with that main PID (the fixture's /proc/PID
+# belongs to the test user, as the real proxy's belongs to its own user).
+running() { rm -f "$S/inactive"; mkdir -p "$R/proc/$1"; echo "$1" >"$S/mainpid"; }
+
 setup port-held
 conf "$GOOD"
-echo 'UNCONN 0 0 0.0.0.0:65001 0.0.0.0:*' >"$S/ss"
+sock 0.0.0.0 "$OTHER" >"$S/ss"
 refuse "another program holds UDP 65001" hd precheck
 check "the port message names the old relay" sh -c '"$1" precheck 2>&1 | grep -q "udp-broadcast-relay"' sh "$H/hdhomerun-discovery"
-rm -f "$S/inactive"
-check "UDP 65001 held while our own unit is active is fine" hd precheck
+running 4321
+refuse "another program holds UDP 65001 while our unit is active" hd precheck
+sock '0.0.0.0%br0' "$ME" >"$S/ss"
+check "UDP 65001 held only by our own running proxy is fine" hd precheck
+{ sock '0.0.0.0%br0' "$ME"; sock 0.0.0.0 "$OTHER"; } >"$S/ss"
+refuse "our proxy and another program both hold UDP 65001" hd precheck
+{ sock 0.0.0.0 "$OTHER"; sock '0.0.0.0%br0' "$ME"; } >"$S/ss"
+refuse "another program, listed before our proxy, holds UDP 65001" hd precheck
+printf 'UNCONN 0 0 0.0.0.0%%br0:65001 0.0.0.0:*\n' >"$S/ss"
+refuse "a socket whose owner ss does not show is not treated as free" hd precheck
+{ sock '0.0.0.0%br0' "$ME"; sock '0.0.0.0%br40' "$ME"; } >"$S/ss"
+check "two sockets of our own proxy (two app networks) are fine" hd precheck
+echo 0 >"$S/mainpid"
+refuse "the unit is active but has no main PID: every holder is foreign" hd precheck
+rm -f "$S/mainpid"
+refuse "the unit is active but its main PID is unknown: every holder is foreign" hd precheck
+running 4321
+echo 'abc' >"$S/mainpid"
+refuse "a main PID that is not a number: every holder is foreign" hd precheck
+rm -rf "$R/proc/4321"; echo 4321 >"$S/mainpid"
+refuse "a main PID with no /proc entry: every holder is foreign" hd precheck
+: >"$S/ss"
+check "an active unit with no socket on the port is fine" hd precheck
+
+check "the port check asks for all UDP sockets, connected ones too, with owners" has "$S/ss-args" '^-Haune '
 
 setup wan
 conf 'CLIENTS="br0 eth8"
@@ -430,6 +464,7 @@ conf "# mine
 $GOOD"
 "$SRC/hdhomerun-discovery" install >/dev/null 2>&1
 check "install keeps an existing config" has "$H/hdhomerun-discovery.conf" '^# mine$'
+check "install with a config says to run enable, and not disable" sh -c '"$1" install 2>&1 | grep -q "To use the new version: hdhomerun-discovery enable\$"' sh "$SRC/hdhomerun-discovery"
 
 for part in proxy.pl systemd/$UNIT on_boot.d/$ENTRY; do
     setup "install-no-${part%%/*}"
@@ -603,6 +638,11 @@ setup guided-firewall
 three
 guided 2 1 "" skip y
 check "setup explains the firewall rule when no tuner answers" has "$T/out" 'Source port: *65001'
+check "the firewall help names only the tuners as the source" has "$T/out" 'HDHomeRun tuners only'
+refuse "the firewall help does not offer the tuner network as the source" has "$T/out" 'or the tuner network'
+refuse "the firewall help does not offer the whole tuner network as the source" has "$T/out" 'or the whole tuner network'
+check "the firewall help keeps destination port Any, and says why" has "$T/out" 'Destination port: *Any'
+check "the firewall help names the ephemeral reply port" has "$T/out" 'answers to that port'
 check "the firewall help names the Gateway zone" has "$T/out" 'Destination zone: *Gateway'
 check "setup still enables after skip" test -f "$H/active"
 
