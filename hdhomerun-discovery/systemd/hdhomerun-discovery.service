@@ -1,0 +1,26 @@
+[Unit]
+Description=HDHomeRun discovery proxy
+After=network-online.target
+StartLimitIntervalSec=0
+# Without /data the condition below skips the unit, and Restart= does not
+# apply to a skipped unit.
+RequiresMountsFor=/data
+ConditionPathExists=/data/unifi-common-addons/hdhomerun-discovery/active
+
+[Service]
+# A throwaway user, not root. The proxy opens no raw socket, but Linux
+# before 5.7 needs CAP_NET_RAW to bind a socket to one interface
+# (SO_BINDTODEVICE). It gets that one capability and no other.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+# precheck checks the config, the interfaces, and the port. A failure
+# holds the proxy back until the next try.
+ExecStartPre=/data/unifi-common-addons/hdhomerun-discovery/hdhomerun-discovery precheck
+ExecStart=/data/unifi-common-addons/hdhomerun-discovery/hdhomerun-discovery run
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

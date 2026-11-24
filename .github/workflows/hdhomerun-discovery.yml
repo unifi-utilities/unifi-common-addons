@@ -1,0 +1,66 @@
+name: hdhomerun-discovery
+
+on:
+  pull_request:
+    paths:
+      - hdhomerun-discovery/**
+      - .github/workflows/hdhomerun-discovery.yml
+  push:
+    branches:
+      - main
+    paths:
+      - hdhomerun-discovery/**
+      - .github/workflows/hdhomerun-discovery.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # A new run of a PR cancels the older one. A run on main, or a manual
+  # run, has a group of its own, so no later run cancels it, running or
+  # pending.
+  group: hdhomerun-discovery-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Off-box suite, as a normal user
+        working-directory: hdhomerun-discovery
+        run: sh tests/run.sh
+      - name: Off-box suite, as root
+        working-directory: hdhomerun-discovery
+        run: sudo sh tests/run.sh
+      - name: Proxy in network namespaces
+        working-directory: hdhomerun-discovery
+        # Ubuntu 24.04 blocks unprivileged user namespaces, so run as root.
+        run: sudo sh tests/proxy-netns.sh
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      # shellcheck v0.10.0
+      SHELLCHECK_IMAGE: koalaman/shellcheck@sha256:2097951f02e735b613f4a34de20c40f937a6c8f18ecb170612c88c34517221fb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck -S warning
+        working-directory: hdhomerun-discovery
+        run: |
+          # tests/debian.sh passes a script to sh -c in a container, which
+          # shellcheck does not see. Check it as a file.
+          sed -n "/sh -c '\$/,/') || fail=1\$/p" tests/debian.sh | sed "1d;\$s/') || fail=1\$//" >"$RUNNER_TEMP/debian-inner.sh"
+          test -s "$RUNNER_TEMP/debian-inner.sh"
+          docker run --rm -v "$PWD:/mnt:ro" -v "$RUNNER_TEMP:/inner:ro" "$SHELLCHECK_IMAGE" -S warning -s sh \
+            hdhomerun-discovery on_boot.d/*.sh tests/*.sh /inner/debian-inner.sh
