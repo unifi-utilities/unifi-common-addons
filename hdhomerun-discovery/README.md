@@ -163,7 +163,8 @@ message names the cause:
 - the config is missing or has an error (run `setup` again),
 - an interface does not exist, is down, or has no IPv4 address,
 - an interface faces the internet (it holds a default route),
-- `ss` is missing or fails, so the port check cannot run,
+- the kernel's socket tables (`/proc/net/udp`, and `/proc/net/udp6` when it
+  exists) cannot be read, so the port check cannot run,
 - another program uses UDP 65001. Two programs on that port would share
   the requests. Stop the other program first.
 
@@ -379,7 +380,7 @@ socket to one interface.
 Off the gateway:
 
 - `tests/run.sh` tests the command on a fixture root, with stubs for
-  `systemctl`, `ip`, `ss`, and `perl`. It passes as root and as a normal
+  `systemctl`, `ip`, and `perl`, and a fake `/proc/net/udp`. It passes as root and as a normal
   user.
 - `tests/proxy-netns.sh` runs the real proxy in private network
   namespaces (`unshare`), with a fake tuner. It needs unprivileged user namespaces:

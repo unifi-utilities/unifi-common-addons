@@ -14,6 +14,7 @@ TOP=$(mktemp -d) || { echo "cannot create a temp dir; aborting" >&2; exit 1; }
 case "$TOP" in /?*/?*) ;; *) echo "unsafe temp dir '$TOP'; aborting" >&2; exit 1 ;; esac
 trap 'rm -rf -- "${TOP:?}"' EXIT
 ORIG_PATH=$PATH
+UDP_HEADER='  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops'
 UNIT=hdhomerun-discovery.service
 ENTRY=20-hdhomerun-discovery.sh
 
@@ -70,12 +71,15 @@ case "$*" in
 *) exit 1 ;;
 esac
 STUB
+    # ss: the script must not call it (the port check reads /proc/net/udp).
     cat >"$B/ss" <<'STUB'
 #!/bin/sh
-[ ! -e "$STUB_STATE/ss-fails" ] || exit 1
-printf '%s\n' "$*" >"$STUB_STATE/ss-args"
-cat "$STUB_STATE/ss" 2>/dev/null || true
+: >"$STUB_STATE/ss-called"
+exit 1
 STUB
+    # The kernel's socket table, with no socket on it: a free port.
+    mkdir -p "$R/proc/net"
+    printf '%s\n' "$UDP_HEADER" >"$R/proc/net/udp"
     # perl: -c passes unless perl-c-fails exists. --probe prints the tuners
     # in "probe" and exits 0, or exits 3 when that file is missing. Other
     # calls record their arguments.
@@ -214,32 +218,66 @@ conf "$GOOD"
 : >"$S/perl-c-fails"
 refuse "proxy.pl does not compile" hd precheck
 
-# A socket line as ss -e prints it. UID 0 and the test's own user ID differ
-# whenever the suite runs as a normal user; OTHER is never the test's own.
+# A row of /proc/net/udp, as the kernel prints it. UID 0 and the test's own
+# user ID differ whenever the suite runs as a normal user; OTHER is never the
+# test's own. sock UID [PORTHEX [STATE [SL [ADDR]]]]: a socket on 0.0.0.0, port
+# 65001 (FDE9) unless given.
 ME=$(id -u)
 OTHER=$((ME + 1))
-sock() { printf 'UNCONN 0 0 %s:65001 0.0.0.0:* uid:%s ino:4242 sk:1 cgroup:/x <->\n' "$1" "$2"; }
+sock() { printf '  %s: %s:%s 00000000:0000 %s 00000000:00000000 00:00000000 00000000 %5s        0 4242 2 0000000000000000 0\n' "${4:-146}" "${5:-00000000}" "${2:-FDE9}" "${3:-07}" "$1"; }
+# socks FILE ROW...: write the table with the rows (udp or udp6 under $R/proc/net).
+socks() { f=$1; shift; { printf '%s\n' "$UDP_HEADER"; for r in "$@"; do printf '%s\n' "$r"; done; } >"$R/proc/net/$f"; }
 # running PID: our unit is active with that main PID (the fixture's /proc/PID
 # belongs to the test user, as the real proxy's belongs to its own user).
 running() { rm -f "$S/inactive"; mkdir -p "$R/proc/$1"; echo "$1" >"$S/mainpid"; }
 
 setup port-held
 conf "$GOOD"
-sock 0.0.0.0 "$OTHER" >"$S/ss"
+socks udp "$(sock "$OTHER")"
 refuse "another program holds UDP 65001" hd precheck
 check "the port message names the old relay" sh -c '"$1" precheck 2>&1 | grep -q "udp-broadcast-relay"' sh "$H/hdhomerun-discovery"
 running 4321
 refuse "another program holds UDP 65001 while our unit is active" hd precheck
-sock '0.0.0.0%br0' "$ME" >"$S/ss"
+socks udp "$(sock "$ME")"
 check "UDP 65001 held only by our own running proxy is fine" hd precheck
-{ sock '0.0.0.0%br0' "$ME"; sock 0.0.0.0 "$OTHER"; } >"$S/ss"
+check "the port check does not call ss" test ! -e "$S/ss-called"
+socks udp "$(sock "$ME")" "$(sock "$OTHER")"
 refuse "our proxy and another program both hold UDP 65001" hd precheck
-{ sock 0.0.0.0 "$OTHER"; sock '0.0.0.0%br0' "$ME"; } >"$S/ss"
+socks udp "$(sock "$OTHER")" "$(sock "$ME")"
 refuse "another program, listed before our proxy, holds UDP 65001" hd precheck
-printf 'UNCONN 0 0 0.0.0.0%%br0:65001 0.0.0.0:*\n' >"$S/ss"
-refuse "a socket whose owner ss does not show is not treated as free" hd precheck
-{ sock '0.0.0.0%br0' "$ME"; sock '0.0.0.0%br40' "$ME"; } >"$S/ss"
+socks udp "$(sock "$ME")" "$(sock "$ME")"
 check "two sockets of our own proxy (two app networks) are fine" hd precheck
+# The failing case on the UDM Pro: a real kernel row (iproute2 5.9 ss shows
+# no user ID for it), the proxy's own uid.
+printf '%s\n%s\n' "$UDP_HEADER" "  146: 00000000:FDE9 00000000:0000 07 00000000:00000000 00:00000000 00000000 $ME        0 48498 2 00000000e1365ff3 0" >"$R/proc/net/udp"
+check "the UDM Pro row of our own proxy is fine" hd precheck
+check "the owner is read from column 8 (uid), not column 7" hd precheck
+socks udp "$(sock "$ME" FDE9 01)" "$(sock "$OTHER" FDE9 01)"
+refuse "a connected socket (state 01) of another program counts" hd precheck
+if [ "$ME" -ne 0 ]; then
+    socks udp "$(sock "$ME")" "$(sock 0)"
+    refuse "a socket of root next to our proxy is foreign" hd precheck
+fi
+socks udp
+socks udp6 "$(sock "$ME" FDE9 07 146 00000000000000000000000000000000)"
+check "our own proxy on IPv6 only is fine" hd precheck
+socks udp6 "$(sock "$OTHER" FDE9 07 146 00000000000000000000000000000000)"
+refuse "another program holds UDP 65001 on IPv6" hd precheck
+socks udp "$(sock "$ME")"
+socks udp6 "$(sock "$ME" FDE9 07 146 00000000000000000000000000000000)" "$(sock "$OTHER" FDE9 07 147 00000000000000000000000000000000)"
+refuse "our proxy and another program on IPv6" hd precheck
+socks udp6
+socks udp "$(sock "$OTHER" FDE8)" "$(sock "$OTHER" 1FDE9)" "$(sock "$OTHER" FDE90)" "$(sock "$OTHER" 0FDE)"
+check "sockets on other ports (65000, a longer or shorter field) do not count" hd precheck
+printf '%s\n%s\n' "$UDP_HEADER" "  146: 00000000:1F90 0100007F:FDE9 01 00000000:00000000 00:00000000 00000000 $OTHER        0 4242 2 0000000000000000 0" >"$R/proc/net/udp"
+check "UDP 65001 as the remote port of a socket does not count" hd precheck
+socks udp "$(sock "$ME" fde9)"
+check "a lower-case port in the table is read as 65001 (own proxy)" hd precheck
+socks udp "$(sock "$OTHER" fde9)"
+refuse "a lower-case port of another program counts" hd precheck
+printf '%s\n%s\n' "$UDP_HEADER" "  146: 00000000:FDE9 00000000:0000 07 00000000:00000000 00:00000000 00000000 x        0 4242 2 0000000000000000 0" >"$R/proc/net/udp"
+refuse "a row whose owner is not a number is foreign" hd precheck
+socks udp "$(sock "$ME")"
 echo 0 >"$S/mainpid"
 refuse "the unit is active but has no main PID: every holder is foreign" hd precheck
 rm -f "$S/mainpid"
@@ -249,20 +287,29 @@ echo 'abc' >"$S/mainpid"
 refuse "a main PID that is not a number: every holder is foreign" hd precheck
 rm -rf "$R/proc/4321"; echo 4321 >"$S/mainpid"
 refuse "a main PID with no /proc entry: every holder is foreign" hd precheck
-: >"$S/ss"
+running 4321
+socks udp
 check "an active unit with no socket on the port is fine" hd precheck
-
-check "the port check asks for all UDP sockets, connected ones too, with owners" has "$S/ss-args" '^-Haune '
+socks udp "$(sock "$ME")"
+: >"$S/inactive"
+refuse "the unit is not running: even a socket with our user ID is foreign" hd precheck
 
 setup wan
 conf 'CLIENTS="br0 eth8"
 TUNERS="br30"'
 refuse "an interface with a default route (the WAN)" hd precheck
 
-setup ss-fails
+setup no-udp-table
 conf "$GOOD"
-: >"$S/ss-fails"
-refuse "precheck fails when ss cannot check the port" hd precheck
+rm -f "$R/proc/net/udp"
+refuse "precheck fails when /proc/net/udp cannot be read" hd precheck
+check "the failure message names the table" sh -c '"$1" precheck 2>&1 | grep -q "cannot read the socket tables"' sh "$H/hdhomerun-discovery"
+socks udp6
+refuse "precheck fails when only /proc/net/udp6 exists" hd precheck
+setup udp6-unreadable
+conf "$GOOD"
+rm -f "$R/proc/net/udp6"; mkdir "$R/proc/net/udp6"
+refuse "a udp6 that cannot be read is not read as a free port" hd precheck
 
 setup symlink-home
 conf "$GOOD"

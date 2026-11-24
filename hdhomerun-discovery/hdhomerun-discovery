@@ -172,15 +172,27 @@ check_values() {
     check_names TUNERS "$TUNERS" || return 1
 }
 
-# port_holder: print the sockets on UDP $PORT, if any, with the user ID of
-# each owner (ss -e). All UDP sockets count, bound or connected (-a). Fails
-# when ss cannot run, so that a missing ss never reads as a free port. Needs
-# no root: ss shows the owner of a socket (not of user ID 0, which counts as
-# foreign below), and shows the process only for processes that the caller
-# may read.
+# port_holder: print the user ID of the owner of each socket on UDP $PORT,
+# one per line, and nothing when the port is free. The kernel's socket
+# tables give it: /proc/net/udp (IPv4) and /proc/net/udp6 (IPv6). Column 2
+# is local_address, ADDRESS:PORT with the port in hex; column 8 is the user
+# ID. All states count, bound or connected. Any user may read these files,
+# so this works as the temporary user of ExecStartPre. ss -e is no use here:
+# iproute2 5.9 (the UDM Pro) prints no user ID for UDP sockets. Fails when
+# /proc/net/udp cannot be read, so that an unreadable table never reads as
+# a free port. A missing udp6 (IPv6 off) means no IPv6 sockets. A row whose
+# user ID is not a number prints "?", which is foreign.
 port_holder() {
-    command -v ss >/dev/null 2>&1 || return 1
-    ss -Haune "sport = :$PORT" 2>/dev/null
+    [ -f "$PROCFS/net/udp" ] || return 1
+    for f in udp udp6; do
+        [ -e "$PROCFS/net/$f" ] || continue
+        [ -f "$PROCFS/net/$f" ] && [ -r "$PROCFS/net/$f" ] || return 1
+        awk -v want="$(printf '%04X' "$PORT")" '
+            NR > 1 {
+                n = split($2, a, ":")
+                if (n >= 2 && toupper(a[n]) == want) print ($8 ~ /^[0-9]+$/ ? $8 : "?")
+            }' "$PROCFS/net/$f" || return 1
+    done
 }
 
 # our_uid: the user ID of our running proxy, or nothing when the unit is not
@@ -193,14 +205,13 @@ our_uid() {
     stat -c %u "$PROCFS/$pid" 2>/dev/null || true
 }
 
-# foreign_holder SOCKETS: print each line of SOCKETS (the output of
-# port_holder) that is not our running proxy's. A socket whose owner ss does
-# not show counts as foreign: when we cannot tell, the port is not free.
+# foreign_holder OWNERS: print each user ID in OWNERS (the output of
+# port_holder) that is not our running proxy's. When the unit is not
+# running, every owner is foreign. Root is foreign too.
 foreign_holder() {
     uid=$(our_uid)
     printf '%s\n' "$1" | awk -v ours="$uid" '
-        { u = ""; for (i = 1; i <= NF; i++) if ($i ~ /^uid:[0-9]+$/) u = substr($i, 5) }
-        ours == "" || u != ours'
+        $0 != "" && (ours == "" || $0 != ours)'
 }
 
 # wan_ifaces: the interfaces that hold a default route, in any routing
@@ -230,8 +241,8 @@ check_system() {
     # own running proxy holds the port too: ignore its sockets, and only
     # its (they have its user ID), so that a second program is found even
     # while the proxy runs.
-    sockets=$(port_holder) || { err "cannot check UDP $PORT: ss is missing or failed"; return 1; }
-    held=$(foreign_holder "$sockets")
+    owners=$(port_holder) || { err "cannot check UDP $PORT: cannot read the socket tables $PROCFS/net/udp and udp6"; return 1; }
+    held=$(foreign_holder "$owners")
     if [ -n "$held" ]; then
         err "another program uses UDP $PORT (for example udp-broadcast-relay). Stop it first."
         return 1
