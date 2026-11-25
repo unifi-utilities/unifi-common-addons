@@ -39,7 +39,10 @@ Enables emulation of a Cascaded Router setup and allows full use of your CIDR on
 
 ### [att-wpa-supplicant](att-wpa-supplicant)
 
-Physically bypass the AT&T Fiber Residential Gateway by running 802.1X authentication on the UniFi gateway and connecting it directly to the ONT. Runs `wpa_supplicant` from Debian packages kept in `/data` without installing them, so it persists across firmware updates. Includes a guided `setup` command and guided takeover from legacy `wpa_supplicant` bypass methods, plus new commands, checks, and guards to improve resilience and stability.
+Physically bypass the AT&T Fiber Residential Gateway by running 802.1X authentication on the UniFi gateway and connecting it directly to the
+ONT. Runs `wpa_supplicant` from Debian packages kept in `/data` without installing them, so it persists across firmware updates. Includes a
+guided `setup` command and guided takeover from legacy `wpa_supplicant` bypass methods, plus new commands, checks, and guards to improve
+resilience and stability.
 
 ### centurylink-ipv6
 
@@ -51,11 +54,12 @@ Lets HDHomeRun apps on one VLAN find HDHomeRun tuners on another, with a small d
 
 ### he-ipv6
 
-Enables a [Hurricane Electric Tunnel Broker](https://tunnelbroker.net/) [6in4](https://www.rfc-editor.org/rfc/rfc4213.html) tunnel on UniFi OS gateways where the ISP only provides IPv4.
+Enables a [Hurricane Electric Tunnel Broker](https://tunnelbroker.net/) [6in4](https://www.rfc-editor.org/rfc/rfc4213.html) tunnel on UniFi
+OS gateways where the ISP only provides IPv4.
 
 ### nfsv4-compat
 
-Enables NFSv4 for shares exported by UniFi Drive
+Enables NFSv4 for shares exported by UniFi Drive, and ensures NFSv4 remains enabled after UniFi Drive rewrites its NFS configuration
 
 ### nspawn-container
 
@@ -67,11 +71,13 @@ Persist changes to your device's configurations and prevent them from being over
 
 ### pppoe-reconnect
 
-Reconnects PPPoE once a day, at a time that differs from gateway to gateway, for connections where the ISP forces a disconnect every 24 hours, such as o2 in Germany. Without configuration it reconnects `ppp0` between 03:00 and 04:00 local time of the gateway.
+Reconnects PPPoE once a day, at a time that differs from gateway to gateway, for connections where the ISP forces a disconnect every 24
+hours, such as o2 in Germany. Without configuration it reconnects `ppp0` between 03:00 and 04:00 local time of the gateway.
 
 ### ra-deprecate
 
-Deprecates the old delegated IPv6 prefix after a PPPoE reconnect or a gateway reboot, so LAN clients stop using addresses from it. Mainly useful on connections with a regular forced disconnect and a new prefix each time, such as 1&1 or Telefónica o2 in Germany.
+Deprecates the old delegated IPv6 prefix after a PPPoE reconnect or a gateway reboot, so LAN clients stop using addresses from it. Mainly
+useful on connections with a regular forced disconnect and a new prefix each time, such as 1&1 or Telefónica o2 in Germany.
 
 ### soundcork
 
@@ -79,11 +85,13 @@ Runs [SoundCork](https://github.com/deborahgu/soundcork) on a UniFi OS gateway f
 
 ### tailscale-unifi
 
-Miscellaneous scripts to help with Tailscale and UniFi integration from [tailscale-unifi](https://github.com/SierraSoftworks/tailscale-unifi)
+Miscellaneous scripts to help with Tailscale and UniFi integration
+from [tailscale-unifi](https://github.com/SierraSoftworks/tailscale-unifi)
 
 ## Missing something?
 
 > [!TIP]
-> We have moved the old add-ons to a new repository to make them easier to maintain and add new ones. If you have an addon that you would like to see added, please open an issue or submit a pull request.
+> We have moved the old add-ons to a new repository to make them easier to maintain and add new ones. If you have an addon that you would
+like to see added, please open an issue or submit a pull request.
 
 <https://github.com/unifi-utilities/unifios-utilities-archived>
