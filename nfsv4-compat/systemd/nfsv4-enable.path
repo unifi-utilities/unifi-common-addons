@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch /etc/nfs.conf for UniFi Drive rewrites that turn NFSv4 off
+
+[Path]
+PathChanged=/etc/nfs.conf
+
+[Install]
+WantedBy=paths.target

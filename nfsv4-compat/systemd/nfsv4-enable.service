@@ -1,0 +1,17 @@
+[Unit]
+Description=Keep nfsd serving NFSv4 for the shares nfsv4-compat exports
+# udc restarts nfs-server right behind its own write of /etc/nfs.conf. The 10s settle below lets
+# that restart finish, so the script reads the state udc actually left behind instead of restarting
+# a server that udc is about to bring back up as v3-only.
+#
+# These limits still stop a genuine trigger loop, but leave room for legitimate bursts: hitting a
+# start limit would also fail nfsv4-enable.path, which then stops watching.
+StartLimitBurst=20
+StartLimitIntervalSec=60
+ConditionPathExists=/etc/nfs.conf
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2min
+ExecStartPre=/bin/sleep 10
+ExecStart=/data/unifi-common-addons/nfsv4-compat/scripts/nfsv4-enable

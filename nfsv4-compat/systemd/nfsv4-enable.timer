@@ -1,0 +1,11 @@
+[Unit]
+Description=Run nfsv4-enable at boot and periodically, as a backstop for missed path events
+
+[Timer]
+# PathChanged= never fires for state that already exists, so the boot run comes from here. It is
+# late enough that nfsv4-compat has built its tree first, so a restart re-exports a finished one.
+OnBootSec=45s
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

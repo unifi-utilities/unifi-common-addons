@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# host path: /data/unifi-common-addons/nfsv4-compat/scripts/nfsv4-enable
+# usage: nfsv4-enable   (run by nfsv4-enable.service; safe to run by hand)
+#
+# UniFi Drive's config daemon (udcd) owns /etc/nfs.conf. Since unifi-drive-config 2.28.x it also
+# writes the [nfsd] protocol versions, taken from the max_protocol_version field of the UniFi Drive
+# app's ReplaceAllNFSExportConfigs request. The app never sets that field, so udc reads it as empty
+# and writes vers4=n, vers4.1=n, vers4.2=n, then restarts nfs-server: nfsd comes back v3-only and
+# every v4 mount fails with "Protocol not supported", nfsv4-compat's exports included. The app
+# pushes that request whenever it starts or its shares change, i.e. at boot, on a UniFi Drive
+# update, and on share edits.
+#
+# This re-asserts the three version keys and restarts nfsd, but only when nfsd is not already
+# serving them. The running server, not the config file, decides whether a restart is due: writing
+# the keys back makes the file correct while the server is still v3-only, and a run that finds both
+# in order has nothing to do.
+#
+# Exports survive the restart. nfs-server re-reads /etc/exports.d as it starts, so nfsv4-compat's
+# generated file is exported again, and the mirror's bind mounts are independent of nfsd.
+#
+# A restart that does not bring v4 up means this kernel cannot serve it, which no amount of retrying
+# changes. Restarting nfsd interrupts v3 clients and opens a grace period for v4 ones, so that
+# failure is recorded in /run and later runs stand down until the next boot.
+
+set -Eeuo pipefail
+
+# uncomment the line below for debugging
+# trap 'STATUS=${?}; echo >&2 "${0}: Error on line "${LINENO}": ${BASH_COMMAND}"; exit ${STATUS}' ERR
+
+readonly nfs_conf='/etc/nfs.conf'                   # written by udc, watched by `nfsv4-enable.path`
+readonly nfsd_versions='/proc/fs/nfsd/versions'     # what the running server serves, not what it was asked to
+readonly stand_down_file='/run/nfsv4-enable.failed' # in /run: a reboot is exactly when a retry is worth it
+readonly -a wanted_versions=('4' '4.1' '4.2')       # nfs.conf spells these vers4, vers4.1, vers4.2
+
+# <N> priority prefixes are only parsed when the stream is the journal's; see systemd.exec(5).
+if [[ -n "${JOURNAL_STREAM:-}" ]] && [[ "${JOURNAL_STREAM:-}" == "$(stat -L -c '%d:%i' "/proc/$$/fd/1" 2>/dev/null)" ]]; then
+  readonly log_to_journal='true'
+else
+  readonly log_to_journal='false'
+fi
+
+log() { # $1=syslog priority, $2=message
+  if [[ "${log_to_journal}" == 'true' ]]; then
+    printf '<%s>%s\n' "${1}" "${2}"
+  else
+    printf '%s\n' "${2}"
+  fi
+}
+
+configured_version() { # $1=version; prints what nfs.conf sets it to, nothing when it is unset
+  nfsconf --get nfsd "vers${1}" 2>/dev/null || true
+}
+
+enable_configured_versions() { # sets the version keys udc cleared; silent when they are already set
+  local version value
+
+  for version in "${wanted_versions[@]}"; do
+    value="$(configured_version "${version}")"
+
+    case "${value}" in
+      [yY] | [yY][eE][sS] | [oO][nN] | [tT][rR][uU][eE] | 1) continue ;;
+    esac
+
+    log 5 "vers${version}=${value:-<unset>} in ${nfs_conf}; setting it to y"
+    nfsconf --set nfsd "vers${version}" y
+  done
+}
+
+serving_wanted_versions() { # true only while nfsd serves every wanted version
+  local versions version
+
+  versions=" $(<"${nfsd_versions}") " # padded, so +4 can't match inside +4.1
+
+  for version in "${wanted_versions[@]}"; do
+    if [[ "${versions}" != *" +${version} "* ]]; then
+      return 1
+    fi
+  done
+}
+
+exec 9>'/run/nfsv4-enable.lock'
+
+if ! flock -n 9; then
+  log 4 'another run already holds the lock; exiting'
+  exit 0
+fi
+
+enable_configured_versions
+
+if [[ ! -r "${nfsd_versions}" ]]; then
+  exit 0 # nfsd isn't running; nfs-server.service will start it from the configuration above
+fi
+
+if serving_wanted_versions; then
+  exit 0
+fi
+
+if [[ -e "${stand_down_file}" ]]; then
+  exit 0 # a restart has already failed to fix this boot; see the stand-down message below
+fi
+
+log 4 "nfsd is serving $(<"${nfsd_versions}"); restarting nfs-server to pick NFSv4 back up"
+systemctl restart nfs-server.service 9>&-
+
+if ! serving_wanted_versions; then
+  : >"${stand_down_file}"
+  log 3 "nfsd is still serving $(<"${nfsd_versions}") after a restart; standing down until reboot"
+  exit 1
+fi
+
+log 5 "nfsd is serving $(<"${nfsd_versions}")"
